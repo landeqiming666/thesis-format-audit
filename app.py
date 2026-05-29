@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import random
 import tempfile
+import time
+from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +26,13 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 MAX_SUBMISSIONS = 3
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
+RATE_LIMITS = {
+    "login": (10, 5 * 60),
+    "register": (5, 60 * 60),
+    "audit": (8, 60 * 60),
+    "admin": (30, 5 * 60),
+}
+RATE_BUCKETS: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
@@ -51,6 +60,34 @@ def user_id_from_token(token: str) -> str | None:
         return None
     user_id = data.get("user_id")
     return str(user_id) if user_id else None
+
+
+def client_ip() -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def rate_limit(scope: str) -> Response | None:
+    max_requests, window_seconds = RATE_LIMITS[scope]
+    now = time.time()
+    key = (scope, client_ip())
+    recent = [timestamp for timestamp in RATE_BUCKETS[key] if now - timestamp < window_seconds]
+    RATE_BUCKETS[key] = recent
+    if len(recent) >= max_requests:
+        return Response("请求太频繁，请稍后再试。", status=429, mimetype="text/plain; charset=utf-8")
+    recent.append(now)
+    return None
+
+
+@app.after_request
+def add_security_headers(response: Response) -> Response:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return response
 
 
 def get_supabase() -> Client:
@@ -1154,6 +1191,9 @@ def index() -> str:
 
 @app.post("/register")
 def register():
+    limited = rate_limit("register")
+    if limited:
+        return limited
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return render_home(auth_error="服务还没有配置 Supabase 数据库。", auth_mode="register"), 503
     email = request.form.get("email", "").strip().lower()
@@ -1187,6 +1227,9 @@ def register():
 
 @app.post("/login")
 def login():
+    limited = rate_limit("login")
+    if limited:
+        return limited
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return render_home(auth_error="服务还没有配置 Supabase 数据库。"), 503
     email = request.form.get("email", "").strip().lower()
@@ -1222,6 +1265,9 @@ def admin():
 
 @app.post("/admin/quota")
 def admin_add_quota():
+    limited = rate_limit("admin")
+    if limited:
+        return limited
     user = current_user()
     if not is_admin(user):
         return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
@@ -1242,6 +1288,9 @@ def admin_add_quota():
 
 @app.post("/audit")
 def audit():
+    limited = rate_limit("audit")
+    if limited:
+        return limited
     user = current_user()
     if user is None:
         return render_home(error="请先注册或登录后再生成报告。"), 401

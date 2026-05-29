@@ -84,6 +84,7 @@ http://你的公网IP:7860
 - natapp
 - Sakura Frp
 - 花生壳
+- Cloudflare Tunnel
 
 穿透目标填：
 
@@ -92,6 +93,18 @@ http://你的公网IP:7860
 ```
 
 穿透平台会给你一个公网 URL，别人打开那个 URL 就能访问。
+
+### 方案 C：Cloudflare Tunnel
+
+Cloudflare Tunnel 不是免费服务器，它只是把你的 Mac mini 安全暴露到 Cloudflare 网络。你的 Python 服务仍然跑在 Mac mini 上。
+
+适合你现在这种情况：
+
+- 不想买服务器
+- 不想开路由器端口
+- 想要 Cloudflare 的基础防护和 HTTPS
+
+但它不保证中国大陆访问一定稳定。国内用户访问时仍可能经过 Cloudflare 境外节点。
 
 ## 4. 注意
 
