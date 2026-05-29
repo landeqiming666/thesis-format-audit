@@ -1,0 +1,10 @@
+services:
+  thesis-audit:
+    build: .
+    container_name: upc-thesis-audit
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "7860:7860"
