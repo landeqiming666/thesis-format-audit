@@ -764,7 +764,7 @@ PAGE = """
         {% elif user %}
           <div class="panel-title"><strong>生成报告</strong><span>{{ max_submissions }} 次额度</span></div>
           <div class="account-bar">
-            <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：<span id="remaining-count">{{ remaining }}</span> / <span id="max-count">{{ max_submissions }}</span></span>
+            <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：<strong><span id="remaining-count">{{ remaining }}</span> 次</strong></span>
             <span>
               {% if is_admin %}<a class="logout-link" href="{{ url_for('admin', auth_token=auth_token) }}">管理后台</a>{% endif %}
               <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
