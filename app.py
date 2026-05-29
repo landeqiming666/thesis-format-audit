@@ -109,65 +109,143 @@ PAGE = """
   <style>
     :root {
       color-scheme: light;
-      --ink: #17202a;
-      --muted: #5f6b76;
-      --paper: #fbfaf7;
-      --line: #d8ded9;
-      --field: #ffffff;
-      --accent: #1f7a5c;
-      --accent-strong: #0f5f45;
-      --warn: #a1432f;
+      --ink: #18212c;
+      --muted: #657382;
+      --paper: #f6f4ef;
+      --surface: rgba(255, 255, 255, .82);
+      --surface-strong: #ffffff;
+      --line: #d6d8d2;
+      --field: #fbfbf8;
+      --accent: #1e7f62;
+      --accent-strong: #145a45;
+      --accent-soft: #dcefe7;
+      --warn: #a64232;
+      --shadow: rgba(24, 33, 44, .12);
+      --grid: rgba(24, 33, 44, .045);
+    }
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --ink: #edf2ef;
+      --muted: #9cadb7;
+      --paper: #0e1416;
+      --surface: rgba(18, 27, 29, .82);
+      --surface-strong: #151f22;
+      --line: #2a393b;
+      --field: #10191b;
+      --accent: #62c598;
+      --accent-strong: #8ce0b4;
+      --accent-soft: #17362b;
+      --warn: #ff9a84;
+      --shadow: rgba(0, 0, 0, .34);
+      --grid: rgba(237, 242, 239, .055);
     }
     * { box-sizing: border-box; }
+    html { background: var(--paper); }
     body {
       margin: 0;
       min-height: 100svh;
       font-family: "Songti SC", "Noto Serif SC", "STSong", serif;
       color: var(--ink);
       background:
-        linear-gradient(120deg, rgba(31, 122, 92, .10), transparent 34%),
-        repeating-linear-gradient(0deg, rgba(23, 32, 42, .035), rgba(23, 32, 42, .035) 1px, transparent 1px, transparent 34px),
+        radial-gradient(circle at 14% 20%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 28rem),
+        linear-gradient(120deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 42%),
+        repeating-linear-gradient(0deg, var(--grid), var(--grid) 1px, transparent 1px, transparent 34px),
         var(--paper);
+      transition: background .25s ease, color .25s ease;
     }
     main {
-      width: min(1080px, calc(100% - 32px));
+      width: min(1180px, calc(100% - 36px));
       margin: 0 auto;
-      padding: 48px 0;
+      padding: 42px 0;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 34px;
+      font: 700 13px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+    }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--accent);
+      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .theme-toggle {
+      width: auto;
+      margin: 0;
+      padding: 10px 13px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: none;
+      font-size: 13px;
+    }
+    .theme-toggle:hover {
+      background: var(--surface-strong);
+      color: var(--accent-strong);
     }
     .shell {
       display: grid;
-      grid-template-columns: minmax(0, 1.05fr) minmax(320px, .95fr);
-      gap: 44px;
+      grid-template-columns: minmax(0, 1.05fr) minmax(420px, .8fr);
+      gap: clamp(34px, 6vw, 80px);
       align-items: center;
-      min-height: calc(100svh - 96px);
+      min-height: calc(100svh - 146px);
     }
     .mark {
-      width: 72px;
-      height: 5px;
-      margin-bottom: 28px;
+      width: 74px;
+      height: 4px;
+      margin-bottom: 30px;
       background: var(--accent);
     }
     h1 {
       margin: 0;
-      max-width: 740px;
-      font-size: clamp(42px, 7vw, 86px);
-      line-height: .98;
+      max-width: 680px;
+      font-size: clamp(48px, 8vw, 96px);
+      line-height: .94;
       font-weight: 800;
       letter-spacing: 0;
     }
     .lead {
       max-width: 560px;
-      margin: 24px 0 0;
+      margin: 28px 0 0;
       color: var(--muted);
-      font-size: 19px;
+      font-size: 18px;
       line-height: 1.8;
     }
     .panel {
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .82);
-      padding: 26px;
-      box-shadow: 0 24px 80px rgba(23, 32, 42, .10);
-      backdrop-filter: blur(14px);
+      background: var(--surface);
+      padding: 30px;
+      box-shadow: 0 26px 90px var(--shadow);
+      backdrop-filter: blur(18px);
+      animation: rise .5s ease both;
+    }
+    .panel-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 22px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+      font: 700 13px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--muted);
+    }
+    .panel-title strong {
+      color: var(--ink);
+      font-size: 20px;
     }
     label {
       display: block;
@@ -186,11 +264,17 @@ PAGE = """
     input[type="password"] {
       width: 100%;
       margin-bottom: 12px;
-      padding: 13px 14px;
+      padding: 14px 15px;
       border: 1px solid var(--line);
       background: var(--field);
       color: var(--ink);
       font: 15px/1.5 "PingFang SC", "Noto Sans SC", sans-serif;
+      outline: 0;
+      transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+    }
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
     }
     button {
       width: 100%;
@@ -231,8 +315,8 @@ PAGE = """
       width: 100%;
       height: 8px;
       overflow: hidden;
-      background: #dfe7e2;
-      border: 1px solid #cad5cf;
+      background: color-mix(in srgb, var(--line) 70%, transparent);
+      border: 1px solid var(--line);
     }
     .progress-bar {
       width: 0%;
@@ -241,7 +325,10 @@ PAGE = """
       transition: width .45s ease;
     }
     .error {
-      margin: 0 0 16px;
+      margin: 0 0 18px;
+      padding: 12px 14px;
+      border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+      background: color-mix(in srgb, var(--warn) 10%, transparent);
       color: var(--warn);
       font: 700 14px/1.6 "PingFang SC", "Noto Sans SC", sans-serif;
     }
@@ -268,6 +355,9 @@ PAGE = """
       grid-template-columns: 1fr 1fr;
       gap: 18px;
     }
+    .auth-box {
+      min-width: 0;
+    }
     .auth-box h2 {
       margin: 0 0 14px;
       font: 800 20px/1.3 "PingFang SC", "Noto Sans SC", sans-serif;
@@ -293,16 +383,29 @@ PAGE = """
       padding-top: 10px;
       min-width: 142px;
     }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
     @media (max-width: 820px) {
-      main { padding: 28px 0; }
+      main { padding: 24px 0; }
+      .topbar { margin-bottom: 30px; }
       .shell { grid-template-columns: 1fr; min-height: auto; }
-      .panel { padding: 20px; }
+      .panel { padding: 22px; }
       .auth-grid { grid-template-columns: 1fr; }
+      h1 { font-size: clamp(46px, 16vw, 68px); }
     }
   </style>
 </head>
 <body>
   <main>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">审</span>
+        <span>Thesis Format Audit</span>
+      </div>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换夜间模式">夜间模式</button>
+    </header>
     <section class="shell">
       <div>
         <div class="mark"></div>
@@ -316,9 +419,11 @@ PAGE = """
       </div>
       <div class="panel">
         {% if not configured %}
+          <div class="panel-title"><strong>系统配置</strong><span>Database</span></div>
           <p class="error">服务还没有配置 Supabase 数据库。</p>
           <p class="note">管理员需要设置 SUPABASE_URL 和 SUPABASE_SERVICE_ROLE_KEY 后才能开放注册登录。</p>
         {% elif user %}
+          <div class="panel-title"><strong>生成报告</strong><span>3 次额度</span></div>
           <div class="account-bar">
             <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：{{ remaining }} / {{ max_submissions }}</span>
             <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
@@ -346,6 +451,7 @@ PAGE = """
             {% endif %}
           </form>
         {% else %}
+          <div class="panel-title"><strong>开始使用</strong><span>账号限制</span></div>
           {% if auth_error %}<p class="error">{{ auth_error }}</p>{% endif %}
           <div class="auth-grid">
             <form class="auth-box" method="post" action="{{ url_for('login') }}">
@@ -367,6 +473,21 @@ PAGE = """
     </section>
   </main>
   <script>
+    const root = document.documentElement;
+    const themeToggle = document.getElementById('theme-toggle');
+    const savedTheme = localStorage.getItem('theme');
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const initialTheme = savedTheme || (prefersDark ? 'dark' : 'light');
+    root.dataset.theme = initialTheme;
+    if (themeToggle) themeToggle.textContent = initialTheme === 'dark' ? '日间模式' : '夜间模式';
+
+    if (themeToggle) themeToggle.addEventListener('click', () => {
+      const nextTheme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      root.dataset.theme = nextTheme;
+      localStorage.setItem('theme', nextTheme);
+      themeToggle.textContent = nextTheme === 'dark' ? '日间模式' : '夜间模式';
+    });
+
     const form = document.getElementById('audit-form');
     const fileInput = document.getElementById('docx');
     const submitButton = document.getElementById('submit-button');
