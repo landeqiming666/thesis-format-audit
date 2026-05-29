@@ -666,7 +666,7 @@ PAGE = """
         {% elif user %}
           <div class="panel-title"><strong>生成报告</strong><span>3 次额度</span></div>
           <div class="account-bar">
-            <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：{{ remaining }} / {{ max_submissions }}</span>
+            <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：<span id="remaining-count">{{ remaining }}</span> / <span id="max-count">{{ max_submissions }}</span></span>
             <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
           </div>
           <form id="audit-form" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
@@ -784,6 +784,7 @@ PAGE = """
     const uploadTitle = document.getElementById('upload-title');
     const uploadMeta = document.getElementById('upload-meta');
     const downloadDone = document.getElementById('download-done');
+    const remainingCount = document.getElementById('remaining-count');
 
     const messages = [
       [10, '正在上传论文...'],
@@ -854,8 +855,9 @@ PAGE = """
         progressBar.style.width = '100%';
         progressPercent.textContent = '100%';
         progressMessage.textContent = '报告已开始下载';
-        submitButton.disabled = false;
-        submitButton.textContent = '继续生成报告';
+        const noRemaining = remainingCount && Number(remainingCount.textContent) <= 0;
+        submitButton.disabled = Boolean(noRemaining);
+        submitButton.textContent = noRemaining ? '额度已用完' : '继续生成报告';
         if (downloadDone) downloadDone.classList.add('active');
       };
 
@@ -865,6 +867,11 @@ PAGE = """
         if (encodedMatch) return decodeURIComponent(encodedMatch[1]);
         const normalMatch = disposition.match(/filename="?([^";]+)"?/i);
         return normalMatch ? normalMatch[1] : 'thesis_format_audit_report.html';
+      };
+
+      const updateRemainingCount = response => {
+        const remaining = response.headers.get('X-Remaining-Submissions');
+        if (remainingCount && remaining !== null) remainingCount.textContent = remaining;
       };
 
       tick();
@@ -895,6 +902,7 @@ PAGE = """
         link.click();
         link.remove();
         URL.revokeObjectURL(downloadUrl);
+        updateRemainingCount(response);
         finishDownloadState();
       } catch (error) {
         finished = true;
@@ -998,9 +1006,13 @@ def audit():
             return Response(f"检测失败：{exc}", status=500, mimetype="text/plain; charset=utf-8")
 
         increment_submissions(user["id"])
+        fresh_user = find_user_by_id(user["id"])
+        remaining = remaining_submissions(fresh_user)
 
         download_name = f"{Path(original_name).stem}_format_audit_report.html"
-        return send_file(report_path, as_attachment=True, download_name=download_name, mimetype="text/html")
+        response = send_file(report_path, as_attachment=True, download_name=download_name, mimetype="text/html")
+        response.headers["X-Remaining-Submissions"] = str(remaining)
+        return response
 
 
 @app.get("/health")
