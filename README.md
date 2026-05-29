@@ -32,7 +32,20 @@ http://127.0.0.1:8000
 2. 在 Render 新建 Blueprint，选择这个仓库。
 3. Render 会读取 `render.yaml` 并创建免费 Python Web Service。
 
-服务不需要 Supabase。Supabase 适合数据库、登录和文件存储；这个工具只需要临时接收 Word 文件并生成报告。
+## Supabase 配置
+
+注册和 3 次提交限制使用 Supabase 保存。
+
+1. 在 Supabase SQL Editor 执行 `supabase_schema.sql`。
+2. 在部署平台设置环境变量：
+
+```text
+SUPABASE_URL=你的 Supabase Project URL
+SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
+SECRET_KEY=任意一段随机长字符串
+```
+
+`SUPABASE_SERVICE_ROLE_KEY` 只能放在服务端环境变量里，不要写进前端页面或公开仓库。
 
 ## Hugging Face Spaces 部署
 
