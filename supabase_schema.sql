@@ -3,8 +3,12 @@ create table if not exists public.thesis_audit_users (
   email text not null unique,
   password_hash text not null,
   submissions_used integer not null default 0,
+  submission_quota integer not null default 3,
   created_at timestamptz not null default now()
 );
+
+alter table public.thesis_audit_users
+add column if not exists submission_quota integer not null default 3;
 
 alter table public.thesis_audit_users enable row level security;
 

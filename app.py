@@ -27,6 +27,11 @@ AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
+ADMIN_EMAILS = {
+    email.strip().lower()
+    for email in os.environ.get("ADMIN_EMAILS", "2818242447@qq.com").split(",")
+    if email.strip()
+}
 
 
 def auth_serializer() -> URLSafeTimedSerializer:
@@ -58,7 +63,7 @@ def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used")
+        .select("id,email,password_hash,submissions_used,submission_quota,created_at")
         .eq("id", user_id)
         .maybe_single()
         .execute()
@@ -70,7 +75,7 @@ def find_user_by_email(email: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used")
+        .select("id,email,password_hash,submissions_used,submission_quota,created_at")
         .eq("email", email)
         .maybe_single()
         .execute()
@@ -89,9 +94,11 @@ def create_user(email: str, password: str) -> dict:
 
 
 def increment_submissions(user_id: str) -> None:
+    user = find_user_by_id(user_id)
+    max_allowed = int(user.get("submission_quota", MAX_SUBMISSIONS)) if user else MAX_SUBMISSIONS
     result = get_supabase().rpc(
         "increment_thesis_audit_submissions",
-        {"target_user_id": user_id, "max_allowed": MAX_SUBMISSIONS},
+        {"target_user_id": user_id, "max_allowed": max_allowed},
     ).execute()
     if result.data is not True:
         raise RuntimeError("Submission limit reached.")
@@ -111,7 +118,43 @@ def current_user() -> dict | None:
 def remaining_submissions(user: dict | None) -> int:
     if user is None:
         return 0
-    return max(0, MAX_SUBMISSIONS - int(user["submissions_used"]))
+    quota = int(user.get("submission_quota", MAX_SUBMISSIONS))
+    return max(0, quota - int(user["submissions_used"]))
+
+
+def user_quota(user: dict | None) -> int:
+    if user is None:
+        return MAX_SUBMISSIONS
+    return int(user.get("submission_quota", MAX_SUBMISSIONS))
+
+
+def is_admin(user: dict | None) -> bool:
+    return bool(user and user.get("email", "").lower() in ADMIN_EMAILS)
+
+
+def list_users() -> list[dict]:
+    result = (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .select("id,email,submissions_used,submission_quota,created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def add_user_quota(user_id: str, amount: int) -> None:
+    user = find_user_by_id(user_id)
+    if user is None:
+        raise ValueError("用户不存在。")
+    new_quota = max(user_quota(user), int(user["submissions_used"])) + amount
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update({"submission_quota": new_quota})
+        .eq("id", user_id)
+        .execute()
+    )
 
 
 def render_home(
@@ -129,7 +172,8 @@ def render_home(
         user=user,
         configured=bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
         remaining=remaining_submissions(user),
-        max_submissions=MAX_SUBMISSIONS,
+        max_submissions=user_quota(user),
+        is_admin=is_admin(user),
         captcha_question=session.get("captcha_question", ""),
         captcha_left=session.get("captcha_left", ""),
         captcha_right=session.get("captcha_right", ""),
@@ -476,6 +520,7 @@ PAGE = """
       text-decoration: none;
       font-weight: 700;
       white-space: nowrap;
+      margin-left: 12px;
     }
     .auth-grid {
       display: grid;
@@ -664,10 +709,13 @@ PAGE = """
           <p class="error">服务还没有配置 Supabase 数据库。</p>
           <p class="note">管理员需要设置 SUPABASE_URL 和 SUPABASE_SERVICE_ROLE_KEY 后才能开放注册登录。</p>
         {% elif user %}
-          <div class="panel-title"><strong>生成报告</strong><span>3 次额度</span></div>
+          <div class="panel-title"><strong>生成报告</strong><span>{{ max_submissions }} 次额度</span></div>
           <div class="account-bar">
             <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：<span id="remaining-count">{{ remaining }}</span> / <span id="max-count">{{ max_submissions }}</span></span>
-            <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
+            <span>
+              {% if is_admin %}<a class="logout-link" href="{{ url_for('admin', auth_token=auth_token) }}">管理后台</a>{% endif %}
+              <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
+            </span>
           </div>
           <form id="audit-form" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
             {% if auth_token %}<input name="auth_token" type="hidden" value="{{ auth_token }}">{% endif %}
@@ -700,7 +748,7 @@ PAGE = """
               <div id="download-done" class="download-done">报告已开始下载，可以继续选择新文件生成下一份报告。</div>
               <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
             {% else %}
-              <p class="error">这个账号的 3 次检测额度已经用完。</p>
+              <p class="error">这个账号的检测额度已经用完。</p>
               <div class="quota-help">
                 <p><span class="quota-label">额度已用完</span>加入官方 QQ 群，联系管理员增加检测次数。</p>
                 <strong class="quota-number">537124215</strong>
@@ -920,6 +968,185 @@ PAGE = """
 """
 
 
+ADMIN_PAGE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理后台 - UPC本科论文格式检测工具</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18212c;
+      --muted: #657382;
+      --paper: #f6f4ef;
+      --surface: #ffffff;
+      --line: #d6d8d2;
+      --accent: #1e7f62;
+      --accent-soft: #dcefe7;
+      --warn: #a64232;
+      --shadow: rgba(24, 33, 44, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 28rem),
+        var(--paper);
+      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    main {
+      width: min(1100px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0;
+    }
+    .topbar, .user-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 5vw, 52px);
+      line-height: 1.05;
+    }
+    a {
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .panel {
+      margin-top: 26px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .84);
+      box-shadow: 0 24px 72px var(--shadow);
+      overflow: hidden;
+    }
+    .notice {
+      margin: 18px 0 0;
+      padding: 12px 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
+      color: var(--accent);
+      font-weight: 800;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 15px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      background: color-mix(in srgb, var(--accent-soft) 32%, transparent);
+    }
+    .email { font-weight: 800; }
+    .muted { color: var(--muted); }
+    .quota {
+      display: inline-grid;
+      place-items: center;
+      min-width: 68px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      font-weight: 900;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    button {
+      border: 0;
+      padding: 9px 11px;
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+      font-weight: 800;
+    }
+    button:hover { filter: brightness(.92); }
+    @media (max-width: 760px) {
+      .topbar { align-items: flex-start; flex-direction: column; }
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      tr { border-bottom: 1px solid var(--line); padding: 12px; }
+      td { border: 0; padding: 7px 4px; }
+      td::before {
+        content: attr(data-label);
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 3px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="topbar">
+      <div>
+        <h1>管理后台</h1>
+        <p class="muted">给用户增加检测次数，额度会立即用于前台限制。</p>
+      </div>
+      <div class="user-row">
+        <span class="muted">管理员：{{ admin_user["email"] }}</span>
+        <a href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
+      </div>
+    </div>
+    {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+    <section class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th>已用 / 总额度</th>
+            <th>剩余</th>
+            <th>注册时间</th>
+            <th>增加次数</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in users %}
+            <tr>
+              <td data-label="账号"><span class="email">{{ item["email"] }}</span></td>
+              <td data-label="已用 / 总额度"><span class="quota">{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
+              <td data-label="剩余"><strong>{{ [item["submission_quota"] - item["submissions_used"], 0] | max }}</strong></td>
+              <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
+              <td data-label="增加次数">
+                <div class="actions">
+                  {% for amount in [1, 3, 10] %}
+                    <form method="post" action="{{ url_for('admin_add_quota') }}">
+                      <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                      <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                      <input name="amount" type="hidden" value="{{ amount }}">
+                      <button type="submit">+{{ amount }}</button>
+                    </form>
+                  {% endfor %}
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 @app.get("/")
 def index() -> str:
     return render_home()
@@ -978,13 +1205,48 @@ def logout():
     return redirect(url_for("index"))
 
 
+@app.get("/admin")
+def admin():
+    user = current_user()
+    if not is_admin(user):
+        return redirect(url_for("index"))
+    token = request.values.get("auth_token") or generate_auth_token(user["id"])
+    return render_template_string(
+        ADMIN_PAGE,
+        admin_user=user,
+        users=list_users(),
+        auth_token=token,
+        message=request.args.get("message", ""),
+    )
+
+
+@app.post("/admin/quota")
+def admin_add_quota():
+    user = current_user()
+    if not is_admin(user):
+        return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    target_user_id = request.form.get("user_id", "")
+    try:
+        amount = int(request.form.get("amount", "0"))
+    except ValueError:
+        amount = 0
+    if amount <= 0:
+        return redirect(url_for("admin", auth_token=token, message="增加次数必须大于 0。"))
+    try:
+        add_user_quota(target_user_id, amount)
+    except ValueError as exc:
+        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+    return redirect(url_for("admin", auth_token=token, message=f"已增加 {amount} 次额度。"))
+
+
 @app.post("/audit")
 def audit():
     user = current_user()
     if user is None:
         return render_home(error="请先注册或登录后再生成报告。"), 401
     if remaining_submissions(user) <= 0:
-        return render_home(error="这个账号的 3 次检测额度已经用完。"), 403
+        return render_home(error="这个账号的检测额度已经用完。"), 403
 
     upload = request.files.get("docx")
     if not upload or not upload.filename:
