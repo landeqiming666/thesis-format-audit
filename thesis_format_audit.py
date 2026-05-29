@@ -61,9 +61,78 @@ class AuditContext:
     path: Path
     doc: Document
     findings: list[Finding] = field(default_factory=list)
+    _paragraph_texts: list[str] = field(default_factory=list, init=False, repr=False)
+    _paragraph_clean_texts: list[str] = field(default_factory=list, init=False, repr=False)
+    _paragraph_text_join: Optional[str] = field(default=None, init=False, repr=False)
+    _body_blocks: Optional[list[tuple[str, object]]] = field(default=None, init=False, repr=False)
+    _document_xml: Optional[str] = field(default=None, init=False, repr=False)
+    _media_count: Optional[int] = field(default=None, init=False, repr=False)
+    _first_chapter_index: Optional[int] = field(default=None, init=False, repr=False)
+    _first_chapter_index_ready: bool = field(default=False, init=False, repr=False)
+    _exact_index_cache: dict[str, Optional[int]] = field(default_factory=dict, init=False, repr=False)
 
     def add(self, item: str, status: str, location: str, message: str, evidence: str = "", severity: str = "一般"):
         self.findings.append(Finding(item, status, location, message, evidence, severity))
+
+    @property
+    def paragraph_texts(self) -> list[str]:
+        if not self._paragraph_texts:
+            self._paragraph_texts = [p.text for p in self.doc.paragraphs]
+        return self._paragraph_texts
+
+    @property
+    def paragraph_clean_texts(self) -> list[str]:
+        if not self._paragraph_clean_texts:
+            self._paragraph_clean_texts = [clean_text(text) for text in self.paragraph_texts]
+        return self._paragraph_clean_texts
+
+    @property
+    def full_text(self) -> str:
+        if self._paragraph_text_join is None:
+            self._paragraph_text_join = "\n".join(self.paragraph_texts)
+        return self._paragraph_text_join
+
+    def text_until(self, end: Optional[int]) -> str:
+        if end is None:
+            return self.full_text
+        return "\n".join(self.paragraph_texts[:end])
+
+    @property
+    def body_blocks(self) -> list[tuple[str, object]]:
+        if self._body_blocks is None:
+            self._body_blocks = list(iter_body_blocks(self.doc))
+        return self._body_blocks
+
+    @property
+    def document_xml(self) -> str:
+        if self._document_xml is None:
+            self._document_xml = document_xml(self.path)
+        return self._document_xml
+
+    @property
+    def media_count(self) -> int:
+        if self._media_count is None:
+            self._media_count = media_count(self.path)
+        return self._media_count
+
+    def find_exact(self, exact: str) -> Optional[int]:
+        if exact not in self._exact_index_cache:
+            self._exact_index_cache[exact] = find_paragraph_index(self.doc, exact)
+        return self._exact_index_cache[exact]
+
+    @property
+    def first_chapter_index(self) -> Optional[int]:
+        if not self._first_chapter_index_ready:
+            self._first_chapter_index = find_first_chapter_index(self.doc)
+            self._first_chapter_index_ready = True
+        return self._first_chapter_index
+
+    def first_tail_index(self) -> int:
+        candidates = [
+            i for i, text in enumerate(self.paragraph_clean_texts)
+            if text in ("致谢", "参考文献", "附录")
+        ]
+        return min(candidates) if candidates else len(self.doc.paragraphs)
 
 
 def clean_text(s: str) -> str:
@@ -588,6 +657,10 @@ def docx_has_toc_field(path: Path) -> bool:
     return "TOC \\o" in xml or "TOC" in xml and "PAGEREF" in xml
 
 
+def xml_has_toc_field(xml: str) -> bool:
+    return "TOC \\o" in xml or ("TOC" in xml and "PAGEREF" in xml)
+
+
 def docx_pageref_count(path: Path) -> int:
     return document_xml(path).count("PAGEREF")
 
@@ -614,7 +687,7 @@ def audit_basic(ctx: AuditContext):
         "PASS",
         "全文",
         "DOCX 可读取。",
-        f"段落 {len(doc.paragraphs)}；表格 {len(doc.tables)}；图片 {len(doc.inline_shapes)}；节 {len(doc.sections)}；媒体文件 {media_count(ctx.path)}。",
+        f"段落 {len(doc.paragraphs)}；表格 {len(doc.tables)}；图片 {len(doc.inline_shapes)}；节 {len(doc.sections)}；媒体文件 {ctx.media_count}。",
     )
 
 
@@ -633,8 +706,8 @@ def audit_template_residue(ctx: AuditContext):
 
 def audit_abstracts(ctx: AuditContext):
     doc = ctx.doc
-    cn_title = find_paragraph_index(doc, "摘  要")
-    en_title = find_paragraph_index(doc, "Abstract")
+    cn_title = ctx.find_exact("摘  要")
+    en_title = ctx.find_exact("Abstract")
     cn_kw = find_first(doc, lambda p: p.text.strip().startswith("关键词"))
     en_kw = find_first(doc, lambda p: p.text.strip().startswith("Keywords"))
 
@@ -882,8 +955,8 @@ def audit_toc(ctx: AuditContext):
     doc = ctx.doc
     toc_start = find_first(doc, lambda p: clean_text(p.text) == "目录")
     toc_field = find_first(doc, paragraph_has_toc_field)
-    has_toc_xml = docx_has_toc_field(ctx.path)
-    body_start = find_first_chapter_index(doc)
+    has_toc_xml = xml_has_toc_field(ctx.document_xml)
+    body_start = ctx.first_chapter_index
 
     if toc_start is None and toc_field is None and not has_toc_xml:
         ctx.add("目录", "FAIL", "目录页", "未找到目录标题，也未检测到 Word 自动目录域。", severity="严重")
@@ -935,7 +1008,7 @@ def audit_toc(ctx: AuditContext):
                 "WARN",
                 "目录页",
                 "已检测到 Word 自动目录域；由于该目录未作为普通段落暴露，脚本无法精确定位目录结束位置，请人工确认目录页内容。",
-                f"底层 XML 检测到 TOC；PAGEREF 域 {docx_pageref_count(ctx.path)} 个。",
+                f"底层 XML 检测到 TOC；PAGEREF 域 {ctx.document_xml.count('PAGEREF')} 个。",
                 "一般",
             )
         else:
@@ -966,7 +1039,7 @@ def audit_toc(ctx: AuditContext):
             "WARN",
             "目录页",
             "检测到 Word 自动目录域；由于目录条目以域代码保存，脚本无法完全读取可见目录文字，建议在 Word 中右键更新域后人工复核目录条目。",
-            f"底层 XML 检测到 TOC；PAGEREF 域 {docx_pageref_count(ctx.path)} 个。",
+            f"底层 XML 检测到 TOC；PAGEREF 域 {ctx.document_xml.count('PAGEREF')} 个。",
             "一般",
         )
         ctx.add(
@@ -979,7 +1052,7 @@ def audit_toc(ctx: AuditContext):
         )
         return
 
-    toc_text = "\n".join(p.text for p in doc.paragraphs[toc_start:body_start])
+    toc_text = "\n".join(ctx.paragraph_texts[toc_start:body_start])
     has_abs = any(x in toc_text for x in ["摘要", "Abstract", "ABSTRACT"])
     has_placeholder = any(x in toc_text for x in ["线性表", "00P"])
     if has_abs or has_placeholder:
@@ -1198,7 +1271,7 @@ def audit_headings(ctx: AuditContext):
 
 def audit_body_and_numbering(ctx: AuditContext):
     doc = ctx.doc
-    refs_start = find_paragraph_index(doc, "参考文献")
+    refs_start = ctx.find_exact("参考文献")
     nums = []
     for i, p in enumerate(doc.paragraphs):
         if refs_start is not None and i >= refs_start:
@@ -1270,8 +1343,8 @@ def audit_body_and_numbering(ctx: AuditContext):
 
 def audit_chinese_punctuation(ctx: AuditContext):
     doc = ctx.doc
-    refs_start = find_paragraph_index(doc, "参考文献")
-    body_start = find_first_chapter_index(doc) or 0
+    refs_start = ctx.find_exact("参考文献")
+    body_start = ctx.first_chapter_index or 0
     hits = []
     for i, p in enumerate(doc.paragraphs):
         if i < body_start:
@@ -1305,13 +1378,9 @@ def audit_figures_tables(ctx: AuditContext):
     dot_fig_cap_pat = re.compile(r"^图(\d+)\.(\d+)\s+(.+)$")
     dot_table_cap_pat = re.compile(r"^表(\d+)\.(\d+)\s+(.+)$")
     cap_pat = re.compile(r"^([图表][A-Z]?\d+-?\d*)\s+(.+)")
-    body = "\n".join(p.text for p in doc.paragraphs)
-    body_start = find_first_chapter_index(doc) or 0
-    tail_start_candidates = [
-        i for i, p in enumerate(doc.paragraphs)
-        if clean_text(p.text) in ("致谢", "参考文献", "附录")
-    ]
-    body_end = min(tail_start_candidates) if tail_start_candidates else len(doc.paragraphs)
+    body = ctx.full_text
+    body_start = ctx.first_chapter_index or 0
+    body_end = ctx.first_tail_index()
     captions = []
     under = []
     bad_size = []
@@ -1362,8 +1431,8 @@ def audit_figures_tables(ctx: AuditContext):
                 ))
 
     body_no_caption = "\n".join(
-        p.text for p in doc.paragraphs
-        if not (fig_cap_pat.match(p.text.strip()) and is_centered(p) and len(p.text.strip()) < 100)
+        text for p, text in zip(doc.paragraphs, ctx.paragraph_texts)
+        if not (fig_cap_pat.match(text.strip()) and is_centered(p) and len(text.strip()) < 100)
     )
 
     for i, p in enumerate(doc.paragraphs):
@@ -1463,7 +1532,7 @@ def audit_figures_tables(ctx: AuditContext):
                 bad_size.append((i + 1, size, text))
     ctx.add("图表题字号", "PASS" if not bad_size else "FAIL", "全文图表", "图题、表题应为五号宋体居中。", "异常项：" + str(bad_size[:20]) if bad_size else f"检测图表题 {len(captions)} 个，未发现字号异常。", "重要")
     ctx.add("图表引用", "PASS" if not under else "FAIL", "全文图表", "正文应引用所有图表。", "未充分引用：" + str(under[:20]) if under else "所有图表编号至少出现两次。", "重要")
-    ctx.add("图片数量", "PASS" if len(doc.inline_shapes) > 0 else "WARN", "全文图片", "正文应包含必要图片。", f"inline_shapes={len(doc.inline_shapes)}, media={media_count(ctx.path)}")
+    ctx.add("图片数量", "PASS" if len(doc.inline_shapes) > 0 else "WARN", "全文图片", "正文应包含必要图片。", f"inline_shapes={len(doc.inline_shapes)}, media={ctx.media_count}")
 
 
 def cell_border_val(cell, edge: str) -> Optional[str]:
@@ -1498,7 +1567,7 @@ def border_is_visible(value: Optional[str]) -> bool:
 
 def audit_tables(ctx: AuditContext):
     doc = ctx.doc
-    blocks = list(iter_body_blocks(doc))
+    blocks = ctx.body_blocks
     body_cap_pat = re.compile(r"^表(\d+)-(\d+) [^\s].+")
     dot_body_cap_pat = re.compile(r"^表(\d+)\.(\d+)\s+(.+)")
     app_cap_pat = re.compile(r"^表([A-Z])-(\d+) [^\s].+")
@@ -1780,6 +1849,7 @@ def audit_formulas(ctx: AuditContext):
     formula_infos = []
     bad = []
     math_font_bad = []
+    math_font_seen = set()
     missing_formula_nums = []
     chapter_counts: dict[str, list[int]] = {}
     appendix_nums = []
@@ -1805,7 +1875,10 @@ def audit_formulas(ctx: AuditContext):
                     latin = rfonts.get(qn("ascii")) or rfonts.get(qn("hAnsi")) if rfonts is not None else None
                     if latin not in (None, "Times New Roman"):
                         shown = math_script_display(mtext, kind)
-                        math_font_bad.append((pi, shown, latin, "公式上标/下标数字按官方检测需使用Times New Roman"))
+                        key = (pi, shown, latin)
+                        if key not in math_font_seen:
+                            math_font_seen.add(key)
+                            math_font_bad.append((pi, shown, latin, "公式上标/下标数字按官方检测需使用Times New Roman"))
                         if len(math_font_bad) >= 30:
                             break
                 if len(math_font_bad) >= 30:
@@ -1860,7 +1933,7 @@ def audit_formulas(ctx: AuditContext):
     if appendix_nums and sorted(appendix_nums) != list(range(1, max(appendix_nums) + 1)):
         bad.append(("附录公式", appendix_nums, "附录公式编号应连续"))
 
-    body_text = "\n".join(p.text for p in doc.paragraphs)
+    body_text = ctx.full_text
     for _, num in formula_infos:
         bare = num.strip("()")
         ref_forms = [f"式({bare})", f"式{num}"]
@@ -1889,11 +1962,11 @@ def audit_formulas(ctx: AuditContext):
 
 def audit_references(ctx: AuditContext):
     doc = ctx.doc
-    refs_start = find_paragraph_index(doc, "参考文献")
+    refs_start = ctx.find_exact("参考文献")
     if refs_start is None:
         ctx.add("参考文献", "FAIL", "参考文献", "未找到参考文献标题。", severity="严重")
         return
-    refs_end = find_paragraph_index(doc, "附  录")
+    refs_end = ctx.find_exact("附  录")
     if refs_end is None or refs_end <= refs_start:
         refs_end = len(doc.paragraphs)
     ref_nums = []
@@ -1954,7 +2027,7 @@ def audit_references(ctx: AuditContext):
         ctx.add("参考文献编号", "PASS" if not missing else "FAIL", "参考文献", "参考文献编号应连续。", evidence, "重要")
 
     # Citation coverage, ignoring [0,1] style intervals.
-    body = "\n".join(p.text for p in doc.paragraphs[:refs_start])
+    body = ctx.text_until(refs_start)
     cites = []
     for m in re.finditer(r"\[(\d+(?:\s*[-,，]\s*\d+)*)\]", body):
         raw = m.group(1)
@@ -2039,7 +2112,7 @@ def audit_references(ctx: AuditContext):
 
 def audit_appendix(ctx: AuditContext):
     doc = ctx.doc
-    app = find_paragraph_index(doc, "附  录")
+    app = ctx.find_exact("附  录")
     if app is None:
         ctx.add("附录", "WARN", "附录", "未找到“附  录”标题。")
         return
