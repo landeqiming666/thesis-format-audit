@@ -571,12 +571,40 @@ PAGE = """
       font: 14px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     .quota-help {
-      margin: 0 0 18px;
-      padding: 12px 14px;
-      border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
-      background: color-mix(in srgb, var(--accent-soft) 34%, transparent);
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 14px;
+      align-items: center;
+      margin: 0 0 20px;
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, var(--accent) 54%, var(--line));
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 22%, transparent), transparent 62%),
+        color-mix(in srgb, var(--accent-soft) 58%, var(--surface));
       color: var(--accent-strong);
+      box-shadow: 0 16px 42px color-mix(in srgb, var(--accent) 15%, transparent);
       font: 700 13px/1.6 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .quota-help p {
+      margin: 0;
+      color: var(--accent-strong);
+    }
+    .quota-label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .quota-number {
+      display: inline-block;
+      padding: 9px 12px;
+      border: 1px solid color-mix(in srgb, var(--accent) 56%, var(--line));
+      background: var(--surface-strong);
+      color: var(--accent-strong);
+      font: 900 22px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+      letter-spacing: .04em;
     }
     .facts {
       display: flex;
@@ -604,6 +632,8 @@ PAGE = """
       .panel { padding: 22px; }
       .auth-grid { grid-template-columns: 1fr; }
       .captcha-row { grid-template-columns: 1fr; }
+      .quota-help { grid-template-columns: 1fr; }
+      .quota-number { width: fit-content; }
       h1 { font-size: clamp(46px, 16vw, 68px); }
     }
   </style>
@@ -644,7 +674,10 @@ PAGE = """
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
-              <p class="quota-help">需要增加检测次数，请加入官方 QQ 群：537124215。</p>
+              <div class="quota-help">
+                <p><span class="quota-label">增加检测次数</span>加入官方 QQ 群，联系管理员增加账号额度。</p>
+                <strong class="quota-number">537124215</strong>
+              </div>
               <label for="docx">选择论文文件</label>
               <label id="upload-card" class="upload-card" for="docx">
                 <span class="upload-icon">↑</span>
@@ -668,7 +701,10 @@ PAGE = """
               <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
             {% else %}
               <p class="error">这个账号的 3 次检测额度已经用完。</p>
-              <p class="quota-help">如果需要继续使用，请加入官方 QQ 群：537124215，联系管理员增加额度。</p>
+              <div class="quota-help">
+                <p><span class="quota-label">额度已用完</span>加入官方 QQ 群，联系管理员增加检测次数。</p>
+                <strong class="quota-number">537124215</strong>
+              </div>
             {% endif %}
           </form>
         {% else %}
