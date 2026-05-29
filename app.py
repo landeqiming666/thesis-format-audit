@@ -17,6 +17,8 @@ from thesis_format_audit import run_audit
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 MAX_SUBMISSIONS = 3
