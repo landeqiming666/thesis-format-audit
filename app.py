@@ -326,12 +326,11 @@ PAGE = """
       font: 700 15px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     input[type="file"] {
-      width: 100%;
-      padding: 18px;
-      border: 1px dashed #8fa099;
-      background: var(--field);
-      color: var(--muted);
-      font: 15px/1.5 "PingFang SC", "Noto Sans SC", sans-serif;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
     }
     input[type="email"],
     input[type="password"],
@@ -398,6 +397,60 @@ PAGE = """
       background: linear-gradient(90deg, var(--accent), #54aa82);
       transition: width .45s ease;
     }
+    .upload-card {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: 14px;
+      align-items: center;
+      min-height: 116px;
+      margin-bottom: 16px;
+      padding: 20px;
+      border: 1px dashed color-mix(in srgb, var(--accent) 46%, var(--line));
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 34%, transparent), transparent 55%),
+        var(--field);
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, transform .18s ease;
+    }
+    .upload-card:hover,
+    .upload-card.dragging {
+      border-color: var(--accent);
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 62%, transparent), transparent 55%),
+        var(--surface-strong);
+      transform: translateY(-1px);
+    }
+    .upload-icon {
+      display: grid;
+      place-items: center;
+      width: 52px;
+      height: 52px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--accent);
+      font: 900 24px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .upload-title {
+      margin: 0 0 5px;
+      color: var(--ink);
+      font: 800 16px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .upload-meta {
+      margin: 0;
+      color: var(--muted);
+      font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+      word-break: break-word;
+    }
+    .download-done {
+      display: none;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 36%, transparent);
+      background: color-mix(in srgb, var(--accent-soft) 45%, transparent);
+      color: var(--accent-strong);
+      font: 700 13px/1.6 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .download-done.active { display: block; }
     .error {
       margin: 0 0 18px;
       padding: 12px 14px;
@@ -584,6 +637,13 @@ PAGE = """
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
               <label for="docx">选择论文文件</label>
+              <label id="upload-card" class="upload-card" for="docx">
+                <span class="upload-icon">↑</span>
+                <span>
+                  <span id="upload-title" class="upload-title">点击选择 Word 论文</span>
+                  <span id="upload-meta" class="upload-meta">支持 .docx，文件选择后会显示名称；生成完成后自动下载 HTML 报告。</span>
+                </span>
+              </label>
               <input id="docx" name="docx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required>
               <button id="submit-button" type="submit">生成检测报告</button>
               <div id="progress-wrap" class="progress-wrap" role="status" aria-live="polite">
@@ -595,6 +655,7 @@ PAGE = """
                   <div id="progress-bar" class="progress-bar"></div>
                 </div>
               </div>
+              <div id="download-done" class="download-done">报告已开始下载，可以继续选择新文件生成下一份报告。</div>
               <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
             {% else %}
               <p class="error">这个账号的 3 次检测额度已经用完。</p>
@@ -674,6 +735,10 @@ PAGE = """
     const progressBar = document.getElementById('progress-bar');
     const progressPercent = document.getElementById('progress-percent');
     const progressMessage = document.getElementById('progress-message');
+    const uploadCard = document.getElementById('upload-card');
+    const uploadTitle = document.getElementById('upload-title');
+    const uploadMeta = document.getElementById('upload-meta');
+    const downloadDone = document.getElementById('download-done');
 
     const messages = [
       [10, '正在上传论文...'],
@@ -684,14 +749,48 @@ PAGE = """
       [92, '报告快好了，请稍等...']
     ];
 
-    if (form && fileInput && submitButton && progressWrap) form.addEventListener('submit', () => {
+    if (fileInput && uploadTitle && uploadMeta) fileInput.addEventListener('change', () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      uploadTitle.textContent = file.name;
+      uploadMeta.textContent = `${(file.size / 1024 / 1024).toFixed(2)} MB · 已选择，点击下方按钮开始检测`;
+      if (downloadDone) downloadDone.classList.remove('active');
+    });
+
+    if (uploadCard && fileInput) {
+      ['dragenter', 'dragover'].forEach(eventName => {
+        uploadCard.addEventListener(eventName, event => {
+          event.preventDefault();
+          uploadCard.classList.add('dragging');
+        });
+      });
+      ['dragleave', 'drop'].forEach(eventName => {
+        uploadCard.addEventListener(eventName, event => {
+          event.preventDefault();
+          uploadCard.classList.remove('dragging');
+        });
+      });
+      uploadCard.addEventListener('drop', event => {
+        const file = event.dataTransfer.files[0];
+        if (!file) return;
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        fileInput.files = transfer.files;
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    }
+
+    if (form && fileInput && submitButton && progressWrap) form.addEventListener('submit', async event => {
+      event.preventDefault();
       if (!fileInput.files.length) return;
 
       submitButton.disabled = true;
       submitButton.textContent = '检测中，请稍等...';
       progressWrap.classList.add('active');
+      if (downloadDone) downloadDone.classList.remove('active');
 
       let progress = 0;
+      let finished = false;
       const tick = () => {
         const nextLimit = progress < 30 ? 30 : progress < 70 ? 70 : 92;
         const step = progress < 30 ? 6 : progress < 70 ? 3 : 1;
@@ -703,8 +802,64 @@ PAGE = """
         if (current) progressMessage.textContent = current[1];
       };
 
+      const finishDownloadState = () => {
+        if (finished) return;
+        finished = true;
+        progress = 100;
+        progressBar.style.width = '100%';
+        progressPercent.textContent = '100%';
+        progressMessage.textContent = '报告已开始下载';
+        submitButton.disabled = false;
+        submitButton.textContent = '继续生成报告';
+        if (downloadDone) downloadDone.classList.add('active');
+      };
+
+      const extractFilename = response => {
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const encodedMatch = disposition.match(/filename\\*=UTF-8''([^;]+)/i);
+        if (encodedMatch) return decodeURIComponent(encodedMatch[1]);
+        const normalMatch = disposition.match(/filename="?([^";]+)"?/i);
+        return normalMatch ? normalMatch[1] : 'thesis_format_audit_report.html';
+      };
+
       tick();
-      window.setInterval(tick, 900);
+      const progressTimer = window.setInterval(() => {
+        if (finished) {
+          window.clearInterval(progressTimer);
+          return;
+        }
+        tick();
+      }, 900);
+
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST',
+          body: new FormData(form),
+          credentials: 'same-origin'
+        });
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || '检测失败，请稍后再试。');
+        }
+        const blob = await response.blob();
+        const downloadUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = extractFilename(response);
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(downloadUrl);
+        finishDownloadState();
+      } catch (error) {
+        finished = true;
+        window.clearInterval(progressTimer);
+        progressBar.style.width = '0%';
+        progressPercent.textContent = '0%';
+        progressMessage.textContent = error.message || '检测失败，请稍后再试。';
+        submitButton.disabled = false;
+        submitButton.textContent = '重新生成报告';
+      }
     });
   </script>
 </body>
