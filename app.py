@@ -130,6 +130,13 @@ def registration_values(email: str, password: str, confirm_password: str) -> dic
     }
 
 
+def login_values(email: str, password: str) -> dict:
+    return {
+        "login_email": email,
+        "login_password": password,
+    }
+
+
 def is_valid_captcha(answer: str, left: str, right: str) -> bool:
     try:
         return int(answer.strip()) == int(left) + int(right)
@@ -576,8 +583,8 @@ PAGE = """
             <form class="auth-box {% if auth_mode == 'login' %}active{% endif %}" method="post" action="{{ url_for('login') }}" data-auth-panel="login">
               <h2>登录</h2>
               <p class="auth-copy">使用已注册邮箱进入检测面板，系统会继续记录你的剩余次数。</p>
-              <input name="email" type="email" placeholder="邮箱" autocomplete="email" required>
-              <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+              <input name="email" type="email" placeholder="邮箱" autocomplete="email" value="{{ auth_values.get('login_email', '') }}" required>
+              <input name="password" type="password" placeholder="密码" autocomplete="current-password" value="{{ auth_values.get('login_password', '') }}" required>
               <button type="submit">登录后检测</button>
             </form>
             <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
@@ -720,9 +727,10 @@ def login():
         return render_home(auth_error="服务还没有配置 Supabase 数据库。"), 503
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
+    auth_values = login_values(email, password)
     user = find_user_by_email(email)
     if user is None or not check_password_hash(user["password_hash"], password):
-        return render_home(auth_error="邮箱或密码不正确。"), 400
+        return render_home(auth_error="邮箱或密码不正确。请确认这个邮箱已经注册，并且密码没有输错。", auth_mode="login", auth_values=auth_values), 400
     session["user_id"] = user["id"]
     return redirect(url_for("index"))
 
