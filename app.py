@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -204,4 +205,4 @@ def health() -> str:
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)

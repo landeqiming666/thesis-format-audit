@@ -1,3 +1,12 @@
+---
+title: Thesis Format Audit
+emoji: 📄
+colorFrom: green
+colorTo: gray
+sdk: docker
+pinned: false
+---
+
 # 本科论文格式检测 Web 版
 
 这个项目把原本的 macOS 命令行检测脚本包装成一个网页服务。用户上传 `.docx` 后，服务会调用 `thesis_format_audit.py` 生成 HTML 检测报告，并把报告返回给浏览器下载。
@@ -24,3 +33,9 @@ http://127.0.0.1:8000
 3. Render 会读取 `render.yaml` 并创建免费 Python Web Service。
 
 服务不需要 Supabase。Supabase 适合数据库、登录和文件存储；这个工具只需要临时接收 Word 文件并生成报告。
+
+## Hugging Face Spaces 部署
+
+这个项目也可以部署到 Hugging Face Spaces，适合没有信用卡、只想给别人一个公开访问链接的场景。
+
+使用 Docker SDK 时，Spaces 会运行 `Dockerfile` 中的启动命令。
