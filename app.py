@@ -110,10 +110,41 @@ PAGE = """
       transition: transform .18s ease, background .18s ease;
     }
     button:hover { background: var(--accent-strong); transform: translateY(-1px); }
+    button:disabled {
+      cursor: wait;
+      background: #7d928b;
+      transform: none;
+    }
     .note {
       margin: 18px 0 0;
       color: var(--muted);
       font: 13px/1.8 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .progress-wrap {
+      display: none;
+      margin-top: 18px;
+      font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--muted);
+    }
+    .progress-wrap.active { display: block; }
+    .progress-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 8px;
+    }
+    .progress-track {
+      width: 100%;
+      height: 8px;
+      overflow: hidden;
+      background: #dfe7e2;
+      border: 1px solid #cad5cf;
+    }
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #54aa82);
+      transition: width .45s ease;
     }
     .error {
       margin: 0 0 16px;
@@ -155,15 +186,65 @@ PAGE = """
           <li>检测过程不改原文</li>
         </ul>
       </div>
-      <form class="panel" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
+      <form id="audit-form" class="panel" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
         {% if error %}<p class="error">{{ error }}</p>{% endif %}
         <label for="docx">选择论文文件</label>
         <input id="docx" name="docx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required>
-        <button type="submit">生成检测报告</button>
-        <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。</p>
+        <button id="submit-button" type="submit">生成检测报告</button>
+        <div id="progress-wrap" class="progress-wrap" role="status" aria-live="polite">
+          <div class="progress-head">
+            <span id="progress-message">正在上传论文...</span>
+            <strong id="progress-percent">0%</strong>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="progress-bar" class="progress-bar"></div>
+          </div>
+        </div>
+        <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
       </form>
     </section>
   </main>
+  <script>
+    const form = document.getElementById('audit-form');
+    const fileInput = document.getElementById('docx');
+    const submitButton = document.getElementById('submit-button');
+    const progressWrap = document.getElementById('progress-wrap');
+    const progressBar = document.getElementById('progress-bar');
+    const progressPercent = document.getElementById('progress-percent');
+    const progressMessage = document.getElementById('progress-message');
+
+    const messages = [
+      [10, '正在上传论文...'],
+      [28, '正在读取 Word 结构...'],
+      [46, '正在检查摘要、目录和标题...'],
+      [64, '正在检查正文、图表和公式...'],
+      [82, '正在生成 HTML 报告...'],
+      [92, '报告快好了，请稍等...']
+    ];
+
+    form.addEventListener('submit', () => {
+      if (!fileInput.files.length) return;
+
+      submitButton.disabled = true;
+      submitButton.textContent = '检测中，请稍等...';
+      progressWrap.classList.add('active');
+
+      let progress = 0;
+      const tick = () => {
+        const nextLimit = progress < 30 ? 30 : progress < 70 ? 70 : 92;
+        const step = progress < 30 ? 6 : progress < 70 ? 3 : 1;
+        progress = Math.min(nextLimit, progress + step);
+        progressBar.style.width = `${progress}%`;
+        progressPercent.textContent = `${progress}%`;
+
+        const current = [...messages].reverse().find(([limit]) => progress >= limit);
+        if (current) progressMessage.textContent = current[1];
+      };
+
+      tick();
+      window.setInterval(tick, 900);
+    });
+  </script>
 </body>
 </html>
 """
