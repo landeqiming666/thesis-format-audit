@@ -1,5 +1,6 @@
 .venv/
 .codex-tasks/
+supabase/.temp/
 __pycache__/
 *.pyc
 .DS_Store
