@@ -178,7 +178,7 @@ PAGE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>论文格式检测</title>
+  <title>UPC本科论文格式检测工具</title>
   <style>
     :root {
       color-scheme: light;
@@ -643,14 +643,14 @@ PAGE = """
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">审</span>
-        <span>Thesis Format Audit</span>
+        <span>UPC本科论文格式检测工具</span>
       </div>
       <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换夜间模式">夜间模式</button>
     </header>
     <section class="shell">
       <div>
         <div class="mark"></div>
-        <h1>本科论文格式检测</h1>
+        <h1>UPC本科论文格式检测工具</h1>
         <p class="lead">上传 Word 论文，系统会检查摘要、目录、标题、正文、图表、公式、参考文献和页码，并生成可交互的 HTML 报告。</p>
         <ul class="facts">
           <li>仅支持 .docx</li>

@@ -1,5 +1,5 @@
 ---
-title: Thesis Format Audit
+title: UPC本科论文格式检测工具
 emoji: 📄
 colorFrom: green
 colorTo: gray
@@ -7,7 +7,7 @@ sdk: docker
 pinned: false
 ---
 
-# 本科论文格式检测 Web 版
+# UPC本科论文格式检测工具
 
 这个项目把原本的 macOS 命令行检测脚本包装成一个网页服务。用户上传 `.docx` 后，服务会调用 `thesis_format_audit.py` 生成 HTML 检测报告，并把报告返回给浏览器下载。
 
