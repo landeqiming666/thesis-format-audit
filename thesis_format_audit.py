@@ -1302,6 +1302,8 @@ def audit_figures_tables(ctx: AuditContext):
     doc = ctx.doc
     official_figure_caption_size = 12
     fig_cap_pat = re.compile(r"^图(\d+)-(\d+)\s+(.+)$")
+    dot_fig_cap_pat = re.compile(r"^图(\d+)\.(\d+)\s+(.+)$")
+    dot_table_cap_pat = re.compile(r"^表(\d+)\.(\d+)\s+(.+)$")
     cap_pat = re.compile(r"^([图表][A-Z]?\d+-?\d*)\s+(.+)")
     body = "\n".join(p.text for p in doc.paragraphs)
     body_start = find_first_chapter_index(doc) or 0
@@ -1319,9 +1321,20 @@ def audit_figures_tables(ctx: AuditContext):
     image_caption_bad = []
     figure_number_bad = []
     figure_reference_bad = []
+    dot_number_bad = []
+    dot_number_seen = set()
+
+    def add_dot_number_bad(item):
+        key = (item[0], item[1])
+        if key not in dot_number_seen:
+            dot_number_seen.add(key)
+            dot_number_bad.append(item)
 
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
+        dot_m = dot_fig_cap_pat.match(text)
+        if dot_m and len(text) < 100:
+            add_dot_number_bad((i + 1, f"图{dot_m.group(1)}.{dot_m.group(2)}", f"应写作图{dot_m.group(1)}-{dot_m.group(2)}", text))
         m = fig_cap_pat.match(text)
         if not m:
             continue
@@ -1352,6 +1365,18 @@ def audit_figures_tables(ctx: AuditContext):
         p.text for p in doc.paragraphs
         if not (fig_cap_pat.match(p.text.strip()) and is_centered(p) and len(p.text.strip()) < 100)
     )
+
+    for i, p in enumerate(doc.paragraphs):
+        text = p.text.strip()
+        if i < body_start or i >= body_end or not text:
+            continue
+        for m in re.finditer(r"(?<![A-Za-z0-9])([图表])(\d+)\.(\d+)", text):
+            expected = f"{m.group(1)}{m.group(2)}-{m.group(3)}"
+            add_dot_number_bad((i + 1, m.group(0), f"应写作{expected}", short_sample(text, 100)))
+            break
+        if dot_table_cap_pat.match(text) and len(text) < 100:
+            tm = dot_table_cap_pat.match(text)
+            add_dot_number_bad((i + 1, f"表{tm.group(1)}.{tm.group(2)}", f"应写作表{tm.group(1)}-{tm.group(2)}", text))
 
     for idx, p in enumerate(doc.paragraphs):
         if not has_drawing(p):
@@ -1404,10 +1429,15 @@ def audit_figures_tables(ctx: AuditContext):
     )
     ctx.add(
         "插图编号连续性",
-        "PASS" if not figure_number_bad else "FAIL",
+        "PASS" if not figure_number_bad and not dot_number_bad else "FAIL",
         "正文插图",
-        "图号应按一级标题编排，如第3章第1个图为“图3-1”，并在同章内依次连续编号。",
-        "异常项：" + html.escape(str(figure_number_bad[:20])) if figure_number_bad else html.escape(str({ch: sorted(seqs) for ch, seqs in sorted(by_chapter.items())})),
+        "图表编号应按一级标题编排，如第3章第1个图为“图3-1”；正文引用也应使用短横线编号，不能写作“图3.1/表3.1”。",
+        (
+            ("点号编号异常：" + html.escape(str(dot_number_bad[:20])) if dot_number_bad else "")
+            + ("<br>连续性异常：" + html.escape(str(figure_number_bad[:20])) if figure_number_bad else "")
+            if (dot_number_bad or figure_number_bad)
+            else html.escape(str({ch: sorted(seqs) for ch, seqs in sorted(by_chapter.items())}))
+        ),
         "重要",
     )
     ctx.add(
@@ -1449,10 +1479,28 @@ def cell_border_val(cell, edge: str) -> Optional[str]:
     return el.get(qn("val"))
 
 
+def table_border_val(table, edge: str) -> Optional[str]:
+    tbl_pr = table._tbl.tblPr
+    if tbl_pr is None:
+        return None
+    borders = tbl_pr.find(qn("tblBorders"))
+    if borders is None:
+        return None
+    el = borders.find(qn(edge))
+    if el is None:
+        return None
+    return el.get(qn("val"))
+
+
+def border_is_visible(value: Optional[str]) -> bool:
+    return value not in (None, "nil", "none")
+
+
 def audit_tables(ctx: AuditContext):
     doc = ctx.doc
     blocks = list(iter_body_blocks(doc))
     body_cap_pat = re.compile(r"^表(\d+)-(\d+) [^\s].+")
+    dot_body_cap_pat = re.compile(r"^表(\d+)\.(\d+)\s+(.+)")
     app_cap_pat = re.compile(r"^表([A-Z])-(\d+) [^\s].+")
     cont_cap_pat = re.compile(r"^续表((?:\d+-\d+)|(?:[A-Z]-\d+))$")
     body_text_no_captions = []
@@ -1468,6 +1516,7 @@ def audit_tables(ctx: AuditContext):
     ref_bad = []
     number_bad = []
     three_line_bad = []
+    dot_table_bad = []
     body_by_chapter: dict[int, list[int]] = defaultdict(list)
     app_by_letter: dict[str, list[int]] = defaultdict(list)
     caption_nums = []
@@ -1484,6 +1533,9 @@ def audit_tables(ctx: AuditContext):
                 prev_p = blocks[j][1]
                 break
         cap_text = prev_p.text.strip() if prev_p is not None else ""
+        dot_m = dot_body_cap_pat.match(cap_text)
+        if dot_m:
+            dot_table_bad.append((bi + 1, f"表{dot_m.group(1)}.{dot_m.group(2)}", f"应写作表{dot_m.group(1)}-{dot_m.group(2)}", cap_text))
         body_m = body_cap_pat.match(cap_text)
         app_m = app_cap_pat.match(cap_text)
         cont_m = cont_cap_pat.match(cap_text)
@@ -1536,6 +1588,8 @@ def audit_tables(ctx: AuditContext):
             ref_bad.append((num, cap_text, "正文未检测到表号引用"))
 
         if table.rows:
+            tbl_top = table_border_val(table, "top")
+            tbl_bottom = table_border_val(table, "bottom")
             top_vals = [cell_border_val(cell, "top") for cell in table.rows[0].cells]
             mid_vals = [cell_border_val(cell, "bottom") for cell in table.rows[0].cells]
             bottom_vals = [cell_border_val(cell, "bottom") for cell in table.rows[-1].cells]
@@ -1543,14 +1597,21 @@ def audit_tables(ctx: AuditContext):
             for row in table.rows:
                 for cell in row.cells:
                     vertical_vals.extend([cell_border_val(cell, "left"), cell_border_val(cell, "right")])
-            if not all(v not in (None, "nil", "none") for v in top_vals):
+            has_top = border_is_visible(tbl_top) or all(border_is_visible(v) for v in top_vals)
+            has_mid = all(border_is_visible(v) for v in mid_vals)
+            has_bottom = border_is_visible(tbl_bottom) or all(border_is_visible(v) for v in bottom_vals)
+            has_vertical = any(border_is_visible(v) for v in vertical_vals)
+            if not has_top:
                 three_line_bad.append((num, "首行上边线缺失"))
-            if len(table.rows) > 1 and not all(v not in (None, "nil", "none") for v in mid_vals):
+            if len(table.rows) > 1 and not has_mid:
                 three_line_bad.append((num, "表头下方横线缺失"))
-            if not all(v not in (None, "nil", "none") for v in bottom_vals):
+            if not has_bottom:
                 three_line_bad.append((num, "末行下边线缺失"))
-            if any(v not in (None, "nil", "none") for v in vertical_vals):
+            if has_vertical:
                 three_line_bad.append((num, "检测到竖线，三线表一般不应使用竖线"))
+            style_name = table.style.name if table.style is not None else ""
+            if style_name in ("Table Grid", "网格型") and not has_vertical:
+                three_line_bad.append((num, f"表格样式为{style_name}，需复核是否保留了全框线"))
 
     for ch, seqs in sorted(body_by_chapter.items()):
         expected = list(range(1, max(seqs) + 1))
@@ -1577,10 +1638,15 @@ def audit_tables(ctx: AuditContext):
     )
     ctx.add(
         "表格编号连续性",
-        "PASS" if not number_bad else "FAIL",
+        "PASS" if not number_bad and not dot_table_bad else "FAIL",
         "正文和附录表格",
-        "表号应按一级标题编排，如第3章第1个表为“表3-1”，并在同章内依次连续编号。",
-        "异常项：" + html.escape(str(number_bad[:20])) if number_bad else html.escape(str({ch: sorted(seqs) for ch, seqs in sorted(body_by_chapter.items())})),
+        "表号应按一级标题编排，如第3章第1个表为“表3-1”，不能写作“表3.1”，并在同章内依次连续编号。",
+        (
+            ("点号编号异常：" + html.escape(str(dot_table_bad[:20])) if dot_table_bad else "")
+            + ("<br>连续性异常：" + html.escape(str(number_bad[:20])) if number_bad else "")
+            if (dot_table_bad or number_bad)
+            else html.escape(str({ch: sorted(seqs) for ch, seqs in sorted(body_by_chapter.items())}))
+        ),
         "重要",
     )
     ctx.add(
