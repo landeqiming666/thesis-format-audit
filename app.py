@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from flask import Flask, Response, redirect, render_template_string, request, send_file, session, url_for
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -22,9 +23,29 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 MAX_SUBMISSIONS = 3
+AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
+
+
+def auth_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.secret_key, salt="thesis-audit-auth")
+
+
+def generate_auth_token(user_id: str) -> str:
+    return auth_serializer().dumps({"user_id": user_id})
+
+
+def user_id_from_token(token: str) -> str | None:
+    if not token:
+        return None
+    try:
+        data = auth_serializer().loads(token, max_age=AUTH_TOKEN_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    user_id = data.get("user_id")
+    return str(user_id) if user_id else None
 
 
 def get_supabase() -> Client:
@@ -79,6 +100,10 @@ def increment_submissions(user_id: str) -> None:
 def current_user() -> dict | None:
     user_id = session.get("user_id")
     if not user_id:
+        user_id = user_id_from_token(request.values.get("auth_token", ""))
+        if user_id:
+            session["user_id"] = user_id
+    if not user_id:
         return None
     return find_user_by_id(user_id)
 
@@ -110,6 +135,7 @@ def render_home(
         captcha_right=session.get("captcha_right", ""),
         auth_mode=auth_mode,
         auth_values=auth_values,
+        auth_token=request.values.get("auth_token", ""),
         error=error,
         auth_error=auth_error,
     )
@@ -553,6 +579,7 @@ PAGE = """
             <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
           </div>
           <form id="audit-form" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
+            {% if auth_token %}<input name="auth_token" type="hidden" value="{{ auth_token }}">{% endif %}
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
@@ -720,7 +747,7 @@ def register():
     except APIError:
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
-    return redirect(url_for("index"))
+    return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
 
 @app.post("/login")
@@ -734,7 +761,7 @@ def login():
     if user is None or not check_password_hash(user["password_hash"], password):
         return render_home(auth_error="邮箱或密码不正确。请确认这个邮箱已经注册，并且密码没有输错。", auth_mode="login", auth_values=auth_values), 400
     session["user_id"] = user["id"]
-    return redirect(url_for("index"))
+    return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
 
 @app.get("/logout")
