@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import tempfile
 from pathlib import Path
 from uuid import uuid4
@@ -86,17 +87,28 @@ def remaining_submissions(user: dict | None) -> int:
     return max(0, MAX_SUBMISSIONS - int(user["submissions_used"]))
 
 
-def render_home(error: str = "", auth_error: str = "") -> str:
+def render_home(error: str = "", auth_error: str = "", auth_mode: str = "login") -> str:
     user = current_user()
+    if "captcha_answer" not in session:
+        refresh_captcha()
     return render_template_string(
         PAGE,
         user=user,
         configured=bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
         remaining=remaining_submissions(user),
         max_submissions=MAX_SUBMISSIONS,
+        captcha_question=session.get("captcha_question", ""),
+        auth_mode=auth_mode,
         error=error,
         auth_error=auth_error,
     )
+
+
+def refresh_captcha() -> None:
+    left = random.randint(2, 9)
+    right = random.randint(1, 8)
+    session["captcha_question"] = f"{left} + {right} = ?"
+    session["captcha_answer"] = str(left + right)
 
 
 PAGE = """
@@ -261,7 +273,8 @@ PAGE = """
       font: 15px/1.5 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     input[type="email"],
-    input[type="password"] {
+    input[type="password"],
+    input[type="text"] {
       width: 100%;
       margin-bottom: 12px;
       padding: 14px 15px;
@@ -352,17 +365,92 @@ PAGE = """
     }
     .auth-grid {
       display: grid;
+      grid-template-columns: 1fr;
+      gap: 0;
+    }
+    .auth-switch {
+      display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 18px;
+      gap: 8px;
+      margin-bottom: 22px;
+      padding: 5px;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--field) 78%, transparent);
+    }
+    .auth-tab {
+      margin: 0;
+      padding: 11px 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font-size: 14px;
+      box-shadow: none;
+    }
+    .auth-tab.active {
+      border-color: var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+    }
+    .auth-tab:hover {
+      transform: none;
+      background: var(--surface-strong);
     }
     .auth-box {
       min-width: 0;
+      display: none;
+    }
+    .auth-box.active {
+      display: block;
+      animation: rise .28s ease both;
     }
     .auth-box h2 {
-      margin: 0 0 14px;
-      font: 800 20px/1.3 "PingFang SC", "Noto Sans SC", sans-serif;
+      margin: 0 0 8px;
+      font: 800 22px/1.3 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .auth-copy {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     .auth-box button { margin-top: 4px; }
+    .captcha-row {
+      display: grid;
+      grid-template-columns: 116px 1fr;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .captcha-chip {
+      display: grid;
+      place-items: center;
+      margin-bottom: 12px;
+      border: 1px solid var(--line);
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font: 800 15px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .auth-rules {
+      display: grid;
+      gap: 10px;
+      margin-top: 20px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+    .auth-rule {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 10px;
+      color: var(--muted);
+      font: 13px/1.65 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .auth-rule span {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border: 1px solid var(--line);
+      color: var(--accent);
+      font-weight: 800;
+    }
     .usage {
       margin: 0 0 16px;
       color: var(--muted);
@@ -393,6 +481,7 @@ PAGE = """
       .shell { grid-template-columns: 1fr; min-height: auto; }
       .panel { padding: 22px; }
       .auth-grid { grid-template-columns: 1fr; }
+      .captcha-row { grid-template-columns: 1fr; }
       h1 { font-size: clamp(46px, 16vw, 68px); }
     }
   </style>
@@ -453,21 +542,35 @@ PAGE = """
         {% else %}
           <div class="panel-title"><strong>开始使用</strong><span>账号限制</span></div>
           {% if auth_error %}<p class="error">{{ auth_error }}</p>{% endif %}
+          <div class="auth-switch" role="tablist" aria-label="登录或注册">
+            <button class="auth-tab {% if auth_mode == 'login' %}active{% endif %}" type="button" data-auth-tab="login">登录</button>
+            <button class="auth-tab {% if auth_mode == 'register' %}active{% endif %}" type="button" data-auth-tab="register">注册</button>
+          </div>
           <div class="auth-grid">
-            <form class="auth-box" method="post" action="{{ url_for('login') }}">
+            <form class="auth-box {% if auth_mode == 'login' %}active{% endif %}" method="post" action="{{ url_for('login') }}" data-auth-panel="login">
               <h2>登录</h2>
+              <p class="auth-copy">使用已注册邮箱进入检测面板，系统会继续记录你的剩余次数。</p>
               <input name="email" type="email" placeholder="邮箱" autocomplete="email" required>
               <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
               <button type="submit">登录后检测</button>
             </form>
-            <form class="auth-box" method="post" action="{{ url_for('register') }}">
+            <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
               <h2>注册</h2>
+              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。请确认密码并完成数字验证。</p>
               <input name="email" type="email" placeholder="邮箱" autocomplete="email" required>
               <input name="password" type="password" placeholder="至少 6 位密码" autocomplete="new-password" minlength="6" required>
+              <input name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="6" required>
+              <div class="captcha-row">
+                <div class="captcha-chip">{{ captcha_question }}</div>
+                <input name="captcha_answer" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="输入计算结果" required>
+              </div>
               <button type="submit">创建账号</button>
             </form>
           </div>
-          <p class="note">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
+          <div class="auth-rules">
+            <div class="auth-rule"><span>1</span><p>每个账号最多生成 {{ max_submissions }} 次报告，次数保存在数据库中。</p></div>
+            <div class="auth-rule"><span>2</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
+          </div>
         {% endif %}
       </div>
     </section>
@@ -486,6 +589,18 @@ PAGE = """
       root.dataset.theme = nextTheme;
       localStorage.setItem('theme', nextTheme);
       themeToggle.textContent = nextTheme === 'dark' ? '日间模式' : '夜间模式';
+    });
+
+    document.querySelectorAll('[data-auth-tab]').forEach(tabButton => {
+      tabButton.addEventListener('click', () => {
+        const target = tabButton.dataset.authTab;
+        document.querySelectorAll('[data-auth-tab]').forEach(button => {
+          button.classList.toggle('active', button === tabButton);
+        });
+        document.querySelectorAll('[data-auth-panel]').forEach(panel => {
+          panel.classList.toggle('active', panel.dataset.authPanel === target);
+        });
+      });
     });
 
     const form = document.getElementById('audit-form');
@@ -541,19 +656,30 @@ def index() -> str:
 @app.post("/register")
 def register():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return render_home(auth_error="服务还没有配置 Supabase 数据库。"), 503
+        return render_home(auth_error="服务还没有配置 Supabase 数据库。", auth_mode="register"), 503
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
+    confirm_password = request.form.get("confirm_password", "")
+    captcha_answer = request.form.get("captcha_answer", "").strip()
     if not email or "@" not in email:
-        return render_home(auth_error="请输入有效邮箱。"), 400
+        refresh_captcha()
+        return render_home(auth_error="请输入有效邮箱。", auth_mode="register"), 400
     if len(password) < 6:
-        return render_home(auth_error="密码至少需要 6 位。"), 400
+        refresh_captcha()
+        return render_home(auth_error="密码至少需要 6 位。", auth_mode="register"), 400
+    if password != confirm_password:
+        refresh_captcha()
+        return render_home(auth_error="两次输入的密码不一致。", auth_mode="register"), 400
+    if captcha_answer != session.get("captcha_answer"):
+        refresh_captcha()
+        return render_home(auth_error="数字验证不正确，请重新计算。", auth_mode="register"), 400
 
     try:
         user = create_user(email, password)
         session["user_id"] = user["id"]
     except APIError:
-        return render_home(auth_error="这个邮箱已经注册，请直接登录。"), 400
+        refresh_captcha()
+        return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register"), 400
     return redirect(url_for("index"))
 
 
