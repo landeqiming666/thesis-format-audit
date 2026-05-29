@@ -570,6 +570,14 @@ PAGE = """
       color: var(--muted);
       font: 14px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
+    .quota-help {
+      margin: 0 0 18px;
+      padding: 12px 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 34%, transparent);
+      color: var(--accent-strong);
+      font: 700 13px/1.6 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
     .facts {
       display: flex;
       flex-wrap: wrap;
@@ -636,6 +644,7 @@ PAGE = """
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
+              <p class="quota-help">需要增加检测次数，请加入官方 QQ 群：537124215。</p>
               <label for="docx">选择论文文件</label>
               <label id="upload-card" class="upload-card" for="docx">
                 <span class="upload-icon">↑</span>
@@ -659,7 +668,7 @@ PAGE = """
               <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
             {% else %}
               <p class="error">这个账号的 3 次检测额度已经用完。</p>
-              <p class="note">如果需要继续使用，请联系管理员增加额度或更换账号。</p>
+              <p class="quota-help">如果需要继续使用，请加入官方 QQ 群：537124215，联系管理员增加额度。</p>
             {% endif %}
           </form>
         {% else %}
