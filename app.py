@@ -87,10 +87,16 @@ def remaining_submissions(user: dict | None) -> int:
     return max(0, MAX_SUBMISSIONS - int(user["submissions_used"]))
 
 
-def render_home(error: str = "", auth_error: str = "", auth_mode: str = "login") -> str:
+def render_home(
+    error: str = "",
+    auth_error: str = "",
+    auth_mode: str = "login",
+    auth_values: dict | None = None,
+) -> str:
     user = current_user()
     if "captcha_answer" not in session:
         refresh_captcha()
+    auth_values = auth_values or {}
     return render_template_string(
         PAGE,
         user=user,
@@ -98,7 +104,10 @@ def render_home(error: str = "", auth_error: str = "", auth_mode: str = "login")
         remaining=remaining_submissions(user),
         max_submissions=MAX_SUBMISSIONS,
         captcha_question=session.get("captcha_question", ""),
+        captcha_left=session.get("captcha_left", ""),
+        captcha_right=session.get("captcha_right", ""),
         auth_mode=auth_mode,
+        auth_values=auth_values,
         error=error,
         auth_error=auth_error,
     )
@@ -107,8 +116,25 @@ def render_home(error: str = "", auth_error: str = "", auth_mode: str = "login")
 def refresh_captcha() -> None:
     left = random.randint(2, 9)
     right = random.randint(1, 8)
+    session["captcha_left"] = str(left)
+    session["captcha_right"] = str(right)
     session["captcha_question"] = f"{left} + {right} = ?"
     session["captcha_answer"] = str(left + right)
+
+
+def registration_values(email: str, password: str, confirm_password: str) -> dict:
+    return {
+        "register_email": email,
+        "register_password": password,
+        "register_confirm_password": confirm_password,
+    }
+
+
+def is_valid_captcha(answer: str, left: str, right: str) -> bool:
+    try:
+        return int(answer.strip()) == int(left) + int(right)
+    except (TypeError, ValueError):
+        return False
 
 
 PAGE = """
@@ -557,11 +583,13 @@ PAGE = """
             <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
               <h2>注册</h2>
               <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。请确认密码并完成数字验证。</p>
-              <input name="email" type="email" placeholder="邮箱" autocomplete="email" required>
-              <input name="password" type="password" placeholder="至少 6 位密码" autocomplete="new-password" minlength="6" required>
-              <input name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="6" required>
+              <input name="email" type="email" placeholder="邮箱" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
+              <input name="password" type="password" placeholder="至少 6 位密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_password', '') }}" required>
+              <input name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_confirm_password', '') }}" required>
               <div class="captcha-row">
                 <div class="captcha-chip">{{ captcha_question }}</div>
+                <input name="captcha_left" type="hidden" value="{{ captcha_left }}">
+                <input name="captcha_right" type="hidden" value="{{ captcha_right }}">
                 <input name="captcha_answer" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="输入计算结果" required>
               </div>
               <button type="submit">创建账号</button>
@@ -661,25 +689,28 @@ def register():
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
     captcha_answer = request.form.get("captcha_answer", "").strip()
+    captcha_left = request.form.get("captcha_left", "")
+    captcha_right = request.form.get("captcha_right", "")
+    auth_values = registration_values(email, password, confirm_password)
     if not email or "@" not in email:
         refresh_captcha()
-        return render_home(auth_error="请输入有效邮箱。", auth_mode="register"), 400
+        return render_home(auth_error="请输入有效邮箱。", auth_mode="register", auth_values=auth_values), 400
     if len(password) < 6:
         refresh_captcha()
-        return render_home(auth_error="密码至少需要 6 位。", auth_mode="register"), 400
+        return render_home(auth_error="密码至少需要 6 位。", auth_mode="register", auth_values=auth_values), 400
     if password != confirm_password:
         refresh_captcha()
-        return render_home(auth_error="两次输入的密码不一致。", auth_mode="register"), 400
-    if captcha_answer != session.get("captcha_answer"):
+        return render_home(auth_error="两次输入的密码不一致。", auth_mode="register", auth_values=auth_values), 400
+    if not is_valid_captcha(captcha_answer, captcha_left, captcha_right):
         refresh_captcha()
-        return render_home(auth_error="数字验证不正确，请重新计算。", auth_mode="register"), 400
+        return render_home(auth_error="数字验证不正确，请重新计算。", auth_mode="register", auth_values=auth_values), 400
 
     try:
         user = create_user(email, password)
         session["user_id"] = user["id"]
     except APIError:
         refresh_captcha()
-        return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register"), 400
+        return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
     return redirect(url_for("index"))
 
 
