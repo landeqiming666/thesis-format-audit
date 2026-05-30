@@ -19,6 +19,7 @@ import html
 import json
 import re
 import sys
+import tempfile
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -40,6 +41,19 @@ W_URI = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 M_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
 OFFICIAL_FIXED_HEADER = "中国石油大学（华东）本科毕业设计（论文）"
 LEGACY_FIXED_HEADER = "中国石油大学（华东）本科毕业设计(论文)"
+STRICT_REL_PREFIX = "http://purl.oclc.org/ooxml/officeDocument/relationships"
+TRANSITIONAL_REL_PREFIX = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+STRICT_TO_TRANSITIONAL_URIS = {
+    STRICT_REL_PREFIX: TRANSITIONAL_REL_PREFIX,
+    "http://purl.oclc.org/ooxml/wordprocessingml/main": W_URI,
+    "http://purl.oclc.org/ooxml/officeDocument/math": "http://schemas.openxmlformats.org/officeDocument/2006/math",
+    "http://purl.oclc.org/ooxml/drawingml/main": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "http://purl.oclc.org/ooxml/drawingml/picture": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+    "http://purl.oclc.org/ooxml/officeDocument/sharedTypes": "http://schemas.openxmlformats.org/officeDocument/2006/sharedTypes",
+    "http://purl.oclc.org/ooxml/officeDocument/extendedProperties": "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties",
+    "http://purl.oclc.org/ooxml/officeDocument/customProperties": "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
+}
 
 
 def qn(tag: str) -> str:
@@ -663,6 +677,54 @@ def xml_has_toc_field(xml: str) -> bool:
 
 def docx_pageref_count(path: Path) -> int:
     return document_xml(path).count("PAGEREF")
+
+
+def make_python_docx_compatible_copy(path: Path, work_dir: Path) -> Path:
+    """Convert Strict OOXML relationship types in a temp copy for python-docx."""
+    try:
+        with zipfile.ZipFile(path) as src:
+            names = src.namelist()
+            xml_names = [
+                name for name in names
+                if name.endswith((".xml", ".rels")) and not name.startswith("word/media/")
+            ]
+            needs_rewrite = any(
+                any(strict in src.read(name).decode("utf-8", errors="ignore") for strict in STRICT_TO_TRANSITIONAL_URIS)
+                for name in xml_names
+            )
+            if not needs_rewrite:
+                return path
+
+            fixed = work_dir / f"{path.stem}_compatible.docx"
+            with zipfile.ZipFile(fixed, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+                for info in src.infolist():
+                    data = src.read(info.filename)
+                    if info.filename in xml_names:
+                        for strict, transitional in STRICT_TO_TRANSITIONAL_URIS.items():
+                            data = data.replace(strict.encode("utf-8"), transitional.encode("utf-8"))
+                    dst.writestr(info, data)
+            return fixed
+    except zipfile.BadZipFile as exc:
+        raise ValueError("这个文件扩展名是 .docx，但内部不是有效的 Word 文档包。请在 Word/WPS 中另存为 .docx 后再上传。") from exc
+
+
+def open_docx_document(path: Path, work_dir: Optional[Path] = None) -> tuple[Document, Path]:
+    if work_dir is None:
+        with tempfile.TemporaryDirectory(prefix="docx-compat-") as tmp:
+            return open_docx_document(path, Path(tmp))
+
+    compatible_path = make_python_docx_compatible_copy(path, work_dir)
+    try:
+        return Document(compatible_path), compatible_path
+    except KeyError as exc:
+        if "officeDocument" in str(exc):
+            raise ValueError(
+                "这个 DOCX 的内部关系文件不标准，无法定位正文 document.xml。"
+                "请在 Word 或 WPS 中打开后选择“另存为 .docx”，再重新上传。"
+            ) from exc
+        raise
+    except Exception as exc:
+        raise ValueError(f"无法读取这个 DOCX：{exc}") from exc
 
 
 def paragraph_has_toc_field(paragraph) -> bool:
@@ -3854,26 +3916,27 @@ syncAllChecks();
 
 
 def run_audit(path: Path, out: Path) -> AuditContext:
-    doc = Document(path)
-    ctx = AuditContext(path=path, doc=doc)
-    audit_basic(ctx)
-    audit_template_residue(ctx)
-    audit_abstracts(ctx)
-    audit_toc(ctx)
-    audit_headings(ctx)
-    audit_body_and_numbering(ctx)
-    audit_chinese_punctuation(ctx)
-    audit_figures_tables(ctx)
-    audit_tables(ctx)
-    audit_units(ctx)
-    audit_formulas(ctx)
-    audit_references(ctx)
-    audit_appendix(ctx)
-    audit_acknowledgement(ctx)
-    audit_headers_footers_structural(ctx)
-    audit_page_numbers(ctx)
-    build_report(ctx, out)
-    return ctx
+    with tempfile.TemporaryDirectory(prefix="docx-compat-") as tmp:
+        doc, audit_path = open_docx_document(path, Path(tmp))
+        ctx = AuditContext(path=audit_path, doc=doc)
+        audit_basic(ctx)
+        audit_template_residue(ctx)
+        audit_abstracts(ctx)
+        audit_toc(ctx)
+        audit_headings(ctx)
+        audit_body_and_numbering(ctx)
+        audit_chinese_punctuation(ctx)
+        audit_figures_tables(ctx)
+        audit_tables(ctx)
+        audit_units(ctx)
+        audit_formulas(ctx)
+        audit_references(ctx)
+        audit_appendix(ctx)
+        audit_acknowledgement(ctx)
+        audit_headers_footers_structural(ctx)
+        audit_page_numbers(ctx)
+        build_report(ctx, out)
+        return ctx
 
 
 def main(argv: Optional[list[str]] = None) -> int:
