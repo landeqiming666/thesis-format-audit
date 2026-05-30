@@ -2176,9 +2176,9 @@ PAGE = """
                 </div>
                 <p id="email-code-note" class="verify-note">
                   {% if email_code_sent %}
-                    验证码已发送到 {{ email_code_target }}，10 分钟内有效。
+                    验证码已发送到 {{ email_code_target }}，10 分钟内有效。若收不到，请查看垃圾邮箱或广告邮件。
                   {% else %}
-                    使用 QQ 邮箱接收 6 位验证码，发送前请先填写邮箱。
+                    使用 QQ 邮箱接收 6 位验证码，发送前请先填写邮箱。若收不到验证码，请查看垃圾邮箱或广告邮件。
                   {% endif %}
                 </p>
               {% else %}
@@ -2519,12 +2519,12 @@ PAGE = """
             throw new Error(data.message || '发送验证码失败，请稍后再试。');
           }
           if (emailCodeNote) {
-            emailCodeNote.textContent = `验证码已发送到 ${email}，10 分钟内有效。`;
+            emailCodeNote.textContent = `验证码已发送到 ${email}，10 分钟内有效。若收不到，请查看垃圾邮箱或广告邮件。`;
           }
           startEmailCodeCountdown(Number(data.resend_seconds || {{ email_code_resend_seconds }}));
           showModal({
             title: '验证码已发送',
-            body: `我们已经把 6 位验证码发送到了 ${email}，请到邮箱中查看。`
+            body: `我们已经把 6 位验证码发送到了 ${email}，请到邮箱中查看。若收不到验证码，请查看垃圾邮箱或广告邮件。`
           });
           registerEmailCodeInput?.focus();
         } catch (error) {
@@ -4997,7 +4997,7 @@ def send_register_email_code():
         return Response(message, status=500, mimetype="text/plain; charset=utf-8")
 
     store_email_code(email, code)
-    message = "验证码已发送，请到邮箱中查看。"
+    message = "验证码已发送，请到邮箱中查看。若收不到验证码，请查看垃圾邮箱或广告邮件。"
     if wants_json:
         return jsonify({"ok": True, "message": message, "resend_seconds": EMAIL_CODE_RESEND_SECONDS})
     return Response(message, mimetype="text/plain; charset=utf-8")
