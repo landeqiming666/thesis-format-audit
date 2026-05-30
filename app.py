@@ -43,6 +43,22 @@ ADMIN_EMAILS = {
 }
 
 
+def uploaded_docx_names(filename: str) -> tuple[str, str] | None:
+    raw_name = (filename or "").strip()
+    if not raw_name.lower().endswith(".docx"):
+        return None
+    safe_name = secure_filename(raw_name)
+    if not safe_name:
+        safe_name = "thesis.docx"
+    elif not safe_name.lower().endswith(".docx"):
+        # Werkzeug may strip non-ASCII filenames down to "docx"; keep the
+        # original extension decision but use a safe server-side name.
+        safe_name = f"{safe_name}.docx"
+    display_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
+    display_stem = display_name[:-5].strip() or Path(safe_name).stem or "thesis"
+    return safe_name, f"{display_stem}_format_audit_report.html"
+
+
 def auth_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(app.secret_key, salt="thesis-audit-auth")
 
@@ -1301,14 +1317,15 @@ def audit():
     if not upload or not upload.filename:
         return render_home(error="请先选择一个 .docx 文件。"), 400
 
-    original_name = secure_filename(upload.filename) or "thesis.docx"
-    if not original_name.lower().endswith(".docx"):
+    names = uploaded_docx_names(upload.filename)
+    if names is None:
         return render_home(error="当前只支持 .docx 文件。"), 400
+    _safe_name, download_name = names
 
     with tempfile.TemporaryDirectory(prefix="thesis-audit-") as tmp:
         tmp_path = Path(tmp)
         docx_path = tmp_path / f"{uuid4().hex}.docx"
-        report_path = tmp_path / f"{Path(original_name).stem}_format_audit_report.html"
+        report_path = tmp_path / download_name
         upload.save(docx_path)
 
         try:
@@ -1320,7 +1337,6 @@ def audit():
         fresh_user = find_user_by_id(user["id"])
         remaining = remaining_submissions(fresh_user)
 
-        download_name = f"{Path(original_name).stem}_format_audit_report.html"
         response = send_file(report_path, as_attachment=True, download_name=download_name, mimetype="text/html")
         response.headers["X-Remaining-Submissions"] = str(remaining)
         return response
