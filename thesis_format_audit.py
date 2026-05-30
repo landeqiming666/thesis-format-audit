@@ -372,6 +372,38 @@ def effective_first_line_chars(paragraph, chars: int = 200) -> bool:
     return False
 
 
+def effective_first_line_indent_ok(paragraph) -> bool:
+    if effective_first_line_chars(paragraph, 200):
+        return True
+    ppr = paragraph._p.pPr
+    candidates = []
+    if ppr is not None and ppr.ind is not None:
+        candidates.append(ppr.ind)
+    for style in iter_style_chain(paragraph.style):
+        sppr = getattr(style._element, "pPr", None)
+        if sppr is not None and sppr.ind is not None:
+            candidates.append(sppr.ind)
+    for ind in candidates:
+        first_line = ind.get(qn("firstLine"))
+        if first_line is None:
+            continue
+        try:
+            twips = int(first_line)
+        except ValueError:
+            continue
+        if 400 <= twips <= 560:
+            return True
+    return False
+
+
+def is_subfigure_label_paragraph(text: str) -> bool:
+    if not text:
+        return False
+    if not re.match(r"^\s*[（(][a-z][）)]", text, flags=re.IGNORECASE):
+        return False
+    return len(text) < 140 and not re.search(r"[。；;，,]$", text)
+
+
 def para_has_snap_to_grid(paragraph) -> bool:
     ppr = paragraph._p.pPr
     if ppr is None:
@@ -487,7 +519,7 @@ def caption_run_segments(paragraph, text: str, num: str, title: str) -> list[tup
     return segments
 
 
-def caption_segment_issues(paragraph, segment_text: str, runs: list, expected_size: float = 12) -> list[str]:
+def caption_segment_issues(paragraph, segment_text: str, runs: list, expected_size: float = 12, strict_size: bool = True) -> list[str]:
     issues = []
     size_values = []
     east_values = []
@@ -507,15 +539,43 @@ def caption_segment_issues(paragraph, segment_text: str, runs: list, expected_si
             latin_values.append(r_latin)
 
     bad_sizes = [s for s in size_values if abs(s - expected_size) > 0.2]
+    if not strict_size:
+        bad_sizes = [s for s in bad_sizes if not any(abs(s - ok) <= 0.2 for ok in (10.5, 12))]
     if bad_sizes:
         shown = "/".join(f"{s:g}" for s in bad_sizes[:3])
         issues.append(f"当前字号{shown}pt，应为小四12pt")
     bad_east = [f for f in east_values if f != "宋体"]
     if has_cjk(segment_text) and bad_east:
         issues.append(f"当前中文字体{'/'.join(bad_east[:3])}，应为宋体")
+        near_five = [s for s in size_values if abs(s - 10.5) <= 0.2]
+        if not strict_size and near_five:
+            issues.append("当前字号五号，按维普图题文字规范应为小四12pt")
     bad_latin = [f for f in latin_values if f != "Times New Roman"]
     if has_latin_or_digit(segment_text) and bad_latin:
         issues.append(f"当前西文字体{'/'.join(bad_latin[:3])}，应为Times New Roman")
+    return issues
+
+
+def vip_figure_label_issues(paragraph, segment_text: str, runs: list) -> list[str]:
+    issues = []
+    target_runs = runs or [r for r in paragraph.runs if r.text and r.text.strip()]
+    size_values = []
+    east_values = []
+    for run in target_runs:
+        if not run.text or not run.text.strip():
+            continue
+        r_size = effective_size_for_run(paragraph, run)
+        r_east = effective_east_asia_for_run(paragraph, run)
+        if r_size is not None and r_size not in size_values:
+            size_values.append(r_size)
+        if has_cjk(run.text) and r_east is not None and r_east not in east_values:
+            east_values.append(r_east)
+    bad_sizes = [s for s in size_values if abs(s - 10.5) > 0.2]
+    if bad_sizes:
+        issues.append(f"当前字号{'/'.join(f'{s:g}' for s in bad_sizes[:3])}pt，应为五号10.5pt")
+    bad_east = [f for f in east_values if f != "宋体"]
+    if has_cjk(segment_text) and bad_east:
+        issues.append(f"当前中文字体{'/'.join(bad_east[:3])}，应为宋体")
     return issues
 
 
@@ -551,6 +611,8 @@ def is_probable_body_paragraph(paragraph) -> bool:
     if text in ("摘  要", "Abstract", "目  录", "致  谢", "参考文献", "附  录"):
         return False
     if text.startswith(("关键词", "Keywords")):
+        return False
+    if is_subfigure_label_paragraph(text):
         return False
     if len(text) < 25:
         return False
@@ -772,6 +834,41 @@ def paragraph_has_pageref_field(paragraph) -> bool:
 
 def find_first_chapter_index(doc: Document) -> Optional[int]:
     return find_first(doc, lambda p: p.style.name.startswith("Heading") and re.match(r"^第\s*1\s*章", p.text.strip()))
+
+
+def visible_word_count(text: str) -> tuple[int, int, int, int]:
+    """Approximate VIP's visible-word statistics using CJK chars, English words and numbers."""
+    cjk = len(re.findall(r"[\u3400-\u9fff]", text or ""))
+    english_words = len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", text or ""))
+    numbers = len(re.findall(r"\d+(?:\.\d+)?", text or ""))
+    return cjk + english_words + numbers, cjk, english_words, numbers
+
+
+def body_text_with_tables(ctx: AuditContext, start: int, end: int) -> str:
+    parts = []
+    paragraph_index = 0
+    for kind, block in ctx.body_blocks:
+        if kind == "p":
+            if start <= paragraph_index < end:
+                parts.append(block.text)
+            paragraph_index += 1
+        elif start <= paragraph_index < end:
+            parts.append(table_plain_text(block))
+    return "\n".join(parts)
+
+
+def normalize_title_for_compare(text: str) -> str:
+    text = re.sub(r"[\t\u3000]+", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*\d+\s*$", "", text).strip()
+    return clean_text(text)
+
+
+def looks_like_foreign_reference(text: str) -> bool:
+    sample = re.sub(r"\[[A-Z]+(?:/OL)?\]", "", text or "")
+    letters = len(re.findall(r"[A-Za-z]", sample))
+    cjk = len(re.findall(r"[\u3400-\u9fff]", sample))
+    return letters >= 20 and letters > cjk * 2
 
 
 def audit_basic(ctx: AuditContext):
@@ -1157,6 +1254,45 @@ def audit_toc(ctx: AuditContext):
     else:
         ctx.add("目录内容", "PASS", "目录页", "目录未包含摘要/ABSTRACT，未发现模板占位内容。")
 
+    toc_entries = []
+    for i in range(toc_start + 1, body_start):
+        raw = doc.paragraphs[i].text.strip()
+        if not raw:
+            continue
+        entry = re.sub(r"\.{2,}|\u2026+", " ", raw)
+        entry = re.sub(r"\s*\d+\s*$", "", entry).strip()
+        if entry and not re.fullmatch(r"\d+", entry):
+            toc_entries.append((i + 1, raw, normalize_title_for_compare(entry)))
+    body_titles = []
+    tail_titles = {"致谢", "参考文献", "附录"}
+    for i, p in enumerate(doc.paragraphs[body_start:], body_start):
+        text = p.text.strip()
+        if not text:
+            continue
+        norm = normalize_title_for_compare(text)
+        if p.style.name in ("Heading 1", "Heading 2", "Heading 3") or clean_text(text) in tail_titles:
+            body_titles.append((i + 1, text, norm))
+    body_title_norms = {norm for _, _, norm in body_titles if norm}
+    toc_title_norms = {norm for _, _, norm in toc_entries if norm}
+    toc_missing = [(line, raw) for line, raw, norm in toc_entries if norm and norm not in body_title_norms]
+    body_missing = [
+        (line, raw) for line, raw, norm in body_titles
+        if norm and norm not in toc_title_norms and not re.match(r"^附\s*录", raw)
+    ]
+    ctx.add(
+        "目录与正文标题一致性",
+        "PASS" if not toc_missing and not body_missing else "FAIL",
+        "目录页",
+        "目录条目应与正文一、二、三级标题以及致谢、参考文献等结构标题一致，更新目录后不应残留旧标题或漏列正文标题。",
+        (
+            ("目录中找不到对应正文标题：" + html.escape(str(toc_missing[:15])) if toc_missing else "")
+            + ("<br>正文标题未在目录中出现：" + html.escape(str(body_missing[:15])) if body_missing else "")
+            if (toc_missing or body_missing)
+            else f"目录条目 {len(toc_entries)} 个，正文标题 {len(body_titles)} 个，未发现不一致。"
+        ),
+        "重要",
+    )
+
     bad = []
     for i in range(toc_start + 1, body_start):
         p = doc.paragraphs[i]
@@ -1437,6 +1573,8 @@ def audit_body_and_numbering(ctx: AuditContext):
     cap_pat = re.compile(r"^[图表][A-Z]?\d+-?\d*\s+.+")
     bad = []
     body_bad = []
+    vip_body_font_bad = []
+    vip_body_size_bad = []
     for i, p in enumerate(doc.paragraphs):
         if refs_start is not None and i >= refs_start:
             continue
@@ -1458,16 +1596,48 @@ def audit_body_and_numbering(ctx: AuditContext):
             continue
         if i < body_start or not is_probable_body_paragraph(p):
             continue
-        indent_ok = effective_first_line_chars(p, 200)
+        indent_ok = effective_first_line_indent_ok(p)
         font_issues = paragraph_font_issues(p, expected_size=12, expected_east="宋体", expected_latin="Times New Roman")
         if not indent_ok or font_issues:
             body_bad.append((i + 1, indent_ok, font_issues[:5], p.text.strip()[:70]))
+        for run in p.runs:
+            raw = run.text.strip()
+            if not raw:
+                continue
+            size = effective_size_for_run(p, run)
+            east = effective_east_asia_for_run(p, run)
+            latin = effective_latin_for_run(p, run)
+            if size is not None and abs(size - 12) > 0.2:
+                vip_body_size_bad.append((i + 1, f"字号{size:g}", short_sample(p.text, 90)))
+                break
+            if has_cjk(raw) and east not in (None, "宋体"):
+                vip_body_font_bad.append((i + 1, f"中文字体{east}", short_sample(p.text, 90)))
+                break
+            if has_latin_or_digit(raw) and latin not in (None, "Times New Roman"):
+                vip_body_font_bad.append((i + 1, f"西文字体{latin}", short_sample(p.text, 90)))
+                break
     ctx.add(
         "正文段落格式",
         "PASS" if not body_bad else "FAIL",
         "正文",
         "论文正文应为小四号宋体，外文和数字使用 Times New Roman，每段首行缩进2字符。",
         "异常项：" + html.escape(str(body_bad[:20])) if body_bad else "未发现正文段落字体或首行缩进异常。",
+        "重要",
+    )
+    ctx.add(
+        "正文文本内容-字体问题（官方检测兼容）",
+        "PASS" if not vip_body_font_bad else "FAIL",
+        "正文文本内容",
+        "维普会单独提示正文文本中的字体问题；正文中文应为宋体，英文、数字应为 Times New Roman。",
+        "异常项：" + html.escape(str(vip_body_font_bad[:20])) if vip_body_font_bad else "未发现维普式正文文本字体异常。",
+        "重要",
+    )
+    ctx.add(
+        "正文文本内容-字号问题（官方检测兼容）",
+        "PASS" if not vip_body_size_bad else "FAIL",
+        "正文文本内容",
+        "维普会单独提示正文文本中的字号问题；正文文本应为小四号 12 pt。",
+        "异常项：" + html.escape(str(vip_body_size_bad[:20])) if vip_body_size_bad else "未发现维普式正文文本字号异常。",
         "重要",
     )
 
@@ -1573,6 +1743,7 @@ def audit_figures_tables(ctx: AuditContext):
     figure_captions = []
     figure_caption_nums = []
     figure_caption_bad = []
+    vip_figure_label_bad = []
     image_caption_bad = []
     figure_number_bad = []
     figure_reference_bad = []
@@ -1605,7 +1776,13 @@ def audit_figures_tables(ctx: AuditContext):
         if re.search(r"图\d+-\d+\s{2,}", text) or not re.match(r"^图\d+-\d+ [^\s].+", text):
             figure_caption_bad.append((i + 1, num, "图号与图题之间应空一格", text))
         for segment_name, segment_text, segment_runs in caption_run_segments(p, text, num, m.group(3)):
-            segment_bad = caption_segment_issues(p, segment_text, segment_runs, official_figure_caption_size)
+            segment_bad = caption_segment_issues(
+                p,
+                segment_text,
+                segment_runs,
+                official_figure_caption_size,
+                strict_size=segment_name == "文献标注",
+            )
             if segment_bad:
                 figure_caption_bad.append((
                     i + 1,
@@ -1615,6 +1792,10 @@ def audit_figures_tables(ctx: AuditContext):
                     "；".join(segment_bad),
                     text,
                 ))
+            if segment_name == "图号标签":
+                label_bad = vip_figure_label_issues(p, segment_text, segment_runs)
+                if label_bad:
+                    vip_figure_label_bad.append((i + 1, num, "序号标签", "；".join(label_bad), text))
 
     body_no_caption = "\n".join(
         text for p, text in zip(doc.paragraphs, ctx.paragraph_texts)
@@ -1696,6 +1877,14 @@ def audit_figures_tables(ctx: AuditContext):
         "重要",
     )
     ctx.add(
+        "图题序号标签格式（官方检测兼容）",
+        "PASS" if not vip_figure_label_bad else "FAIL",
+        "正文插图",
+        "维普会单独检查图题开头“图X-X”序号标签；序号标签应使用宋体、小四号，并与图题整体格式一致。",
+        "异常项：" + html.escape(str(vip_figure_label_bad[:20])) if vip_figure_label_bad else "未发现图题序号标签字体或字号异常。",
+        "重要",
+    )
+    ctx.add(
         "插图正文引用",
         "PASS" if not figure_reference_bad else "FAIL",
         "正文插图",
@@ -1771,6 +1960,7 @@ def audit_tables(ctx: AuditContext):
     ref_bad = []
     number_bad = []
     three_line_bad = []
+    table_text_bad = []
     dot_table_bad = []
     body_by_chapter: dict[int, list[int]] = defaultdict(list)
     app_by_letter: dict[str, list[int]] = defaultdict(list)
@@ -1868,6 +2058,41 @@ def audit_tables(ctx: AuditContext):
             if style_name in ("Table Grid", "网格型") and not has_vertical:
                 three_line_bad.append((num, f"表格样式为{style_name}，需复核是否保留了全框线"))
 
+        cell_bad_seen = set()
+        for row_idx, row in enumerate(table.rows, 1):
+            for col_idx, cell in enumerate(row.cells, 1):
+                for p in cell.paragraphs:
+                    text = p.text.strip()
+                    if not text:
+                        continue
+                    for run in p.runs:
+                        raw = run.text.strip()
+                        if not raw:
+                            continue
+                        issues = []
+                        size = run_size(run)
+                        east = run_east_asia(run)
+                        latin = run_latin_font(run)
+                        if size is not None and not any(abs(size - ok) <= 0.2 for ok in (10.5, 11, 12)):
+                            issues.append(f"字号{size}")
+                        if has_cjk(raw) and east not in (None, "宋体"):
+                            issues.append(f"中文字体{east}")
+                        if re.search(r"[A-Za-z0-9]", raw) and latin not in (None, "Times New Roman"):
+                            issues.append(f"西文字体{latin}")
+                        if issues:
+                            key = (num, row_idx, col_idx, tuple(issues), raw[:24])
+                            if key not in cell_bad_seen:
+                                cell_bad_seen.add(key)
+                                table_text_bad.append((num, f"R{row_idx}C{col_idx}", "；".join(issues[:3]), raw[:60]))
+                        if len(table_text_bad) >= 40:
+                            break
+                    if len(table_text_bad) >= 40:
+                        break
+                if len(table_text_bad) >= 40:
+                    break
+            if len(table_text_bad) >= 40:
+                break
+
     for ch, seqs in sorted(body_by_chapter.items()):
         expected = list(range(1, max(seqs) + 1))
         if sorted(seqs) != expected:
@@ -1918,6 +2143,14 @@ def audit_tables(ctx: AuditContext):
         "正文和附录表格",
         "表格一般采用三线表，必要时可加辅助线；本项检查首线、表头线、底线和明显竖线。",
         "异常项：" + html.escape(str(three_line_bad[:25])) if three_line_bad else "未发现明显非三线表边框结构。",
+        "重要",
+    )
+    ctx.add(
+        "表格内容字体字号",
+        "PASS" if not table_text_bad else "FAIL",
+        "正文和附录表格",
+        "表格内文字应与论文模板保持一致，中文一般使用宋体，英文和数字使用 Times New Roman，字号不应明显偏离五号/小四。",
+        "异常项：" + html.escape(str(table_text_bad[:30])) if table_text_bad else "未发现表格内容中明确的字体或字号异常。",
         "重要",
     )
 
@@ -2162,6 +2395,7 @@ def audit_references(ctx: AuditContext):
     standard_type_bad = []
     missing_pub_place = []
     auto_number_refs = []
+    ref_language_counts = Counter()
     num_formats = numbering_formats(ctx.path)
     for i in range(refs_start + 1, refs_end):
         p = doc.paragraphs[i]
@@ -2189,6 +2423,8 @@ def audit_references(ctx: AuditContext):
                     bad_type.append((i + 1, str(len(auto_number_refs)), text[:120]))
                 if "GB/T " in text and "[S]" not in text:
                     standard_type_bad.append((i + 1, str(len(auto_number_refs)), text[:120]))
+        if ref_no:
+            ref_language_counts["foreign" if looks_like_foreign_reference(text) else "chinese"] += 1
         if ref_no and re.search(r"\[(?:D|M)\]", text):
             tail = re.split(r"\[(?:D|M)\]", text, maxsplit=1)[-1]
             if not re.search(r"[\.:：][^,，。]{2,}[:：][^,，。]{2,}[,，]\s*\d{4}", tail):
@@ -2211,6 +2447,16 @@ def audit_references(ctx: AuditContext):
         if auto_number_refs:
             evidence += "；检测到Word自动编号参考文献：" + html.escape(str(auto_number_refs[:20]))
         ctx.add("参考文献编号", "PASS" if not missing else "FAIL", "参考文献", "参考文献编号应连续。", evidence, "重要")
+    if ref_nums:
+        ref_count_ok = len(ref_nums) >= 10
+        ctx.add(
+            "参考文献数量要求",
+            "PASS" if ref_count_ok else "FAIL",
+            "参考文献",
+            "参考文献数量应不少于10条；维普统计会区分中文文献和外文文献数量。",
+            f"总数={len(ref_nums)}；中文={ref_language_counts['chinese']}条；外文={ref_language_counts['foreign']}条。",
+            "严重" if not ref_count_ok else "重要",
+        )
 
     # Citation coverage, ignoring [0,1] style intervals.
     body = ctx.text_until(refs_start)
@@ -2328,8 +2574,6 @@ def audit_document_structure(ctx: AuditContext):
         return None
 
     toc_idx = first_index(lambda _i, p: clean_text(p.text) == "目录" or paragraph_has_toc_field(p))
-    if toc_idx is None and xml_has_toc_field(ctx.document_xml):
-        toc_idx = (en_kw + 1) if en_kw is not None else None
 
     found = [
         ("封面", first_index(lambda i, p: "本科毕业设计" in clean_text(p.text) and i < 10)),
@@ -2361,6 +2605,26 @@ def audit_document_structure(ctx: AuditContext):
 
     status = "PASS" if not missing and not order_bad else "FAIL"
     ctx.add(
+        "结构缺失",
+        "PASS" if not missing else "FAIL",
+        "全文结构",
+        "论文应包含维普模板要求的必备结构要素；附录为非必有结构。",
+        "缺失=" + html.escape(str(missing)) if missing else "未发现必备结构缺失。",
+        "严重" if missing else "重要",
+    )
+    ctx.add(
+        "结构顺序",
+        "PASS" if not missing and not order_bad else "FAIL",
+        "全文结构",
+        "论文结构顺序应为：封面-诚信声明-版权声明-中文标题-中文摘要-中文关键词-英文标题-英文摘要-英文关键词-中文目录-正文-致谢-参考文献-附录（非必有）。",
+        (
+            f"当前结构={html.escape(str(present))}"
+            + (f"<br>缺失导致顺序不完整={html.escape(str(missing))}" if missing else "")
+            + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else "")
+        ),
+        "严重" if missing or order_bad else "重要",
+    )
+    ctx.add(
         "结构要素与顺序",
         status,
         "全文结构",
@@ -2369,6 +2633,25 @@ def audit_document_structure(ctx: AuditContext):
         + (f"<br>缺失={html.escape(str(missing))}" if missing else "")
         + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else ""),
         "严重" if missing or order_bad else "重要",
+    )
+
+
+def audit_word_count_requirements(ctx: AuditContext):
+    body_start = ctx.first_chapter_index
+    refs_start = ctx.find_exact("参考文献")
+    if body_start is None:
+        ctx.add("正文字数要求", "WARN", "正文", "未定位到正文第一章，无法统计正文字数。", severity="一般")
+        return
+    body_end = refs_start if refs_start is not None and refs_start > body_start else ctx.first_tail_index()
+    body_text = body_text_with_tables(ctx, body_start, body_end)
+    total, cjk, english_words, numbers = visible_word_count(body_text)
+    ctx.add(
+        "正文字数要求",
+        "PASS" if total >= 10000 else "FAIL",
+        "正文",
+        "按维普结构统计口径，正文应不少于10000字；本脚本近似统计正文段落和表格中的中文字符、英文单词和数字。",
+        f"正文约 {total} 字/词/数字；其中中文字符={cjk}，英文词={english_words}，数字={numbers}；统计范围=P{body_start+1} 到 P{body_end}。",
+        "严重" if total < 10000 else "重要",
     )
 
 
@@ -4132,6 +4415,7 @@ def run_audit(path: Path, out: Path) -> AuditContext:
         audit_formulas(ctx)
         audit_references(ctx)
         audit_document_structure(ctx)
+        audit_word_count_requirements(ctx)
         audit_appendix(ctx)
         audit_acknowledgement(ctx)
         audit_headers_footers_structural(ctx)

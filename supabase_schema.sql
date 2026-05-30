@@ -3,20 +3,32 @@ create table if not exists public.thesis_audit_users (
   email text not null unique,
   password_hash text not null,
   submissions_used integer not null default 0,
-  submission_quota integer not null default 3,
+  submission_quota integer not null default 2,
   account_status text not null default 'active',
   is_admin boolean not null default false,
+  invite_code text,
+  invited_by uuid references public.thesis_audit_users(id),
   created_at timestamptz not null default now()
 );
 
 alter table public.thesis_audit_users
-add column if not exists submission_quota integer not null default 3;
+add column if not exists submission_quota integer not null default 2;
 
 alter table public.thesis_audit_users
 add column if not exists account_status text not null default 'active';
 
 alter table public.thesis_audit_users
 add column if not exists is_admin boolean not null default false;
+
+alter table public.thesis_audit_users
+add column if not exists invite_code text;
+
+alter table public.thesis_audit_users
+add column if not exists invited_by uuid references public.thesis_audit_users(id);
+
+create unique index if not exists thesis_audit_users_invite_code_key
+on public.thesis_audit_users(invite_code)
+where invite_code is not null;
 
 alter table public.thesis_audit_users enable row level security;
 

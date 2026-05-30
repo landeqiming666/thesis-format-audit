@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import queue
 import random
+import re
 import tempfile
 import time
 from collections import defaultdict
@@ -35,7 +36,7 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-MAX_SUBMISSIONS = 3
+MAX_SUBMISSIONS = 2
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 ACCOUNT_STATUS_ACTIVE = "active"
 ACCOUNT_STATUS_FROZEN = "frozen"
@@ -205,7 +206,7 @@ def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
         .eq("id", user_id)
         .maybe_single()
         .execute()
@@ -217,7 +218,7 @@ def find_user_by_email(email: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
         .eq("email", email)
         .maybe_single()
         .execute()
@@ -225,18 +226,73 @@ def find_user_by_email(email: str) -> dict | None:
     return result.data
 
 
-def create_user(email: str, password: str) -> dict:
+def normalize_invite_code(code: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
+
+
+def generate_invite_code() -> str:
+    return uuid4().hex[:10].upper()
+
+
+def find_user_by_invite_code(code: str) -> dict | None:
+    invite_code = normalize_invite_code(code)
+    if not invite_code:
+        return None
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .insert(
-            {
-                "email": email,
-                "password_hash": generate_password_hash(password),
-                "account_status": ACCOUNT_STATUS_ACTIVE,
-                "is_admin": email in SUPER_ADMIN_EMAILS,
-            }
-        )
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
+        .eq("invite_code", invite_code)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+def create_unique_invite_code() -> str:
+    for _ in range(8):
+        code = generate_invite_code()
+        if find_user_by_invite_code(code) is None:
+            return code
+    return uuid4().hex.upper()
+
+
+def ensure_user_invite_code(user: dict | None) -> dict | None:
+    if not user or user.get("invite_code"):
+        return user
+    for _ in range(8):
+        code = create_unique_invite_code()
+        try:
+            (
+                get_supabase()
+                .table(SUPABASE_TABLE)
+                .update({"invite_code": code})
+                .eq("id", user["id"])
+                .execute()
+            )
+        except APIError:
+            continue
+        updated = dict(user)
+        updated["invite_code"] = code
+        return updated
+    return user
+
+
+def create_user(email: str, password: str, invited_by: str | None = None) -> dict:
+    payload = {
+        "email": email,
+        "password_hash": generate_password_hash(password, method="pbkdf2:sha256"),
+        "submission_quota": MAX_SUBMISSIONS,
+        "account_status": ACCOUNT_STATUS_ACTIVE,
+        "is_admin": email in SUPER_ADMIN_EMAILS,
+        "invite_code": create_unique_invite_code(),
+    }
+    if invited_by:
+        payload["invited_by"] = invited_by
+    result = (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .insert(payload)
         .execute()
     )
     return result.data[0]
@@ -261,7 +317,7 @@ def current_user() -> dict | None:
             session["user_id"] = user_id
     if not user_id:
         return None
-    return find_user_by_id(user_id)
+    return ensure_user_invite_code(find_user_by_id(user_id))
 
 
 def remaining_submissions(user: dict | None) -> int:
@@ -304,6 +360,29 @@ def add_user_quota(user_id: str, amount: int) -> None:
     if user is None:
         raise ValueError("用户不存在。")
     new_quota = max(user_quota(user), int(user["submissions_used"])) + amount
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update({"submission_quota": new_quota})
+        .eq("id", user_id)
+        .execute()
+    )
+
+
+def award_invite_bonus(inviter_id: str) -> None:
+    add_user_quota(inviter_id, 1)
+
+
+def reduce_user_quota(user_id: str, amount: int) -> None:
+    user = find_user_by_id(user_id)
+    if user is None:
+        raise ValueError("用户不存在。")
+    used = int(user["submissions_used"])
+    quota = user_quota(user)
+    remaining = max(quota - used, 0)
+    if amount > remaining:
+        raise ValueError(f"减少次数不能超过当前剩余次数（剩余 {remaining} 次）。")
+    new_quota = quota - amount
     (
         get_supabase()
         .table(SUPABASE_TABLE)
@@ -381,6 +460,10 @@ def render_home(
     if "captcha_answer" not in session:
         refresh_captcha()
     auth_values = auth_values or {}
+    invite_code = normalize_invite_code(user.get("invite_code", "")) if user else normalize_invite_code(request.values.get("invite", ""))
+    invite_link = url_for("index", invite=invite_code, _external=True) if user and invite_code else ""
+    if not user and invite_code and auth_mode == "login" and not auth_error:
+        auth_mode = "register"
     return render_template_string(
         PAGE,
         user=user,
@@ -394,6 +477,8 @@ def render_home(
         auth_mode=auth_mode,
         auth_values=auth_values,
         auth_token=request.values.get("auth_token", ""),
+        invite_code=invite_code,
+        invite_link=invite_link,
         error=error,
         auth_error=auth_error,
     )
@@ -408,11 +493,12 @@ def refresh_captcha() -> None:
     session["captcha_answer"] = str(left + right)
 
 
-def registration_values(email: str, password: str, confirm_password: str) -> dict:
+def registration_values(email: str, password: str, confirm_password: str, invite_code: str = "") -> dict:
     return {
         "register_email": email,
         "register_password": password,
         "register_confirm_password": confirm_password,
+        "invite_code": normalize_invite_code(invite_code),
     }
 
 
@@ -915,6 +1001,36 @@ PAGE = """
       font: 900 18px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
       letter-spacing: .05em;
     }
+    .invite-card {
+      margin: 0 0 20px;
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line));
+      background:
+        radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 18%, transparent), transparent 12rem),
+        var(--surface-strong);
+      font: 700 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .invite-card p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+    .invite-code {
+      display: inline-flex;
+      align-items: center;
+      min-height: 42px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      background: var(--field);
+      color: var(--ink);
+      font: 900 20px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+      letter-spacing: .08em;
+    }
+    .invite-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
     .modal {
       position: fixed;
       inset: 0;
@@ -1036,6 +1152,13 @@ PAGE = """
               <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
             </span>
           </div>
+          <div class="invite-card">
+            <p>邀请好友注册并完成创建账号，你的检测额度会自动增加 1 次。</p>
+            <div class="invite-actions">
+              <span class="invite-code">{{ invite_code }}</span>
+              <button class="copy-button" type="button" data-copy-invite="{{ invite_link }}">复制邀请链接</button>
+            </div>
+          </div>
           <form id="audit-form" method="post" action="{{ url_for('audit') }}" enctype="multipart/form-data">
             {% if auth_token %}<input name="auth_token" type="hidden" value="{{ auth_token }}">{% endif %}
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -1101,6 +1224,7 @@ PAGE = """
               <input name="email" type="email" placeholder="邮箱" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
               <input name="password" type="password" placeholder="至少 6 位密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_password', '') }}" required>
               <input name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_confirm_password', '') }}" required>
+              <input name="invite_code" type="text" placeholder="邀请码（可选）" value="{{ auth_values.get('invite_code', invite_code) }}">
               <div class="captcha-row">
                 <div class="captcha-chip">{{ captcha_question }}</div>
                 <input name="captcha_left" type="hidden" value="{{ captcha_left }}">
@@ -1270,6 +1394,33 @@ PAGE = """
 
     document.querySelectorAll('[data-copy-group]').forEach(button => {
       button.addEventListener('click', copyGroupNumber);
+    });
+
+    document.querySelectorAll('[data-copy-invite]').forEach(button => {
+      button.addEventListener('click', async () => {
+        const inviteLink = button.dataset.copyInvite || '';
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(inviteLink);
+          } else {
+            const helper = document.createElement('input');
+            helper.value = inviteLink;
+            document.body.appendChild(helper);
+            helper.select();
+            document.execCommand('copy');
+            helper.remove();
+          }
+          showModal({
+            title: '邀请链接已复制',
+            body: '好友通过你的链接注册成功后，你会自动增加 1 次检测额度。'
+          });
+        } catch (_error) {
+          showModal({
+            title: '复制失败',
+            body: `浏览器暂时无法自动复制，请手动复制：${inviteLink}`
+          });
+        }
+      });
     });
 
     if (fileInput && uploadTitle && uploadMeta) fileInput.addEventListener('change', () => {
@@ -1885,7 +2036,7 @@ ADMIN_PAGE = """
       </div>
       <div class="summary-bar">
         <span>共 <strong id="visible-count">{{ users|length }}</strong> 个账号正在显示</span>
-        <span>支持快速额度发放、自定义加额、冻结、恢复和注销操作</span>
+        <span>支持快速额度发放/扣减、自定义调整、冻结、恢复和注销操作</span>
       </div>
       <div class="table-wrap">
         <table>
@@ -1897,7 +2048,7 @@ ADMIN_PAGE = """
               <th>已用 / 总额度</th>
               <th>剩余</th>
               <th>注册时间</th>
-              <th>增加次数</th>
+              <th>调整次数</th>
               <th>账号操作</th>
             </tr>
           </thead>
@@ -1931,7 +2082,7 @@ ADMIN_PAGE = """
                 <td data-label="已用 / 总额度"><span class="quota" data-quota-text>{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
                 <td data-label="剩余"><strong data-remaining-text>{{ remaining }}</strong></td>
                 <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
-                <td data-label="增加次数">
+                <td data-label="调整次数">
                   <div class="actions">
                     <div class="action-group">
                       {% for amount in [1, 3, 10] %}
@@ -1942,12 +2093,26 @@ ADMIN_PAGE = """
                           <button class="compact-button" type="submit">+{{ amount }}</button>
                         </form>
                       {% endfor %}
+                      {% for amount in [1, 3, 10] %}
+                        <form class="quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
+                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                          <input name="amount" type="hidden" value="{{ amount }}">
+                          <button class="ghost-button compact-button" type="submit">-{{ amount }}</button>
+                        </form>
+                      {% endfor %}
                     </div>
                     <form class="inline-form quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
                       <input name="auth_token" type="hidden" value="{{ auth_token }}">
                       <input name="user_id" type="hidden" value="{{ item["id"] }}">
                       <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
                       <button class="ghost-button compact-button" type="submit">增加</button>
+                    </form>
+                    <form class="inline-form quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
+                      <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                      <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                      <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
+                      <button class="ghost-button compact-button" type="submit">减少</button>
                     </form>
                   </div>
                 </td>
@@ -2089,7 +2254,7 @@ ADMIN_PAGE = """
             ? await response.json()
             : { ok: response.ok, message: await response.text() };
           if (!response.ok || payload.ok === false) {
-            throw new Error(payload.message || '增加次数失败，请稍后再试。');
+            throw new Error(payload.message || '调整次数失败，请稍后再试。');
           }
 
           const row = userTable?.querySelector(`tr[data-user-id="${payload.user.id}"]`);
@@ -2102,10 +2267,10 @@ ADMIN_PAGE = """
           }
           const customAmount = form.querySelector('input[name="amount"][type="number"]');
           if (customAmount) customAmount.value = '';
-          showAdminNotice(payload.message || '次数已增加。');
+          showAdminNotice(payload.message || '次数已调整。');
           applyFilters();
         } catch (error) {
-          showAdminNotice(error.message || '增加次数失败，请稍后再试。', true);
+          showAdminNotice(error.message || '调整次数失败，请稍后再试。', true);
         } finally {
           if (button) {
             button.disabled = false;
@@ -2144,10 +2309,11 @@ def register():
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
+    invite_code = normalize_invite_code(request.form.get("invite_code", ""))
     captcha_answer = request.form.get("captcha_answer", "").strip()
     captcha_left = request.form.get("captcha_left", "")
     captcha_right = request.form.get("captcha_right", "")
-    auth_values = registration_values(email, password, confirm_password)
+    auth_values = registration_values(email, password, confirm_password, invite_code)
     if not email or "@" not in email:
         refresh_captcha()
         return render_home(auth_error="请输入有效邮箱。", auth_mode="register", auth_values=auth_values), 400
@@ -2161,12 +2327,25 @@ def register():
         refresh_captcha()
         return render_home(auth_error="数字验证不正确，请重新计算。", auth_mode="register", auth_values=auth_values), 400
 
+    inviter = find_user_by_invite_code(invite_code) if invite_code else None
+    if invite_code and inviter is None:
+        refresh_captcha()
+        return render_home(auth_error="邀请码不存在，请检查后再注册。", auth_mode="register", auth_values=auth_values), 400
+    if inviter and inviter.get("email", "").lower() == email:
+        refresh_captcha()
+        return render_home(auth_error="不能使用自己的邀请码注册。", auth_mode="register", auth_values=auth_values), 400
+
     try:
-        user = create_user(email, password)
-        session["user_id"] = user["id"]
+        user = create_user(email, password, invited_by=inviter["id"] if inviter else None)
     except APIError:
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
+    if inviter:
+        try:
+            award_invite_bonus(inviter["id"])
+        except Exception:
+            app.logger.warning("Failed to award invite bonus for inviter %s", inviter["id"], exc_info=True)
+    session["user_id"] = user["id"]
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
 
@@ -2259,6 +2438,42 @@ def admin_add_quota():
             return jsonify({"ok": False, "message": str(exc)}), 400
         return redirect(url_for("admin", auth_token=token, message=str(exc)))
     message = f"已增加 {amount} 次额度。"
+    if wants_json:
+        return jsonify({"ok": True, "message": message, "user": admin_user_quota_payload(target_user)})
+    return redirect(url_for("admin", auth_token=token, message=message))
+
+
+@app.post("/admin/quota/reduce")
+def admin_reduce_quota():
+    wants_json = request.headers.get("X-Requested-With") == "fetch" or "application/json" in request.headers.get("Accept", "")
+    limited = rate_limit("admin")
+    if limited:
+        if wants_json:
+            return jsonify({"ok": False, "message": limited.get_data(as_text=True)}), limited.status_code
+        return limited
+    user = current_user()
+    if not is_admin(user):
+        if wants_json:
+            return jsonify({"ok": False, "message": "没有权限。"}), 403
+        return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    target_user_id = request.form.get("user_id", "")
+    try:
+        amount = int(request.form.get("amount", "0"))
+    except ValueError:
+        amount = 0
+    if amount <= 0:
+        if wants_json:
+            return jsonify({"ok": False, "message": "减少次数必须大于 0。"}), 400
+        return redirect(url_for("admin", auth_token=token, message="减少次数必须大于 0。"))
+    try:
+        reduce_user_quota(target_user_id, amount)
+        target_user = find_user_by_id(target_user_id)
+    except ValueError as exc:
+        if wants_json:
+            return jsonify({"ok": False, "message": str(exc)}), 400
+        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+    message = f"已减少 {amount} 次额度。"
     if wants_json:
         return jsonify({"ok": True, "message": message, "user": admin_user_quota_payload(target_user)})
     return redirect(url_for("admin", auth_token=token, message=message))
