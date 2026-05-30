@@ -4,11 +4,15 @@ create table if not exists public.thesis_audit_users (
   password_hash text not null,
   submissions_used integer not null default 0,
   submission_quota integer not null default 3,
+  account_status text not null default 'active',
   created_at timestamptz not null default now()
 );
 
 alter table public.thesis_audit_users
 add column if not exists submission_quota integer not null default 3;
+
+alter table public.thesis_audit_users
+add column if not exists account_status text not null default 'active';
 
 alter table public.thesis_audit_users enable row level security;
 

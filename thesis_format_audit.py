@@ -573,6 +573,25 @@ def is_body_or_caption_paragraph(paragraph) -> bool:
     return True
 
 
+def chapter_number_from_text(text: str) -> Optional[int]:
+    m = re.match(r"^第\s*(\d+)\s*章", text.strip())
+    if m:
+        return int(m.group(1))
+    cn = re.match(r"^第\s*([一二三四五六七八九十]+)\s*章", text.strip())
+    if not cn:
+        return None
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    value = cn.group(1)
+    if value == "十":
+        return 10
+    if value.startswith("十"):
+        return 10 + digits.get(value[-1], 0)
+    if "十" in value:
+        left, right = value.split("十", 1)
+        return digits.get(left, 0) * 10 + (digits.get(right, 0) if right else 0)
+    return digits.get(value)
+
+
 def paragraph_has_numbering(paragraph) -> bool:
     ppr = paragraph._p.pPr
     return ppr is not None and ppr.find(qn("numPr")) is not None
@@ -1346,10 +1365,67 @@ def audit_headings(ctx: AuditContext):
         "重要",
     )
 
+    heading_order_bad = []
+    current_chapter: Optional[int] = None
+    h1_nums = []
+    h2_by_chapter: dict[int, list[int]] = defaultdict(list)
+    h3_by_parent: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i, p in enumerate(doc.paragraphs):
+        text = p.text.strip()
+        if not text:
+            continue
+        if p.style.name == "Heading 1":
+            chapter = chapter_number_from_text(text)
+            if chapter is not None:
+                current_chapter = chapter
+                h1_nums.append(chapter)
+            continue
+        if p.style.name == "Heading 2":
+            m = re.match(r"^(\d+)\.(\d+)\b", text)
+            if not m:
+                heading_order_bad.append((i + 1, "二级标题缺少形如1.1的编号", text))
+                continue
+            chapter, section = int(m.group(1)), int(m.group(2))
+            h2_by_chapter[chapter].append(section)
+            if current_chapter is not None and chapter != current_chapter:
+                heading_order_bad.append((i + 1, f"二级标题章号{chapter}与当前第{current_chapter}章不一致", text))
+        if p.style.name == "Heading 3":
+            m = re.match(r"^(\d+)\.(\d+)\.(\d+)\b", text)
+            if not m:
+                heading_order_bad.append((i + 1, "三级标题缺少形如1.1.1的编号", text))
+                continue
+            chapter, section, subsection = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            h3_by_parent[(chapter, section)].append(subsection)
+            if current_chapter is not None and chapter != current_chapter:
+                heading_order_bad.append((i + 1, f"三级标题章号{chapter}与当前第{current_chapter}章不一致", text))
+
+    if h1_nums:
+        expected = list(range(1, max(h1_nums) + 1))
+        if sorted(h1_nums) != expected:
+            heading_order_bad.append(("一级标题", h1_nums, f"章号应连续为{expected}"))
+    for chapter, sections in sorted(h2_by_chapter.items()):
+        expected = list(range(1, max(sections) + 1))
+        if sorted(sections) != expected:
+            heading_order_bad.append((f"第{chapter}章二级标题", sections, f"序号应连续为{expected}"))
+    for (chapter, section), subsections in sorted(h3_by_parent.items()):
+        expected = list(range(1, max(subsections) + 1))
+        if sorted(subsections) != expected:
+            heading_order_bad.append((f"{chapter}.{section}三级标题", subsections, f"序号应连续为{expected}"))
+
+    ctx.add(
+        "标题编号连续性",
+        "PASS" if not heading_order_bad else "FAIL",
+        "正文标题",
+        "正文标题编号应与所在章节一致，并按一级、二级、三级标题逐级连续递增。",
+        "异常项：" + html.escape(str(heading_order_bad[:30])) if heading_order_bad else "未发现标题编号层级或连续性异常。",
+        "重要",
+    )
+
 
 def audit_body_and_numbering(ctx: AuditContext):
     doc = ctx.doc
     refs_start = ctx.find_exact("参考文献")
+    body_start = ctx.first_chapter_index or 0
     nums = []
     for i, p in enumerate(doc.paragraphs):
         if refs_start is not None and i >= refs_start:
@@ -1365,7 +1441,7 @@ def audit_body_and_numbering(ctx: AuditContext):
         if refs_start is not None and i >= refs_start:
             continue
         text = p.text.strip()
-        if not text or i < 100 or p.style.name.startswith(("Heading", "toc", "目录", "Bibliography")):
+        if not text or i < body_start or p.style.name.startswith(("Heading", "toc", "目录", "Bibliography")):
             continue
         if cap_pat.match(text) and len(text) < 70 and "。" not in text and "，" not in text:
             continue
@@ -1380,7 +1456,7 @@ def audit_body_and_numbering(ctx: AuditContext):
     for i, p in enumerate(doc.paragraphs):
         if refs_start is not None and i >= refs_start:
             continue
-        if i < 100 or not is_probable_body_paragraph(p):
+        if i < body_start or not is_probable_body_paragraph(p):
             continue
         indent_ok = effective_first_line_chars(p, 200)
         font_issues = paragraph_font_issues(p, expected_size=12, expected_east="宋体", expected_latin="Times New Roman")
@@ -1399,9 +1475,15 @@ def audit_body_and_numbering(ctx: AuditContext):
     for i, p in enumerate(doc.paragraphs):
         if refs_start is not None and i >= refs_start:
             continue
-        if i < 100 or not is_body_or_caption_paragraph(p):
+        if i < body_start or not is_body_or_caption_paragraph(p):
             continue
         text = p.text.strip()
+        if re.fullmatch(r"[（(]\d+-\d+[）)]", text):
+            continue
+        if re.fullmatch(r"续表(?:\d+-\d+|[A-Z]-\d+)", text):
+            continue
+        if re.match(r"^\([a-z]\)|^（[a-z]）", text, flags=re.IGNORECASE):
+            continue
         cap_like = re.match(r"^[图表]\d+[-.]\d+\s+", text) and len(text) < 100
         align = effective_paragraph_alignment(p)
         line = effective_line_spacing(p)
@@ -1411,7 +1493,7 @@ def audit_body_and_numbering(ctx: AuditContext):
             align_ok = align in (WD_ALIGN_PARAGRAPH.JUSTIFY, None)
         line_ok = line in (1.5, None)
         if not align_ok or not line_ok:
-            paragraph_bad.append((i + 1, "图表题" if cap_like else "正文段落", align, line, text[:80]))
+            paragraph_bad.append((i + 1, "图表题" if cap_like else "正文段落", str(align), line, text[:80]))
     ctx.add(
         "段落对齐与行距",
         "PASS" if not paragraph_bad else "FAIL",

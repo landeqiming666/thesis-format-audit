@@ -37,6 +37,9 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 MAX_SUBMISSIONS = 3
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
+ACCOUNT_STATUS_ACTIVE = "active"
+ACCOUNT_STATUS_FROZEN = "frozen"
+ACCOUNT_STATUS_DISABLED = "disabled"
 RATE_LIMITS = {
     "login": (10, 5 * 60),
     "register": (5, 60 * 60),
@@ -197,7 +200,7 @@ def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,created_at")
         .eq("id", user_id)
         .maybe_single()
         .execute()
@@ -209,7 +212,7 @@ def find_user_by_email(email: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,created_at")
         .eq("email", email)
         .maybe_single()
         .execute()
@@ -221,7 +224,13 @@ def create_user(email: str, password: str) -> dict:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .insert({"email": email, "password_hash": generate_password_hash(password)})
+        .insert(
+            {
+                "email": email,
+                "password_hash": generate_password_hash(password),
+                "account_status": ACCOUNT_STATUS_ACTIVE,
+            }
+        )
         .execute()
     )
     return result.data[0]
@@ -270,7 +279,7 @@ def list_users() -> list[dict]:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,submissions_used,submission_quota,created_at")
+        .select("id,email,submissions_used,submission_quota,account_status,created_at")
         .order("created_at", desc=True)
         .execute()
     )
@@ -289,6 +298,42 @@ def add_user_quota(user_id: str, amount: int) -> None:
         .eq("id", user_id)
         .execute()
     )
+
+
+def update_user_status(user_id: str, status: str) -> None:
+    if status not in {ACCOUNT_STATUS_ACTIVE, ACCOUNT_STATUS_FROZEN, ACCOUNT_STATUS_DISABLED}:
+        raise ValueError("无效的账号状态。")
+    user = find_user_by_id(user_id)
+    if user is None:
+        raise ValueError("用户不存在。")
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update({"account_status": status})
+        .eq("id", user_id)
+        .execute()
+    )
+
+
+def account_status_label(status: str) -> str:
+    return {
+        ACCOUNT_STATUS_ACTIVE: "正常",
+        ACCOUNT_STATUS_FROZEN: "已冻结",
+        ACCOUNT_STATUS_DISABLED: "已注销",
+    }.get(status or ACCOUNT_STATUS_ACTIVE, "未知")
+
+
+def is_account_active(user: dict | None) -> bool:
+    return (user or {}).get("account_status", ACCOUNT_STATUS_ACTIVE) == ACCOUNT_STATUS_ACTIVE
+
+
+def account_block_message(user: dict | None) -> str:
+    status = (user or {}).get("account_status", ACCOUNT_STATUS_ACTIVE)
+    if status == ACCOUNT_STATUS_FROZEN:
+        return "这个账号已被冻结，请联系管理员处理。"
+    if status == ACCOUNT_STATUS_DISABLED:
+        return "这个账号已被注销，暂时不能继续使用。"
+    return ""
 
 
 def render_home(
@@ -1334,30 +1379,39 @@ ADMIN_PAGE = """
   <style>
     :root {
       color-scheme: light;
-      --ink: #18212c;
-      --muted: #657382;
-      --paper: #f6f4ef;
-      --surface: #ffffff;
-      --line: #d6d8d2;
-      --accent: #1e7f62;
-      --accent-soft: #dcefe7;
-      --warn: #a64232;
-      --shadow: rgba(24, 33, 44, .12);
+      --ink: #16202a;
+      --muted: #607181;
+      --paper: #f3efe6;
+      --surface: rgba(255, 255, 255, .86);
+      --surface-strong: #ffffff;
+      --line: #d7d9d2;
+      --line-strong: #c3c9bf;
+      --accent: #176f58;
+      --accent-strong: #0f4d3d;
+      --accent-soft: #d8ece5;
+      --warn: #9d4131;
+      --warn-soft: #f7e0db;
+      --info: #2f5f8a;
+      --info-soft: #dceaf8;
+      --shadow: rgba(22, 32, 42, .12);
     }
     * { box-sizing: border-box; }
+    html { background: var(--paper); }
     body {
       margin: 0;
       min-height: 100svh;
       color: var(--ink);
       background:
-        radial-gradient(circle at 10% 10%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 28rem),
+        radial-gradient(circle at 8% 12%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 28rem),
+        radial-gradient(circle at 92% 16%, color-mix(in srgb, #caa55a 14%, transparent), transparent 22rem),
+        linear-gradient(180deg, rgba(255, 255, 255, .35), transparent 26%),
         var(--paper);
       font-family: "PingFang SC", "Noto Sans SC", sans-serif;
     }
     main {
-      width: min(1100px, calc(100% - 32px));
+      width: min(1320px, calc(100% - 40px));
       margin: 0 auto;
-      padding: 34px 0;
+      padding: 36px 0 48px;
     }
     .topbar, .user-row {
       display: flex;
@@ -1365,30 +1419,157 @@ ADMIN_PAGE = """
       justify-content: space-between;
       gap: 16px;
     }
+    .topbar {
+      align-items: flex-start;
+      margin-bottom: 24px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 44px;
+      height: 1px;
+      background: var(--accent);
+    }
     h1 {
       margin: 0;
-      font-size: clamp(30px, 5vw, 52px);
-      line-height: 1.05;
+      font-size: clamp(36px, 5vw, 64px);
+      line-height: .98;
+      letter-spacing: -.03em;
+    }
+    .headline-copy {
+      margin: 14px 0 0;
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.8;
     }
     a {
       color: var(--accent);
       font-weight: 800;
       text-decoration: none;
     }
-    .panel {
-      margin-top: 26px;
+    .top-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 12px;
+    }
+    .user-row {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .top-links {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .top-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .84);
+      background: var(--surface);
+      box-shadow: 0 10px 28px rgba(22, 32, 42, .06);
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .stat-card {
+      padding: 20px 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 18px 56px rgba(22, 32, 42, .08);
+      backdrop-filter: blur(14px);
+    }
+    .stat-label {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .stat-value {
+      display: block;
+      font-size: 34px;
+      font-weight: 900;
+      line-height: 1;
+    }
+    .stat-hint {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      background: var(--surface);
       box-shadow: 0 24px 72px var(--shadow);
       overflow: hidden;
+      backdrop-filter: blur(16px);
     }
     .notice {
-      margin: 18px 0 0;
-      padding: 12px 14px;
+      margin: 0 0 18px;
+      padding: 13px 15px;
       border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--line));
       background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
       color: var(--accent);
       font-weight: 800;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(160px, .42fr));
+      gap: 12px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .5);
+    }
+    .field,
+    .select,
+    .inline-number {
+      width: 100%;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font: 14px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+      outline: 0;
+      transition: border-color .18s ease, box-shadow .18s ease;
+    }
+    .field:focus,
+    .select:focus,
+    .inline-number:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    .summary-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .table-wrap {
+      overflow-x: auto;
     }
     table {
       width: 100%;
@@ -1396,7 +1577,7 @@ ADMIN_PAGE = """
       font-size: 14px;
     }
     th, td {
-      padding: 15px 16px;
+      padding: 16px 18px;
       border-bottom: 1px solid var(--line);
       text-align: left;
       vertical-align: middle;
@@ -1406,45 +1587,165 @@ ADMIN_PAGE = """
       font-size: 12px;
       letter-spacing: .08em;
       text-transform: uppercase;
-      background: color-mix(in srgb, var(--accent-soft) 32%, transparent);
+      background: color-mix(in srgb, var(--accent-soft) 28%, transparent);
+    }
+    tbody tr {
+      transition: background .16s ease;
+    }
+    tbody tr:hover {
+      background: rgba(255, 255, 255, .55);
     }
     .email { font-weight: 800; }
     .muted { color: var(--muted); }
+    .mono {
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 12px;
+    }
     .quota {
       display: inline-grid;
       place-items: center;
-      min-width: 68px;
-      padding: 7px 10px;
+      min-width: 78px;
+      padding: 8px 10px;
       border: 1px solid var(--line);
-      background: var(--surface);
+      background: var(--surface-strong);
       font-weight: 900;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 78px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+    .status-active {
+      border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+      color: var(--accent-strong);
+    }
+    .status-frozen {
+      border-color: color-mix(in srgb, var(--info) 30%, var(--line));
+      background: color-mix(in srgb, var(--info-soft) 60%, transparent);
+      color: var(--info);
+    }
+    .status-disabled {
+      border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: var(--warn);
     }
     .actions {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
     }
+    .action-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
     button {
-      border: 0;
-      padding: 9px 11px;
+      border: 1px solid transparent;
+      padding: 10px 12px;
       background: var(--accent);
       color: white;
       cursor: pointer;
       font-weight: 800;
+      transition: transform .16s ease, filter .16s ease, background .16s ease;
     }
-    button:hover { filter: brightness(.92); }
-    @media (max-width: 760px) {
+    button:hover {
+      filter: brightness(.95);
+      transform: translateY(-1px);
+    }
+    .ghost-button {
+      background: var(--surface-strong);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    .ghost-button:hover {
+      color: var(--accent-strong);
+      background: color-mix(in srgb, var(--accent-soft) 36%, var(--surface-strong));
+    }
+    .warn-button {
+      background: var(--warn);
+    }
+    .info-button {
+      background: var(--info);
+    }
+    .compact-button {
+      padding: 9px 11px;
+      font-size: 13px;
+    }
+    .inline-form {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .inline-number {
+      width: 88px;
+      padding: 9px 10px;
+    }
+    .empty-state {
+      padding: 42px 18px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 15px;
+      line-height: 1.8;
+    }
+    @media (max-width: 1180px) {
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .toolbar {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    @media (max-width: 820px) {
+      main {
+        width: min(100%, calc(100% - 24px));
+        padding-top: 24px;
+      }
       .topbar { align-items: flex-start; flex-direction: column; }
+      .top-actions {
+        width: 100%;
+        align-items: flex-start;
+      }
+      .top-links {
+        justify-content: flex-start;
+      }
+      .stats {
+        grid-template-columns: 1fr;
+      }
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+      .summary-bar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
       table, thead, tbody, tr, th, td { display: block; }
       thead { display: none; }
-      tr { border-bottom: 1px solid var(--line); padding: 12px; }
-      td { border: 0; padding: 7px 4px; }
+      tr { border-bottom: 1px solid var(--line); padding: 14px; }
+      td { border: 0; padding: 8px 4px; }
       td::before {
         content: attr(data-label);
         display: block;
         color: var(--muted);
         font-size: 12px;
         margin-bottom: 3px;
+      }
+      .actions,
+      .action-group,
+      .inline-form {
+        width: 100%;
+      }
+      .inline-number {
+        width: 100%;
       }
     }
   </style>
@@ -1453,51 +1754,205 @@ ADMIN_PAGE = """
   <main>
     <div class="topbar">
       <div>
+        <div class="eyebrow">Admin Console</div>
         <h1>管理后台</h1>
-        <p class="muted">给用户增加检测次数，额度会立即用于前台限制。</p>
+        <p class="headline-copy">在这里集中管理用户额度、账号状态和使用情况。支持搜索、筛选、冻结、恢复、注销以及快速发放检测次数。</p>
       </div>
-      <div class="user-row">
-        <span class="muted">管理员：{{ admin_user["email"] }}</span>
-        <a href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
+      <div class="top-actions">
+        <div class="user-row">
+          <span class="muted">管理员：{{ admin_user["email"] }}</span>
+        </div>
+        <div class="top-links">
+          <a class="top-link" href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
+          <a class="top-link" href="{{ url_for('logout') }}">退出登录</a>
+        </div>
       </div>
     </div>
     {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+    <section class="stats">
+      <div class="stat-card">
+        <span class="stat-label">总用户数</span>
+        <span class="stat-value">{{ stats["total"] }}</span>
+        <div class="stat-hint">当前数据库中的全部账号</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">正常账号</span>
+        <span class="stat-value">{{ stats["active"] }}</span>
+        <div class="stat-hint">可正常登录并生成检测报告</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">冻结账号</span>
+        <span class="stat-value">{{ stats["frozen"] }}</span>
+        <div class="stat-hint">已被临时停用，可随时恢复</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">已注销账号</span>
+        <span class="stat-value">{{ stats["disabled"] }}</span>
+        <div class="stat-hint">已停用，不允许继续使用</div>
+      </div>
+    </section>
     <section class="panel">
-      <table>
-        <thead>
-          <tr>
-            <th>账号</th>
-            <th>已用 / 总额度</th>
-            <th>剩余</th>
-            <th>注册时间</th>
-            <th>增加次数</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for item in users %}
+      <div class="toolbar">
+        <input id="search-input" class="field" type="search" placeholder="搜索邮箱、用户 ID 或注册时间">
+        <select id="status-filter" class="select">
+          <option value="all">全部状态</option>
+          <option value="active">仅看正常</option>
+          <option value="frozen">仅看冻结</option>
+          <option value="disabled">仅看已注销</option>
+        </select>
+        <select id="quota-filter" class="select">
+          <option value="all">全部额度情况</option>
+          <option value="remaining">仅看仍有次数</option>
+          <option value="empty">仅看额度用完</option>
+        </select>
+        <button id="reset-filter" class="ghost-button" type="button">重置筛选</button>
+      </div>
+      <div class="summary-bar">
+        <span>共 <strong id="visible-count">{{ users|length }}</strong> 个账号正在显示</span>
+        <span>支持快速额度发放、自定义加额、冻结、恢复和注销操作</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
             <tr>
-              <td data-label="账号"><span class="email">{{ item["email"] }}</span></td>
-              <td data-label="已用 / 总额度"><span class="quota">{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
-              <td data-label="剩余"><strong>{{ [item["submission_quota"] - item["submissions_used"], 0] | max }}</strong></td>
-              <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
-              <td data-label="增加次数">
-                <div class="actions">
-                  {% for amount in [1, 3, 10] %}
-                    <form method="post" action="{{ url_for('admin_add_quota') }}">
+              <th>账号</th>
+              <th>状态</th>
+              <th>已用 / 总额度</th>
+              <th>剩余</th>
+              <th>注册时间</th>
+              <th>增加次数</th>
+              <th>账号操作</th>
+            </tr>
+          </thead>
+          <tbody id="user-table">
+            {% for item in users %}
+              {% set remaining = [item["submission_quota"] - item["submissions_used"], 0] | max %}
+              <tr
+                data-search="{{ item['email'] }} {{ item['id'] }} {{ item['created_at'] }}"
+                data-status="{{ item['account_status'] }}"
+                data-remaining="{{ remaining }}"
+              >
+                <td data-label="账号">
+                  <div class="email">{{ item["email"] }}</div>
+                  <div class="muted mono">{{ item["id"] }}</div>
+                </td>
+                <td data-label="状态">
+                  <span class="status-badge status-{{ item['account_status'] }}">
+                    {{ status_labels.get(item["account_status"], "未知") }}
+                  </span>
+                </td>
+                <td data-label="已用 / 总额度"><span class="quota">{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
+                <td data-label="剩余"><strong>{{ remaining }}</strong></td>
+                <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
+                <td data-label="增加次数">
+                  <div class="actions">
+                    <div class="action-group">
+                      {% for amount in [1, 3, 10] %}
+                        <form method="post" action="{{ url_for('admin_add_quota') }}">
+                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                          <input name="amount" type="hidden" value="{{ amount }}">
+                          <button class="compact-button" type="submit">+{{ amount }}</button>
+                        </form>
+                      {% endfor %}
+                    </div>
+                    <form class="inline-form" method="post" action="{{ url_for('admin_add_quota') }}">
                       <input name="auth_token" type="hidden" value="{{ auth_token }}">
                       <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                      <input name="amount" type="hidden" value="{{ amount }}">
-                      <button type="submit">+{{ amount }}</button>
+                      <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
+                      <button class="ghost-button compact-button" type="submit">增加</button>
                     </form>
-                  {% endfor %}
-                </div>
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+                  </div>
+                </td>
+                <td data-label="账号操作">
+                  <div class="actions">
+                    {% if item["account_status"] == "active" %}
+                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认冻结 {{ item['email'] }} 吗？冻结后该账号将不能登录和检测。">
+                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                        <input name="status" type="hidden" value="frozen">
+                        <button class="info-button compact-button" type="submit">冻结</button>
+                      </form>
+                    {% else %}
+                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认恢复 {{ item['email'] }} 吗？恢复后账号可继续使用。">
+                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                        <input name="status" type="hidden" value="active">
+                        <button class="ghost-button compact-button" type="submit">恢复</button>
+                      </form>
+                    {% endif %}
+                    {% if item["account_status"] != "disabled" %}
+                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认注销 {{ item['email'] }} 吗？注销后该账号将被停用。">
+                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                        <input name="status" type="hidden" value="disabled">
+                        <button class="warn-button compact-button" type="submit">注销</button>
+                      </form>
+                    {% endif %}
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div id="empty-state" class="empty-state" hidden>没有匹配到符合条件的账号，试试清空搜索词或调整筛选条件。</div>
     </section>
   </main>
+  <script>
+    const searchInput = document.getElementById('search-input');
+    const statusFilter = document.getElementById('status-filter');
+    const quotaFilter = document.getElementById('quota-filter');
+    const resetFilter = document.getElementById('reset-filter');
+    const userTable = document.getElementById('user-table');
+    const visibleCount = document.getElementById('visible-count');
+    const emptyState = document.getElementById('empty-state');
+
+    const applyFilters = () => {
+      if (!userTable) return;
+      const keyword = (searchInput?.value || '').trim().toLowerCase();
+      const status = statusFilter?.value || 'all';
+      const quota = quotaFilter?.value || 'all';
+      let shown = 0;
+
+      userTable.querySelectorAll('tr').forEach(row => {
+        const searchText = (row.dataset.search || '').toLowerCase();
+        const rowStatus = row.dataset.status || 'active';
+        const remaining = Number(row.dataset.remaining || '0');
+        const matchesKeyword = !keyword || searchText.includes(keyword);
+        const matchesStatus = status === 'all' || rowStatus === status;
+        const matchesQuota = quota === 'all' || (quota === 'remaining' ? remaining > 0 : remaining <= 0);
+        const visible = matchesKeyword && matchesStatus && matchesQuota;
+        row.hidden = !visible;
+        if (visible) shown += 1;
+      });
+
+      if (visibleCount) visibleCount.textContent = String(shown);
+      if (emptyState) emptyState.hidden = shown !== 0;
+    };
+
+    [searchInput, statusFilter, quotaFilter].forEach(element => {
+      if (!element) return;
+      element.addEventListener('input', applyFilters);
+      element.addEventListener('change', applyFilters);
+    });
+
+    if (resetFilter) resetFilter.addEventListener('click', () => {
+      if (searchInput) searchInput.value = '';
+      if (statusFilter) statusFilter.value = 'all';
+      if (quotaFilter) quotaFilter.value = 'all';
+      applyFilters();
+    });
+
+    document.querySelectorAll('form[data-confirm]').forEach(form => {
+      form.addEventListener('submit', event => {
+        const message = form.dataset.confirm || '确认继续吗？';
+        if (!window.confirm(message)) event.preventDefault();
+      });
+    });
+
+    applyFilters();
+  </script>
 </body>
 </html>
 """
@@ -1557,6 +2012,8 @@ def login():
     user = find_user_by_email(email)
     if user is None or not check_password_hash(user["password_hash"], password):
         return render_home(auth_error="邮箱或密码不正确。请确认这个邮箱已经注册，并且密码没有输错。", auth_mode="login", auth_values=auth_values), 400
+    if not is_account_active(user):
+        return render_home(auth_error=account_block_message(user), auth_mode="login", auth_values=auth_values), 403
     session["user_id"] = user["id"]
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
@@ -1573,10 +2030,23 @@ def admin():
     if not is_admin(user):
         return redirect(url_for("index"))
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
+    users = list_users()
+    stats = {
+        "total": len(users),
+        "active": sum(1 for item in users if item.get("account_status", ACCOUNT_STATUS_ACTIVE) == ACCOUNT_STATUS_ACTIVE),
+        "frozen": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_FROZEN),
+        "disabled": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_DISABLED),
+    }
     return render_template_string(
         ADMIN_PAGE,
         admin_user=user,
-        users=list_users(),
+        users=users,
+        stats=stats,
+        status_labels={
+            ACCOUNT_STATUS_ACTIVE: account_status_label(ACCOUNT_STATUS_ACTIVE),
+            ACCOUNT_STATUS_FROZEN: account_status_label(ACCOUNT_STATUS_FROZEN),
+            ACCOUNT_STATUS_DISABLED: account_status_label(ACCOUNT_STATUS_DISABLED),
+        },
         auth_token=token,
         message=request.args.get("message", ""),
     )
@@ -1605,6 +2075,26 @@ def admin_add_quota():
     return redirect(url_for("admin", auth_token=token, message=f"已增加 {amount} 次额度。"))
 
 
+@app.post("/admin/status")
+def admin_update_status():
+    limited = rate_limit("admin")
+    if limited:
+        return limited
+    user = current_user()
+    if not is_admin(user):
+        return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    target_user_id = request.form.get("user_id", "")
+    status = request.form.get("status", "").strip().lower()
+    if target_user_id == user.get("id") and status == ACCOUNT_STATUS_DISABLED:
+        return redirect(url_for("admin", auth_token=token, message="不能注销当前管理员账号。"))
+    try:
+        update_user_status(target_user_id, status)
+    except ValueError as exc:
+        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+    return redirect(url_for("admin", auth_token=token, message=f"账号状态已更新为：{account_status_label(status)}。"))
+
+
 @app.post("/audit")
 def audit():
     limited = rate_limit("audit")
@@ -1613,6 +2103,8 @@ def audit():
     user = current_user()
     if user is None:
         return render_home(error="请先注册或登录后再生成报告。"), 401
+    if not is_account_active(user):
+        return render_home(error=account_block_message(user)), 403
     if remaining_submissions(user) <= 0:
         return render_home(error="这个账号的检测额度已经用完。"), 403
 
