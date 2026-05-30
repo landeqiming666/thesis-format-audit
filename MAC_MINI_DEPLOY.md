@@ -16,10 +16,10 @@ cp .env.example .env
 SUPABASE_URL=你的 Supabase URL
 SUPABASE_SERVICE_ROLE_KEY=你的 service role key
 SECRET_KEY=随便生成一串很长的随机字符串
-ADMIN_EMAILS=2818242447@qq.com
+SUPER_ADMIN_EMAILS=2818242447@qq.com
 ```
 
-`ADMIN_EMAILS` 可以写多个管理员邮箱，用英文逗号分隔。
+`SUPER_ADMIN_EMAILS` 是最高管理员邮箱，用英文逗号分隔；普通管理员可以在后台页面里设置。
 
 ## 2. 启动服务
 

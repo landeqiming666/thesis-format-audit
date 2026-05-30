@@ -50,9 +50,14 @@ RATE_BUCKETS: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
-ADMIN_EMAILS = {
+SUPER_ADMIN_EMAILS = {
     email.strip().lower()
-    for email in os.environ.get("ADMIN_EMAILS", "2818242447@qq.com").split(",")
+    for email in os.environ.get("SUPER_ADMIN_EMAILS", "2818242447@qq.com").split(",")
+    if email.strip()
+}
+LEGACY_ADMIN_EMAILS = {
+    email.strip().lower()
+    for email in os.environ.get("ADMIN_EMAILS", "").split(",")
     if email.strip()
 }
 
@@ -200,7 +205,7 @@ def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,created_at")
         .eq("id", user_id)
         .maybe_single()
         .execute()
@@ -212,7 +217,7 @@ def find_user_by_email(email: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,created_at")
+        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,created_at")
         .eq("email", email)
         .maybe_single()
         .execute()
@@ -229,6 +234,7 @@ def create_user(email: str, password: str) -> dict:
                 "email": email,
                 "password_hash": generate_password_hash(password),
                 "account_status": ACCOUNT_STATUS_ACTIVE,
+                "is_admin": email in SUPER_ADMIN_EMAILS,
             }
         )
         .execute()
@@ -271,15 +277,22 @@ def user_quota(user: dict | None) -> int:
     return int(user.get("submission_quota", MAX_SUBMISSIONS))
 
 
+def is_super_admin(user: dict | None) -> bool:
+    return bool(user and user.get("email", "").lower() in SUPER_ADMIN_EMAILS)
+
+
 def is_admin(user: dict | None) -> bool:
-    return bool(user and user.get("email", "").lower() in ADMIN_EMAILS)
+    if not user:
+        return False
+    email = user.get("email", "").lower()
+    return is_super_admin(user) or bool(user.get("is_admin")) or email in LEGACY_ADMIN_EMAILS
 
 
 def list_users() -> list[dict]:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,submissions_used,submission_quota,account_status,created_at")
+        .select("id,email,submissions_used,submission_quota,account_status,is_admin,created_at")
         .order("created_at", desc=True)
         .execute()
     )
@@ -310,6 +323,19 @@ def update_user_status(user_id: str, status: str) -> None:
         get_supabase()
         .table(SUPABASE_TABLE)
         .update({"account_status": status})
+        .eq("id", user_id)
+        .execute()
+    )
+
+
+def update_user_admin(user_id: str, admin_enabled: bool) -> None:
+    user = find_user_by_id(user_id)
+    if user is None:
+        raise ValueError("用户不存在。")
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update({"is_admin": bool(admin_enabled)})
         .eq("id", user_id)
         .execute()
     )
@@ -1393,6 +1419,8 @@ ADMIN_PAGE = """
       --warn-soft: #f7e0db;
       --info: #2f5f8a;
       --info-soft: #dceaf8;
+      --gold: #966d1f;
+      --gold-soft: #f3e7c8;
       --shadow: rgba(22, 32, 42, .12);
     }
     * { box-sizing: border-box; }
@@ -1485,7 +1513,7 @@ ADMIN_PAGE = """
     }
     .stats {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 16px;
       margin-bottom: 20px;
     }
@@ -1637,6 +1665,31 @@ ADMIN_PAGE = """
       background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
       color: var(--warn);
     }
+    .role-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 86px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .04em;
+    }
+    .role-super {
+      border-color: color-mix(in srgb, var(--gold) 42%, var(--line));
+      background: color-mix(in srgb, var(--gold-soft) 76%, transparent);
+      color: var(--gold);
+    }
+    .role-admin {
+      border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+      color: var(--accent-strong);
+    }
+    .role-user {
+      color: var(--muted);
+    }
     .actions {
       display: flex;
       flex-wrap: wrap;
@@ -1660,6 +1713,12 @@ ADMIN_PAGE = """
     button:hover {
       filter: brightness(.95);
       transform: translateY(-1px);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      filter: grayscale(.25);
+      opacity: .62;
+      transform: none;
     }
     .ghost-button {
       background: var(--surface-strong);
@@ -1790,6 +1849,11 @@ ADMIN_PAGE = """
         <span class="stat-value">{{ stats["disabled"] }}</span>
         <div class="stat-hint">已停用，不允许继续使用</div>
       </div>
+      <div class="stat-card">
+        <span class="stat-label">管理员</span>
+        <span class="stat-value">{{ stats["admins"] }}</span>
+        <div class="stat-hint">含最高管理员和普通管理员</div>
+      </div>
     </section>
     <section class="panel">
       <div class="toolbar">
@@ -1816,6 +1880,7 @@ ADMIN_PAGE = """
           <thead>
             <tr>
               <th>账号</th>
+              <th>权限</th>
               <th>状态</th>
               <th>已用 / 总额度</th>
               <th>剩余</th>
@@ -1835,6 +1900,15 @@ ADMIN_PAGE = """
                 <td data-label="账号">
                   <div class="email">{{ item["email"] }}</div>
                   <div class="muted mono">{{ item["id"] }}</div>
+                </td>
+                <td data-label="权限">
+                  {% if item["is_super_admin"] %}
+                    <span class="role-badge role-super">最高管理员</span>
+                  {% elif item["is_admin"] %}
+                    <span class="role-badge role-admin">管理员</span>
+                  {% else %}
+                    <span class="role-badge role-user">普通用户</span>
+                  {% endif %}
                 </td>
                 <td data-label="状态">
                   <span class="status-badge status-{{ item['account_status'] }}">
@@ -1866,6 +1940,25 @@ ADMIN_PAGE = """
                 </td>
                 <td data-label="账号操作">
                   <div class="actions">
+                    {% if can_manage_admins %}
+                      {% if item["is_super_admin"] %}
+                        <button class="ghost-button compact-button" type="button" disabled>最高权限</button>
+                      {% elif item["is_admin"] %}
+                        <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认取消 {{ item['email'] }} 的管理员权限吗？">
+                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                          <input name="is_admin" type="hidden" value="0">
+                          <button class="ghost-button compact-button" type="submit">取消管理员</button>
+                        </form>
+                      {% else %}
+                        <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认把 {{ item['email'] }} 设为管理员吗？管理员可以进入后台管理用户额度和账号状态。">
+                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                          <input name="is_admin" type="hidden" value="1">
+                          <button class="compact-button" type="submit">设为管理员</button>
+                        </form>
+                      {% endif %}
+                    {% endif %}
                     {% if item["account_status"] == "active" %}
                       <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认冻结 {{ item['email'] }} 吗？冻结后该账号将不能登录和检测。">
                         <input name="auth_token" type="hidden" value="{{ auth_token }}">
@@ -2031,17 +2124,22 @@ def admin():
         return redirect(url_for("index"))
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
     users = list_users()
+    for item in users:
+        item["is_super_admin"] = item.get("email", "").lower() in SUPER_ADMIN_EMAILS
+        item["is_admin"] = bool(item.get("is_admin")) or item["is_super_admin"] or item.get("email", "").lower() in LEGACY_ADMIN_EMAILS
     stats = {
         "total": len(users),
         "active": sum(1 for item in users if item.get("account_status", ACCOUNT_STATUS_ACTIVE) == ACCOUNT_STATUS_ACTIVE),
         "frozen": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_FROZEN),
         "disabled": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_DISABLED),
+        "admins": sum(1 for item in users if item.get("is_admin")),
     }
     return render_template_string(
         ADMIN_PAGE,
         admin_user=user,
         users=users,
         stats=stats,
+        can_manage_admins=is_super_admin(user),
         status_labels={
             ACCOUNT_STATUS_ACTIVE: account_status_label(ACCOUNT_STATUS_ACTIVE),
             ACCOUNT_STATUS_FROZEN: account_status_label(ACCOUNT_STATUS_FROZEN),
@@ -2086,6 +2184,14 @@ def admin_update_status():
     token = request.form.get("auth_token") or generate_auth_token(user["id"])
     target_user_id = request.form.get("user_id", "")
     status = request.form.get("status", "").strip().lower()
+    target_user = find_user_by_id(target_user_id)
+    if target_user is None:
+        return redirect(url_for("admin", auth_token=token, message="用户不存在。"))
+    target_is_privileged = is_super_admin(target_user) or is_admin(target_user)
+    if target_is_privileged and not is_super_admin(user):
+        return redirect(url_for("admin", auth_token=token, message="普通管理员不能修改其他管理员账号状态。"))
+    if is_super_admin(target_user) and status != ACCOUNT_STATUS_ACTIVE:
+        return redirect(url_for("admin", auth_token=token, message="最高管理员账号不能被冻结或注销。"))
     if target_user_id == user.get("id") and status == ACCOUNT_STATUS_DISABLED:
         return redirect(url_for("admin", auth_token=token, message="不能注销当前管理员账号。"))
     try:
@@ -2093,6 +2199,30 @@ def admin_update_status():
     except ValueError as exc:
         return redirect(url_for("admin", auth_token=token, message=str(exc)))
     return redirect(url_for("admin", auth_token=token, message=f"账号状态已更新为：{account_status_label(status)}。"))
+
+
+@app.post("/admin/role")
+def admin_update_role():
+    limited = rate_limit("admin")
+    if limited:
+        return limited
+    user = current_user()
+    if not is_super_admin(user):
+        return Response("只有最高管理员可以设置管理员权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    target_user_id = request.form.get("user_id", "")
+    admin_enabled = request.form.get("is_admin", "") == "1"
+    target_user = find_user_by_id(target_user_id)
+    if target_user is None:
+        return redirect(url_for("admin", auth_token=token, message="用户不存在。"))
+    if is_super_admin(target_user):
+        return redirect(url_for("admin", auth_token=token, message="最高管理员权限不能在后台取消。"))
+    try:
+        update_user_admin(target_user_id, admin_enabled)
+    except ValueError as exc:
+        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+    action = "设为管理员" if admin_enabled else "取消管理员"
+    return redirect(url_for("admin", auth_token=token, message=f"已将 {target_user['email']} {action}。"))
 
 
 @app.post("/audit")
