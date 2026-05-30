@@ -166,7 +166,32 @@ def validate_docx_package(path: Path) -> None:
             if uncompressed > MAX_DOCX_UNCOMPRESSED_MB * 1024 * 1024:
                 raise ValueError(f"这个 .docx 解压后超过 {MAX_DOCX_UNCOMPRESSED_MB}MB，建议先压缩图片后再上传。")
     except BadZipFile as exc:
-        raise ValueError("这个文件扩展名是 .docx，但内部不是有效的 Word 文档包。请重新另存为 .docx 后上传。") from exc
+        raise ValueError("这个文件后缀是 .docx，但内部不是有效的 Word 文档包，可能是损坏文件、网页改后缀或旧版 .doc 直接改名。请用 Word/WPS 打开原文，选择“另存为”真正的 .docx 后再上传。") from exc
+
+
+def archive_original_upload(user: dict, docx_path: Path, original_filename: str) -> dict:
+    original_bytes = docx_path.read_bytes()
+    storage_path = original_storage_path_for(user, original_filename)
+    archive_path = storage_path
+    storage_backend = ""
+    gcs_path = ""
+    try:
+        storage_backend = upload_original_to_storage(storage_path, original_bytes)
+    except Exception:
+        storage_path = ""
+        app.logger.warning("Failed to upload original docx to Supabase for user %s", user["id"], exc_info=True)
+    if gcs_is_configured():
+        try:
+            gcs_path = upload_original_to_gcs(user, archive_path, original_bytes)
+        except Exception:
+            app.logger.warning("Failed to upload original docx to GCS for user %s", user["id"], exc_info=True)
+    return {
+        "original_storage_backend": storage_backend,
+        "original_storage_path": storage_path,
+        "original_gcs_path": gcs_path,
+        "original_size_bytes": len(original_bytes),
+        "original_sha256": sha256_hex(original_bytes),
+    }
 
 
 def audit_worker(docx_path: str, report_path: str, result_queue) -> None:
@@ -1795,7 +1820,7 @@ PAGE = """
       animation: rise .22s ease both;
     }
     .modal-card {
-      width: min(480px, 100%);
+      width: min(560px, 100%);
       border: 1px solid var(--line);
       background: var(--surface-strong);
       box-shadow: 0 24px 80px var(--shadow);
@@ -1809,6 +1834,48 @@ PAGE = """
       margin: 0;
       color: var(--muted);
       font: 14px/1.8 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .modal-group-card {
+      display: none;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      margin-top: 18px;
+      padding: 18px;
+      border: 2px solid color-mix(in srgb, var(--accent) 58%, var(--line));
+      background:
+        radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 22%, transparent), transparent 12rem),
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 72%, #fff), #fff 72%);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .7), 0 16px 42px rgba(23, 111, 88, .14);
+    }
+    .modal-group-card.active {
+      display: grid;
+    }
+    .modal-group-kicker {
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .modal-group-number {
+      margin-top: 4px;
+      color: var(--accent-strong);
+      font: 950 36px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+      letter-spacing: .06em;
+    }
+    .modal-group-copy {
+      min-width: 132px;
+      padding: 14px 18px;
+      border-width: 2px;
+      font-size: 15px;
+      box-shadow: 0 12px 30px rgba(23, 111, 88, .2);
+    }
+    .modal-group-note {
+      grid-column: 1 / -1;
+      margin: -6px 0 0;
+      color: var(--muted);
+      font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     .modal-actions {
       display: flex;
@@ -1865,6 +1932,9 @@ PAGE = """
       .group-number { font-size: 26px; }
       .group-copy-button { width: 100%; }
       .modal-card { padding: 20px; }
+      .modal-group-card { grid-template-columns: 1fr; }
+      .modal-group-number { font-size: 32px; }
+      .modal-group-copy { width: 100%; }
       .modal-actions { flex-direction: column; }
       .modal-actions button { width: 100%; }
       h1 { font-size: clamp(46px, 16vw, 68px); }
@@ -2025,6 +2095,14 @@ PAGE = """
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
       <h3 id="modal-title">提示</h3>
       <p id="modal-body"></p>
+      <div id="modal-group-card" class="modal-group-card">
+        <div>
+          <div class="modal-group-kicker">官方 QQ 群</div>
+          <div class="modal-group-number">537124215</div>
+        </div>
+        <button id="modal-group-copy" class="copy-button modal-group-copy" type="button">复制群号</button>
+        <div id="modal-group-note" class="modal-group-note">进群后可领取额外检测机会，也可以反馈检测问题。</div>
+      </div>
       <div class="modal-actions">
         <button id="modal-secondary" class="ghost-button" type="button" hidden>关闭</button>
         <button id="modal-primary" type="button">我知道了</button>
@@ -2081,6 +2159,9 @@ PAGE = """
     const modalBody = document.getElementById('modal-body');
     const modalPrimary = document.getElementById('modal-primary');
     const modalSecondary = document.getElementById('modal-secondary');
+    const modalGroupCard = document.getElementById('modal-group-card');
+    const modalGroupCopy = document.getElementById('modal-group-copy');
+    const modalGroupNote = document.getElementById('modal-group-note');
     let modalPrimaryHandler = null;
     let modalSecondaryHandler = null;
 
@@ -2129,6 +2210,8 @@ PAGE = """
       body,
       primaryText = '我知道了',
       secondaryText = '',
+      showGroup = false,
+      groupNote = '进群后可领取额外检测机会，也可以反馈检测问题。',
       onPrimary = null,
       onSecondary = null
     }) => {
@@ -2136,6 +2219,12 @@ PAGE = """
       modalTitle.textContent = title;
       modalBody.textContent = body;
       modalPrimary.textContent = primaryText;
+      if (modalGroupCard) {
+        modalGroupCard.classList.toggle('active', Boolean(showGroup));
+      }
+      if (modalGroupNote) {
+        modalGroupNote.textContent = groupNote;
+      }
       modalPrimaryHandler = onPrimary;
       modalSecondaryHandler = onSecondary;
       if (secondaryText) {
@@ -2163,11 +2252,13 @@ PAGE = """
 
     const showQuotaExhaustedModal = source => {
       const body = source === 'download'
-        ? `本次报告已经下载成功，你的检测额度也已经用完。加入官方 QQ 群 ${GROUP_NUMBER} 可领取新的检测机会。`
-        : `你的检测额度已经用完。加入官方 QQ 群 ${GROUP_NUMBER} 可领取新的检测机会。`;
+        ? '本次报告已经下载成功，但你的检测额度也已经用完。下面是补充检测机会的官方联系入口。'
+        : '你的检测额度已经用完。下面是补充检测机会的官方联系入口。';
       showModal({
         title: '检测额度已用完',
         body,
+        showGroup: true,
+        groupNote: '复制群号后打开 QQ 搜索加入，进群可领取新的检测机会。',
         primaryText: '复制群号',
         secondaryText: '稍后再说',
         onPrimary: async () => {
@@ -2190,7 +2281,9 @@ PAGE = """
     const showPostAuditReminderModal = () => {
       showModal({
         title: '下载成功',
-        body: `检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。也欢迎加入官方 QQ 群 ${GROUP_NUMBER}，领取检测机会或咨询使用问题。`,
+        body: '检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。',
+        showGroup: true,
+        groupNote: '遇到使用问题或想领取更多检测机会，可以复制群号加入官方 QQ 群。',
         primaryText: '复制群号',
         secondaryText: '我知道了',
         onPrimary: async () => {
@@ -2246,6 +2339,10 @@ PAGE = """
     document.querySelectorAll('[data-copy-group]').forEach(button => {
       button.addEventListener('click', copyGroupNumber);
     });
+
+    if (modalGroupCopy) {
+      modalGroupCopy.addEventListener('click', copyGroupNumber);
+    }
 
     document.querySelectorAll('[data-copy-invite]').forEach(button => {
       button.addEventListener('click', async () => {
@@ -2673,38 +2770,84 @@ ADMIN_PAGE = """
       gap: 10px;
       align-items: center;
     }
-    .table-wrap {
-      overflow-x: auto;
+    .user-list {
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+      background:
+        radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--accent-soft) 54%, transparent), transparent 22rem),
+        linear-gradient(180deg, rgba(255, 255, 255, .4), transparent 12rem);
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
+    .user-card {
+      display: grid;
+      grid-template-columns: minmax(230px, .95fr) minmax(180px, .62fr) minmax(190px, .68fr) minmax(280px, 1fr) minmax(340px, 1.2fr);
+      gap: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, .82);
+      box-shadow: 0 18px 52px rgba(22, 32, 42, .08);
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
     }
-    th, td {
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-      text-align: left;
-      vertical-align: middle;
+    .user-card:hover {
+      transform: translateY(-2px);
+      border-color: color-mix(in srgb, var(--accent) 26%, var(--line));
+      box-shadow: 0 24px 70px rgba(22, 32, 42, .12);
     }
-    th {
+    .user-card-section {
+      display: grid;
+      align-content: center;
+      gap: 12px;
+      min-width: 0;
+      padding: 18px;
+      border-right: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+    }
+    .user-card-section:last-child {
+      border-right: 0;
+    }
+    .section-label {
       color: var(--muted);
-      font-size: 12px;
-      letter-spacing: .08em;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .13em;
       text-transform: uppercase;
-      background: color-mix(in srgb, var(--accent-soft) 28%, transparent);
     }
-    tbody tr {
-      transition: background .16s ease;
+    .account-cell {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
     }
-    tbody tr:hover {
-      background: rgba(255, 255, 255, .55);
+    .email {
+      font-weight: 900;
+      letter-spacing: -.01em;
     }
-    .email { font-weight: 800; }
+    .id-chip {
+      display: inline-flex;
+      width: fit-content;
+      max-width: 220px;
+      padding: 6px 8px;
+      border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+      background: color-mix(in srgb, var(--paper) 42%, #fff);
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .muted { color: var(--muted); }
     .mono {
       font-family: "SFMono-Regular", "Menlo", monospace;
       font-size: 12px;
+    }
+    .profile-cell {
+      display: grid;
+      gap: 12px;
+      min-width: 190px;
+    }
+    .badge-stack {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .quota {
       display: inline-grid;
@@ -2715,20 +2858,62 @@ ADMIN_PAGE = """
       background: var(--surface-strong);
       font-weight: 900;
     }
+    .quota-card {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .quota-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .remaining-count {
+      font-size: 28px;
+      font-weight: 950;
+      line-height: 1;
+      color: var(--accent-strong);
+    }
+    .quota-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .quota-track {
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--line) 72%, transparent);
+    }
+    .quota-fill {
+      width: var(--quota-percent, 0%);
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #d1a84b));
+      transition: width .2s ease;
+    }
+    .quota-foot {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     .invite-cell {
       display: grid;
       gap: 8px;
-      min-width: 150px;
+      min-width: 0;
     }
     .trace-cell {
       display: grid;
-      gap: 7px;
-      min-width: 220px;
-      max-width: 340px;
+      gap: 8px;
+      min-width: 0;
     }
     .trace-line {
       display: grid;
-      gap: 2px;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 4px 10px;
       color: var(--muted);
       font-size: 12px;
       line-height: 1.45;
@@ -2736,6 +2921,13 @@ ADMIN_PAGE = """
     .trace-line strong {
       color: var(--ink);
       font-size: 12px;
+      white-space: nowrap;
+    }
+    .trace-main {
+      min-width: 0;
+    }
+    .trace-main span {
+      display: block;
     }
     .ua {
       overflow: hidden;
@@ -2820,28 +3012,60 @@ ADMIN_PAGE = """
       color: var(--muted);
     }
     .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+    .quota-action-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
     }
     .action-group {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .action-section {
+      display: grid;
+      gap: 7px;
+      padding: 10px;
+      border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--paper) 24%, #fff);
+    }
+    .action-title {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .inline-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 7px;
       align-items: center;
+    }
+    .account-actions {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
     }
     button {
       border: 1px solid transparent;
       padding: 10px 12px;
+      border-radius: 12px;
       background: var(--accent);
       color: white;
       cursor: pointer;
       font-weight: 800;
-      transition: transform .16s ease, filter .16s ease, background .16s ease;
+      transition: transform .16s ease, filter .16s ease, background .16s ease, box-shadow .16s ease;
     }
     button:hover {
       filter: brightness(.95);
       transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(22, 32, 42, .12);
     }
     button:disabled {
       cursor: not-allowed;
@@ -2865,17 +3089,11 @@ ADMIN_PAGE = """
       background: var(--info);
     }
     .compact-button {
-      padding: 9px 11px;
+      padding: 9px 10px;
       font-size: 13px;
     }
-    .inline-form {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
     .inline-number {
-      width: 88px;
+      width: 100%;
       padding: 9px 10px;
     }
     .pager {
@@ -2972,6 +3190,24 @@ ADMIN_PAGE = """
       .toolbar {
         grid-template-columns: 1fr 1fr 1fr;
       }
+      .user-card {
+        grid-template-columns: minmax(220px, 1fr) minmax(180px, .8fr);
+      }
+      .user-card-section {
+        border-right: 0;
+        border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      }
+      .user-card-section:nth-child(odd) {
+        border-right: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      }
+      .user-card-section:last-child {
+        grid-column: 1 / -1;
+        border-bottom: 0;
+        border-right: 0;
+      }
+      .actions {
+        grid-template-columns: minmax(0, 1fr);
+      }
     }
     @media (max-width: 820px) {
       main {
@@ -3004,16 +3240,23 @@ ADMIN_PAGE = """
         flex-direction: column;
         grid-template-columns: 1fr;
       }
-      table, thead, tbody, tr, th, td { display: block; }
-      thead { display: none; }
-      tr { border-bottom: 1px solid var(--line); padding: 14px; }
-      td { border: 0; padding: 8px 4px; }
-      td::before {
-        content: attr(data-label);
-        display: block;
-        color: var(--muted);
-        font-size: 12px;
-        margin-bottom: 3px;
+      .user-list {
+        padding: 12px;
+      }
+      .user-card {
+        grid-template-columns: 1fr;
+        border-radius: 18px;
+      }
+      .user-card-section,
+      .user-card-section:nth-child(odd) {
+        border-right: 0;
+        border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      }
+      .user-card-section:last-child {
+        border-bottom: 0;
+      }
+      .quota-action-grid {
+        grid-template-columns: 1fr;
       }
       .actions,
       .action-group,
@@ -3119,48 +3362,54 @@ ADMIN_PAGE = """
         <span>共筛选出 <strong>{{ pagination['total'] }}</strong> 个账号，当前显示第 {{ pagination['start'] }} - {{ pagination['end'] }} 条</span>
         <span>支持快速额度发放/扣减、自定义调整、冻结、恢复、注销和权限管理</span>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>账号</th>
-              <th>权限</th>
-              <th>状态</th>
-              <th>已用 / 总额度</th>
-              <th>剩余</th>
-              <th>邀请</th>
-              <th>来源追踪</th>
-              <th>注册时间</th>
-              <th>调整次数</th>
-              <th>账号操作</th>
-            </tr>
-          </thead>
-          <tbody id="user-table">
-            {% for item in users %}
-              <tr
-                data-user-id="{{ item['id'] }}"
-              >
-                <td data-label="账号">
-                  <div class="email">{{ item["email"] }}</div>
-                  <div class="muted mono">{{ item["id"] }}</div>
-                </td>
-                <td data-label="权限">
-                  {% if item["is_super_admin"] %}
-                    <span class="role-badge role-super">最高管理员</span>
-                  {% elif item["is_admin"] %}
-                    <span class="role-badge role-admin">管理员</span>
-                  {% else %}
-                    <span class="role-badge role-user">普通用户</span>
-                  {% endif %}
-                </td>
-                <td data-label="状态">
-                  <span class="status-badge status-{{ item['account_status'] }}">
-                    {{ status_labels.get(item["account_status"], "未知") }}
-                  </span>
-                </td>
-                <td data-label="已用 / 总额度"><span class="quota" data-quota-text>{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
-                <td data-label="剩余"><strong data-remaining-text>{{ item["remaining"] }}</strong></td>
-                <td data-label="邀请">
+      <div id="user-table" class="user-list">
+        {% for item in users %}
+          {% set used = item["submissions_used"]|int %}
+          {% set total = item["submission_quota"]|int %}
+          {% set quota_percent = (used * 100 / total) if total > 0 else 0 %}
+          <article class="user-card" data-user-id="{{ item['id'] }}">
+            <section class="user-card-section">
+              <div class="section-label">账号</div>
+                  <div class="account-cell">
+                    <div>
+                      <div class="email">{{ item["email"] }}</div>
+                      <div class="mono id-chip" title="{{ item['id'] }}">{{ item["id"] }}</div>
+                    </div>
+                    <div class="badge-stack">
+                      {% if item["is_super_admin"] %}
+                        <span class="role-badge role-super">最高管理员</span>
+                      {% elif item["is_admin"] %}
+                        <span class="role-badge role-admin">管理员</span>
+                      {% else %}
+                        <span class="role-badge role-user">普通用户</span>
+                      {% endif %}
+                      <span class="status-badge status-{{ item['account_status'] }}">
+                        {{ status_labels.get(item["account_status"], "未知") }}
+                      </span>
+                    </div>
+                  </div>
+            </section>
+            <section class="user-card-section">
+              <div class="section-label">状态与额度</div>
+                  <div class="quota-card">
+                    <div class="quota-head">
+                      <div>
+                        <div class="quota-label">剩余次数</div>
+                        <div class="remaining-count" data-remaining-text>{{ item["remaining"] }}</div>
+                      </div>
+                      <span class="quota" data-quota-text>{{ used }} / {{ total }}</span>
+                    </div>
+                    <div class="quota-track" aria-label="额度使用进度">
+                      <div class="quota-fill" data-quota-fill style="--quota-percent: {{ quota_percent if quota_percent <= 100 else 100 }}%;"></div>
+                    </div>
+                    <div class="quota-foot">
+                      <span>已用 {{ used }}</span>
+                      <span>总额 {{ total }}</span>
+                    </div>
+                  </div>
+            </section>
+            <section class="user-card-section">
+              <div class="section-label">邀请</div>
                   <div class="invite-cell">
                     {% if item["invite_code"] %}
                       <span class="invite-code-mini">{{ item["invite_code"] }}</span>
@@ -3171,121 +3420,144 @@ ADMIN_PAGE = """
                       <span class="muted">暂无邀请码</span>
                     {% endif %}
                   </div>
-                </td>
-                <td data-label="来源追踪">
+            </section>
+            <section class="user-card-section">
+              <div class="section-label">来源追踪</div>
                   <div class="trace-cell">
                     <div class="trace-line">
-                      <strong>注册 IP：{{ item["register_ip"] or "旧账号未记录" }}</strong>
-                      <span>{{ item["created_at_display"] or item["created_at"] }}</span>
-                      {% if item["register_user_agent"] %}<span class="ua" title="{{ item['register_user_agent'] }}">{{ item["register_user_agent"] }}</span>{% endif %}
+                      <strong>注册</strong>
+                      <div class="trace-main">
+                        <span>{{ item["register_ip"] or "旧账号未记录" }}</span>
+                        <span>{{ item["created_at_display"] or item["created_at"] }}</span>
+                        {% if item["register_user_agent"] %}<span class="ua" title="{{ item['register_user_agent'] }}">{{ item["register_user_agent"] }}</span>{% endif %}
+                      </div>
                     </div>
                     <div class="trace-line">
-                      <strong>最后登录：{{ item["last_login_ip"] or "暂无" }}</strong>
-                      <span>{{ item["last_login_at_display"] or "暂无登录记录" }}</span>
-                      {% if item["last_login_user_agent"] %}<span class="ua" title="{{ item['last_login_user_agent'] }}">{{ item["last_login_user_agent"] }}</span>{% endif %}
+                      <strong>登录</strong>
+                      <div class="trace-main">
+                        <span>{{ item["last_login_ip"] or "暂无" }}</span>
+                        <span>{{ item["last_login_at_display"] or "暂无登录记录" }}</span>
+                        {% if item["last_login_user_agent"] %}<span class="ua" title="{{ item['last_login_user_agent'] }}">{{ item["last_login_user_agent"] }}</span>{% endif %}
+                      </div>
                     </div>
                     <div class="trace-line">
-                      <strong>最后检测：{{ item["last_audit_ip"] or "暂无" }}</strong>
-                      <span>{{ item["last_audit_at_display"] or "暂无检测记录" }}</span>
-                      {% if item["last_audit_user_agent"] %}<span class="ua" title="{{ item['last_audit_user_agent'] }}">{{ item["last_audit_user_agent"] }}</span>{% endif %}
+                      <strong>检测</strong>
+                      <div class="trace-main">
+                        <span>{{ item["last_audit_ip"] or "暂无" }}</span>
+                        <span>{{ item["last_audit_at_display"] or "暂无检测记录" }}</span>
+                        {% if item["last_audit_user_agent"] %}<span class="ua" title="{{ item['last_audit_user_agent'] }}">{{ item["last_audit_user_agent"] }}</span>{% endif %}
+                      </div>
                     </div>
                   </div>
-                </td>
-                <td data-label="注册时间" class="muted">{{ item["created_at_display"] or item["created_at"] }}</td>
-                <td data-label="调整次数">
+                  <div class="muted">注册时间：{{ item["created_at_display"] or item["created_at"] }}</div>
+            </section>
+            <section class="user-card-section">
+              <div class="section-label">管理操作</div>
                   <div class="actions">
-                    <div class="action-group">
-                      {% for amount in [1, 3, 10] %}
-                        <form class="quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
-                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                          <input name="next" type="hidden" value="{{ current_url }}">
-                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                          <input name="amount" type="hidden" value="{{ amount }}">
-                          <button class="compact-button" type="submit">+{{ amount }}</button>
-                        </form>
-                      {% endfor %}
-                      {% for amount in [1, 3, 10] %}
-                        <form class="quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
-                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                          <input name="next" type="hidden" value="{{ current_url }}">
-                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                          <input name="amount" type="hidden" value="{{ amount }}">
-                          <button class="ghost-button compact-button" type="submit">-{{ amount }}</button>
-                        </form>
-                      {% endfor %}
+                    <div class="quota-action-grid">
+                      <div class="action-section">
+                        <div class="action-title">快速加次</div>
+                        <div class="action-group">
+                          {% for amount in [1, 3, 10] %}
+                            <form class="quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
+                              <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                              <input name="next" type="hidden" value="{{ current_url }}">
+                              <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                              <input name="amount" type="hidden" value="{{ amount }}">
+                              <button class="compact-button" type="submit">+{{ amount }}</button>
+                            </form>
+                          {% endfor %}
+                        </div>
+                      </div>
+                      <div class="action-section">
+                        <div class="action-title">快速扣减</div>
+                        <div class="action-group">
+                          {% for amount in [1, 3, 10] %}
+                            <form class="quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
+                              <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                              <input name="next" type="hidden" value="{{ current_url }}">
+                              <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                              <input name="amount" type="hidden" value="{{ amount }}">
+                              <button class="ghost-button compact-button" type="submit">-{{ amount }}</button>
+                            </form>
+                          {% endfor %}
+                        </div>
+                      </div>
                     </div>
-                    <form class="inline-form quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
-                      <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                      <input name="next" type="hidden" value="{{ current_url }}">
-                      <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                      <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
-                      <button class="ghost-button compact-button" type="submit">增加</button>
-                    </form>
-                    <form class="inline-form quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
-                      <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                      <input name="next" type="hidden" value="{{ current_url }}">
-                      <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                      <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
-                      <button class="ghost-button compact-button" type="submit">减少</button>
-                    </form>
+                    <div class="action-section">
+                      <div class="action-title">自定义额度</div>
+                      <form class="inline-form quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
+                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="next" type="hidden" value="{{ current_url }}">
+                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                        <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="输入次数">
+                        <button class="ghost-button compact-button" type="submit">增加</button>
+                      </form>
+                      <form class="inline-form quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
+                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="next" type="hidden" value="{{ current_url }}">
+                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                        <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="输入次数">
+                        <button class="ghost-button compact-button" type="submit">减少</button>
+                      </form>
+                    </div>
+                    <div class="action-section">
+                      <div class="action-title">账号状态</div>
+                      <div class="account-actions">
+                        {% if can_manage_admins %}
+                          {% if item["is_super_admin"] %}
+                            <button class="ghost-button compact-button" type="button" disabled>最高权限</button>
+                          {% elif item["is_admin"] %}
+                            <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认取消 {{ item['email'] }} 的管理员权限吗？">
+                              <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                              <input name="next" type="hidden" value="{{ current_url }}">
+                              <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                              <input name="is_admin" type="hidden" value="0">
+                              <button class="ghost-button compact-button" type="submit">取消管理员</button>
+                            </form>
+                          {% else %}
+                            <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认把 {{ item['email'] }} 设为管理员吗？管理员可以进入后台管理用户额度和账号状态。">
+                              <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                              <input name="next" type="hidden" value="{{ current_url }}">
+                              <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                              <input name="is_admin" type="hidden" value="1">
+                              <button class="compact-button" type="submit">设为管理员</button>
+                            </form>
+                          {% endif %}
+                        {% endif %}
+                        {% if item["account_status"] == "active" %}
+                          <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认冻结 {{ item['email'] }} 吗？冻结后该账号将不能登录和检测。">
+                            <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                            <input name="next" type="hidden" value="{{ current_url }}">
+                            <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                            <input name="status" type="hidden" value="frozen">
+                            <button class="info-button compact-button" type="submit">冻结</button>
+                          </form>
+                        {% else %}
+                          <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认恢复 {{ item['email'] }} 吗？恢复后账号可继续使用。">
+                            <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                            <input name="next" type="hidden" value="{{ current_url }}">
+                            <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                            <input name="status" type="hidden" value="active">
+                            <button class="ghost-button compact-button" type="submit">恢复</button>
+                          </form>
+                        {% endif %}
+                        {% if item["account_status"] != "disabled" %}
+                          <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm-email="{{ item['email'] }}">
+                            <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                            <input name="next" type="hidden" value="{{ current_url }}">
+                            <input name="user_id" type="hidden" value="{{ item["id"] }}">
+                            <input name="status" type="hidden" value="disabled">
+                            <input name="confirm_email" type="hidden" value="">
+                            <button class="warn-button compact-button" type="submit">注销</button>
+                          </form>
+                        {% endif %}
+                      </div>
+                    </div>
                   </div>
-                </td>
-                <td data-label="账号操作">
-                  <div class="actions">
-                    {% if can_manage_admins %}
-                      {% if item["is_super_admin"] %}
-                        <button class="ghost-button compact-button" type="button" disabled>最高权限</button>
-                      {% elif item["is_admin"] %}
-                        <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认取消 {{ item['email'] }} 的管理员权限吗？">
-                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                          <input name="next" type="hidden" value="{{ current_url }}">
-                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                          <input name="is_admin" type="hidden" value="0">
-                          <button class="ghost-button compact-button" type="submit">取消管理员</button>
-                        </form>
-                      {% else %}
-                        <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认把 {{ item['email'] }} 设为管理员吗？管理员可以进入后台管理用户额度和账号状态。">
-                          <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                          <input name="next" type="hidden" value="{{ current_url }}">
-                          <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                          <input name="is_admin" type="hidden" value="1">
-                          <button class="compact-button" type="submit">设为管理员</button>
-                        </form>
-                      {% endif %}
-                    {% endif %}
-                    {% if item["account_status"] == "active" %}
-                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认冻结 {{ item['email'] }} 吗？冻结后该账号将不能登录和检测。">
-                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                        <input name="next" type="hidden" value="{{ current_url }}">
-                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                        <input name="status" type="hidden" value="frozen">
-                        <button class="info-button compact-button" type="submit">冻结</button>
-                      </form>
-                    {% else %}
-                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认恢复 {{ item['email'] }} 吗？恢复后账号可继续使用。">
-                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                        <input name="next" type="hidden" value="{{ current_url }}">
-                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                        <input name="status" type="hidden" value="active">
-                        <button class="ghost-button compact-button" type="submit">恢复</button>
-                      </form>
-                    {% endif %}
-                    {% if item["account_status"] != "disabled" %}
-                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm-email="{{ item['email'] }}">
-                        <input name="auth_token" type="hidden" value="{{ auth_token }}">
-                        <input name="next" type="hidden" value="{{ current_url }}">
-                        <input name="user_id" type="hidden" value="{{ item["id"] }}">
-                        <input name="status" type="hidden" value="disabled">
-                        <input name="confirm_email" type="hidden" value="">
-                        <button class="warn-button compact-button" type="submit">注销</button>
-                      </form>
-                    {% endif %}
-                  </div>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+            </section>
+          </article>
+        {% endfor %}
       </div>
       {% if not users %}
         <div class="empty-state">没有匹配到符合条件的账号，试试清空搜索词或调整筛选条件。</div>
@@ -3392,12 +3664,19 @@ ADMIN_PAGE = """
             throw new Error(payload.message || '调整次数失败，请稍后再试。');
           }
 
-          const row = userTable?.querySelector(`tr[data-user-id="${payload.user.id}"]`);
+          const row = userTable?.querySelector(`[data-user-id="${payload.user.id}"]`);
           if (row) {
             const quotaText = row.querySelector('[data-quota-text]');
             const remainingText = row.querySelector('[data-remaining-text]');
+            const quotaFill = row.querySelector('[data-quota-fill]');
             if (quotaText) quotaText.textContent = `${payload.user.submissions_used} / ${payload.user.submission_quota}`;
             if (remainingText) remainingText.textContent = String(payload.user.remaining);
+            if (quotaFill) {
+              const total = Number(payload.user.submission_quota || 0);
+              const used = Number(payload.user.submissions_used || 0);
+              const percent = total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
+              quotaFill.style.setProperty('--quota-percent', `${percent}%`);
+            }
           }
           const customAmount = form.querySelector('input[name="amount"][type="number"]');
           if (customAmount) customAmount.value = '';
@@ -4866,25 +5145,10 @@ def audit():
         report_path = tmp_path / download_name
         upload.save(docx_path)
 
+        original_archive = archive_original_upload(user, docx_path, original_filename)
+
         try:
             validate_docx_package(docx_path)
-            original_bytes = docx_path.read_bytes()
-            original_storage_path = original_storage_path_for(user, original_filename)
-            original_archive_path = original_storage_path
-            original_storage_backend = ""
-            original_gcs_path = ""
-            original_size_bytes = len(original_bytes)
-            original_sha256 = sha256_hex(original_bytes)
-            try:
-                original_storage_backend = upload_original_to_storage(original_storage_path, original_bytes)
-            except Exception:
-                original_storage_path = ""
-                app.logger.warning("Failed to upload original docx to Supabase for user %s", user["id"], exc_info=True)
-            if gcs_is_configured():
-                try:
-                    original_gcs_path = upload_original_to_gcs(user, original_archive_path, original_bytes)
-                except Exception:
-                    app.logger.warning("Failed to upload original docx to GCS for user %s", user["id"], exc_info=True)
             run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
             error_message = f"{exc}"
@@ -4894,11 +5158,11 @@ def audit():
                     original_filename=original_filename,
                     report_filename=download_name,
                     status="audit_failed",
-                    original_storage_backend=locals().get("original_storage_backend", ""),
-                    original_storage_path=locals().get("original_storage_path", ""),
-                    original_gcs_path=locals().get("original_gcs_path", ""),
-                    original_size_bytes=locals().get("original_size_bytes", 0),
-                    original_sha256=locals().get("original_sha256", ""),
+                    original_storage_backend=original_archive["original_storage_backend"],
+                    original_storage_path=original_archive["original_storage_path"],
+                    original_gcs_path=original_archive["original_gcs_path"],
+                    original_size_bytes=original_archive["original_size_bytes"],
+                    original_sha256=original_archive["original_sha256"],
                     error_message=error_message,
                 )
             except Exception:
@@ -4941,11 +5205,11 @@ def audit():
                 report_filename=download_name,
                 status=report_status,
                 report_storage_path=storage_path,
-                original_storage_backend=original_storage_backend,
-                original_storage_path=original_storage_path,
-                original_gcs_path=original_gcs_path,
-                original_size_bytes=original_size_bytes,
-                original_sha256=original_sha256,
+                original_storage_backend=original_archive["original_storage_backend"],
+                original_storage_path=original_archive["original_storage_path"],
+                original_gcs_path=original_archive["original_gcs_path"],
+                original_size_bytes=original_archive["original_size_bytes"],
+                original_sha256=original_archive["original_sha256"],
                 report_storage_backend=report_storage_backend,
                 report_gcs_path=report_gcs_path,
                 report_size_bytes=report_size_bytes,
