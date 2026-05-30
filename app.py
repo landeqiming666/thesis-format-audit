@@ -384,6 +384,10 @@ def get_gcs_client():
     return _GCS_CLIENT
 
 
+def maybe_single_data(result) -> dict | None:
+    return result.data if result is not None else None
+
+
 def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
@@ -393,7 +397,7 @@ def find_user_by_id(user_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return maybe_single_data(result)
 
 
 def find_user_by_email(email: str) -> dict | None:
@@ -405,7 +409,7 @@ def find_user_by_email(email: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return maybe_single_data(result)
 
 
 def normalize_invite_code(code: str) -> str:
@@ -428,7 +432,7 @@ def find_user_by_invite_code(code: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data if result is not None else None
+    return maybe_single_data(result)
 
 
 def create_unique_invite_code() -> str:
@@ -618,7 +622,7 @@ def find_report_by_id(report_id: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return maybe_single_data(result)
 
 
 def create_report_record(
@@ -1902,6 +1906,14 @@ PAGE = """
               <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
             </span>
           </div>
+          <div class="group-invite">
+            <div>
+              <strong>加入 QQ 群，领取更多检测机会</strong>
+              <div class="group-number">537124215</div>
+              进群后可联系管理员领取额外检测机会，也可以反馈检测问题。
+            </div>
+            <button class="copy-button group-copy-button" type="button" data-copy-group>复制群号</button>
+          </div>
           <div class="invite-card">
             <p>邀请好友注册并完成创建账号，你的检测额度会自动增加 1 次。</p>
             <div class="invite-actions">
@@ -1914,13 +1926,6 @@ PAGE = """
             {% if error %}<p class="error">{{ error }}</p>{% endif %}
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
-              <div class="quota-help">
-                <p><span class="quota-label">增加检测次数</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加账号额度。</p>
-                <div class="quota-actions">
-                  <strong class="quota-number">537124215</strong>
-                  <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
-                </div>
-              </div>
               <label for="docx">选择论文文件</label>
               <label id="upload-card" class="upload-card" for="docx">
                 <span class="upload-icon">↑</span>
@@ -1944,18 +1949,19 @@ PAGE = """
               <p class="note">报告会在浏览器中下载为 HTML 文件，可以直接打开或转发。大文件可能需要等待几十秒。</p>
             {% else %}
               <p class="error">这个账号的检测额度已经用完。</p>
-              <div class="quota-help">
-                <p><span class="quota-label">额度已用完</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加检测次数。</p>
-                <div class="quota-actions">
-                  <strong class="quota-number">537124215</strong>
-                  <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
-                </div>
-              </div>
             {% endif %}
           </form>
         {% else %}
           <div class="panel-title"><strong>开始使用</strong><span>账号限制</span></div>
           {% if auth_error %}<p class="error">{{ auth_error }}</p>{% endif %}
+          <div class="group-invite">
+            <div>
+              <strong>加入 QQ 群，领取检测机会</strong>
+              <div class="group-number">537124215</div>
+              进群后可联系管理员领取额外检测机会，新用户也可以咨询注册和使用问题。
+            </div>
+            <button class="copy-button group-copy-button" type="button" data-copy-group>复制群号</button>
+          </div>
           <div class="auth-switch" role="tablist" aria-label="登录或注册">
             <button class="auth-tab {% if auth_mode == 'login' %}active{% endif %}" type="button" data-auth-tab="login">登录</button>
             <button class="auth-tab {% if auth_mode == 'register' %}active{% endif %}" type="button" data-auth-tab="register">注册</button>
@@ -2010,14 +2016,6 @@ PAGE = """
           <div class="auth-rules">
             <div class="auth-rule"><span>1</span><p>每个账号最多生成 {{ max_submissions }} 次报告，次数保存在数据库中。</p></div>
             <div class="auth-rule"><span>2</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
-          </div>
-          <div class="group-invite">
-            <div class="group-invite-head">
-              <strong>加入 QQ 群可领取检测机会</strong>
-              <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
-            </div>
-            <div class="group-number">QQ 群号：537124215</div>
-            进群后可联系管理员领取额外检测机会。
           </div>
         {% endif %}
       </div>
