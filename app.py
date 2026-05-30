@@ -82,6 +82,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
 ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
 REPORTS_TABLE = "thesis_audit_reports"
+REGISTRATION_CODES_TABLE = "thesis_audit_registration_codes"
 REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
 GMAIL_SMTP_HOST = os.environ.get("GMAIL_SMTP_HOST", "smtp.gmail.com")
 GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT", "465"))
@@ -108,6 +109,7 @@ REPORT_COLUMNS = (
     "original_gcs_path,original_size_bytes,original_sha256,report_storage_backend,report_gcs_path,"
     "report_size_bytes,report_sha256,created_at"
 )
+REGISTRATION_CODE_COLUMNS = "id,code,note,max_uses,used_count,is_active,created_by,created_at"
 _GCS_CLIENT = None
 ADMIN_SORT_OPTIONS = {
     "created_desc",
@@ -441,8 +443,16 @@ def normalize_invite_code(code: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
 
 
+def normalize_registration_code(code: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
+
+
 def generate_invite_code() -> str:
     return uuid4().hex[:10].upper()
+
+
+def generate_registration_code() -> str:
+    return f"UPC{uuid4().hex[:9]}".upper()
 
 
 def find_user_by_invite_code(code: str) -> dict | None:
@@ -487,6 +497,100 @@ def ensure_user_invite_code(user: dict | None) -> dict | None:
         updated["invite_code"] = code
         return updated
     return user
+
+
+def find_registration_code(code: str) -> dict | None:
+    normalized = normalize_registration_code(code)
+    if not normalized:
+        return None
+    result = (
+        get_supabase()
+        .table(REGISTRATION_CODES_TABLE)
+        .select(REGISTRATION_CODE_COLUMNS)
+        .eq("code", normalized)
+        .maybe_single()
+        .execute()
+    )
+    return maybe_single_data(result)
+
+
+def list_registration_codes(limit: int = 12) -> list[dict]:
+    try:
+        result = (
+            get_supabase()
+            .table(REGISTRATION_CODES_TABLE)
+            .select(REGISTRATION_CODE_COLUMNS)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception:
+        app.logger.warning("Failed to list registration codes", exc_info=True)
+        return []
+
+
+def registration_code_remaining(item: dict | None) -> int:
+    if not item:
+        return 0
+    return max(0, int(item.get("max_uses") or 0) - int(item.get("used_count") or 0))
+
+
+def registration_code_is_available(item: dict | None) -> bool:
+    return bool(item and item.get("is_active") and registration_code_remaining(item) > 0)
+
+
+def create_registration_code(actor: dict, max_uses: int, note: str = "") -> dict:
+    max_uses = min(max(max_uses, 1), 999)
+    note = (note or "").strip()[:120]
+    for _ in range(10):
+        code = generate_registration_code()
+        if find_registration_code(code) is not None:
+            continue
+        result = (
+            get_supabase()
+            .table(REGISTRATION_CODES_TABLE)
+            .insert(
+                {
+                    "code": code,
+                    "note": note,
+                    "max_uses": max_uses,
+                    "used_count": 0,
+                    "is_active": True,
+                    "created_by": actor.get("email", ""),
+                }
+            )
+            .execute()
+        )
+        return result.data[0]
+    raise RuntimeError("注册码生成失败，请重试。")
+
+
+def consume_registration_code(code: str) -> dict:
+    normalized = normalize_registration_code(code)
+    if not normalized:
+        raise ValueError("QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。")
+    result = get_supabase().rpc(
+        "consume_thesis_audit_registration_code",
+        {"target_code": normalized},
+    ).execute()
+    data = result.data or []
+    if not data:
+        raise ValueError("QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。")
+    return data[0]
+
+
+def update_registration_code_status(code_id: str, is_active: bool) -> dict:
+    result = (
+        get_supabase()
+        .table(REGISTRATION_CODES_TABLE)
+        .update({"is_active": bool(is_active)})
+        .eq("id", code_id)
+        .execute()
+    )
+    if not result.data:
+        raise ValueError("注册码不存在。")
+    return result.data[0]
 
 
 def create_user(email: str, password: str, invited_by: str | None = None) -> dict:
@@ -1220,6 +1324,7 @@ def registration_values(
     email: str,
     password: str,
     confirm_password: str,
+    registration_code: str = "",
     invite_code: str = "",
     email_code: str = "",
 ) -> dict:
@@ -1227,6 +1332,7 @@ def registration_values(
         "register_email": email,
         "register_password": password,
         "register_confirm_password": confirm_password,
+        "registration_code": normalize_registration_code(registration_code),
         "invite_code": normalize_invite_code(invite_code),
         "email_code": (email_code or "").strip(),
     }
@@ -2046,7 +2152,8 @@ PAGE = """
             </form>
             <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
               <h2>注册</h2>
-              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。新注册仅支持 QQ 邮箱，并需要完成邮箱验证。</p>
+              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。新注册仅支持 QQ 邮箱，并需要填写 QQ 群注册码。</p>
+              <input name="registration_code" type="text" placeholder="QQ群注册码：加入官方 QQ 群 537124215，从群公告获得" value="{{ auth_values.get('registration_code', '') }}" required>
               <input name="email" type="email" placeholder="QQ 邮箱，例如 123456@qq.com" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
               {% if email_verification_enabled %}
                 <div class="verify-row">
@@ -2084,8 +2191,9 @@ PAGE = """
             </form>
           </div>
           <div class="auth-rules">
-            <div class="auth-rule"><span>1</span><p>每个账号最多生成 {{ max_submissions }} 次报告，次数保存在数据库中。</p></div>
-            <div class="auth-rule"><span>2</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
+            <div class="auth-rule"><span>1</span><p>QQ群注册码从官方 QQ 群 537124215 的群公告中获得，用于控制注册入口。</p></div>
+            <div class="auth-rule"><span>2</span><p>每个账号最多生成 {{ max_submissions }} 次报告，次数保存在数据库中。</p></div>
+            <div class="auth-rule"><span>3</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
           </div>
         {% endif %}
       </div>
@@ -3140,6 +3248,83 @@ ADMIN_PAGE = """
       box-shadow: 0 24px 72px var(--shadow);
       backdrop-filter: blur(16px);
     }
+    .code-panel {
+      margin-bottom: 18px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .code-panel-body {
+      display: grid;
+      grid-template-columns: minmax(280px, .9fr) minmax(0, 1.4fr);
+      gap: 18px;
+      padding: 18px;
+    }
+    .code-create {
+      display: grid;
+      gap: 10px;
+      align-content: start;
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, .58);
+    }
+    .code-create .inline-form {
+      grid-template-columns: 110px minmax(0, 1fr);
+    }
+    .code-list {
+      display: grid;
+      gap: 10px;
+    }
+    .code-item {
+      display: grid;
+      grid-template-columns: minmax(160px, .8fr) minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px;
+      border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, .68);
+    }
+    .code-token {
+      display: inline-flex;
+      width: fit-content;
+      padding: 9px 11px;
+      border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--accent-soft) 50%, #fff);
+      color: var(--accent-strong);
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 14px;
+      font-weight: 900;
+      letter-spacing: .08em;
+    }
+    .code-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .code-status {
+      display: inline-flex;
+      width: fit-content;
+      padding: 6px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 900;
+    }
+    .code-status.active {
+      border-color: color-mix(in srgb, var(--accent) 34%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 52%, transparent);
+      color: var(--accent-strong);
+    }
+    .code-status.inactive {
+      border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: var(--warn);
+    }
     .section-head {
       display: flex;
       align-items: center;
@@ -3231,6 +3416,10 @@ ADMIN_PAGE = """
       .summary-bar {
         align-items: flex-start;
         flex-direction: column;
+      }
+      .code-panel-body,
+      .code-item {
+        grid-template-columns: 1fr;
       }
       .toolbar-actions,
       .pager,
@@ -3325,6 +3514,63 @@ ADMIN_PAGE = """
         <span class="stat-label">奖励次数</span>
         <span class="stat-value">{{ stats["invite_rewards"] }}</span>
         <div class="stat-hint">已发放的邀请奖励次数</div>
+      </div>
+    </section>
+    <section class="code-panel">
+      <div class="section-head">
+        <div>
+          <h2>QQ群注册码</h2>
+          <div class="log-meta">用户注册必须填写注册码。把可用注册码发布到官方 QQ 群 537124215 的群公告中，用户从群公告获取后再注册。</div>
+        </div>
+      </div>
+      <div class="code-panel-body">
+        <form class="code-create" method="post" action="{{ url_for('admin_create_registration_code') }}">
+          <input name="auth_token" type="hidden" value="{{ auth_token }}">
+          <input name="next" type="hidden" value="{{ current_url }}">
+          <strong>生成新注册码</strong>
+          <div class="log-meta">建议每次群公告放 1 个码，可设置使用次数；用完自动不可用。</div>
+          <label class="log-meta" for="code-max-uses">可用次数</label>
+          <div class="inline-form">
+            <input id="code-max-uses" class="inline-number" name="max_uses" type="number" min="1" max="999" step="1" value="20" required>
+            <button class="compact-button" type="submit">生成注册码</button>
+          </div>
+          <input class="field" name="note" type="text" maxlength="120" placeholder="备注，例如：QQ群公告 5月30日">
+        </form>
+        <div class="code-list">
+          {% if registration_codes %}
+            {% for code in registration_codes %}
+              {% set remaining_uses = (code["max_uses"]|int) - (code["used_count"]|int) %}
+              <div class="code-item">
+                <div>
+                  <button class="code-token mini-link" type="button" data-copy-text="{{ code['code'] }}">{{ code["code"] }}</button>
+                  <div class="code-meta">点击复制，发布到 QQ 群公告</div>
+                </div>
+                <div class="code-meta">
+                  <strong>{{ code["note"] or "未填写备注" }}</strong><br>
+                  使用 {{ code["used_count"] }} / {{ code["max_uses"] }}，剩余 {{ remaining_uses if remaining_uses > 0 else 0 }}<br>
+                  创建者：{{ code["created_by"] or "未知" }} · {{ code["created_at"] }}
+                </div>
+                <form method="post" action="{{ url_for('admin_update_registration_code_status') }}">
+                  <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                  <input name="next" type="hidden" value="{{ current_url }}">
+                  <input name="code_id" type="hidden" value="{{ code["id"] }}">
+                  {% if code["is_active"] %}
+                    <input name="is_active" type="hidden" value="0">
+                    <button class="ghost-button compact-button" type="submit">停用</button>
+                  {% else %}
+                    <input name="is_active" type="hidden" value="1">
+                    <button class="compact-button" type="submit">启用</button>
+                  {% endif %}
+                  <span class="code-status {% if code['is_active'] %}active{% else %}inactive{% endif %}">
+                    {% if code["is_active"] %}启用中{% else %}已停用{% endif %}
+                  </span>
+                </form>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="empty-state">还没有注册码。生成一个后放到 QQ 群公告中，用户注册时必须填写。</div>
+          {% endif %}
+        </div>
       </div>
     </section>
     <section class="panel">
@@ -4630,12 +4876,13 @@ def register():
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
+    registration_code = normalize_registration_code(request.form.get("registration_code", ""))
     invite_code = normalize_invite_code(request.form.get("invite_code", ""))
     email_code = request.form.get("email_code", "").strip()
     captcha_answer = request.form.get("captcha_answer", "").strip()
     captcha_left = request.form.get("captcha_left", "")
     captcha_right = request.form.get("captcha_right", "")
-    auth_values = registration_values(email, password, confirm_password, invite_code, email_code)
+    auth_values = registration_values(email, password, confirm_password, registration_code, invite_code, email_code)
     if not is_valid_registration_email(email):
         refresh_captcha()
         return render_home(auth_error="新注册仅支持 QQ 邮箱，请使用类似 123456@qq.com 的邮箱地址。", auth_mode="register", auth_values=auth_values), 400
@@ -4654,6 +4901,13 @@ def register():
     if not is_valid_captcha(captcha_answer, captcha_left, captcha_right):
         refresh_captcha()
         return render_home(auth_error="数字验证不正确，请重新计算。", auth_mode="register", auth_values=auth_values), 400
+    access_code_record = find_registration_code(registration_code)
+    if not registration_code_is_available(access_code_record):
+        refresh_captcha()
+        return render_home(auth_error="QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。", auth_mode="register", auth_values=auth_values), 400
+    if find_user_by_email(email) is not None:
+        refresh_captcha()
+        return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
 
     inviter = find_user_by_invite_code(invite_code) if invite_code else None
     if invite_code and inviter is None:
@@ -4664,10 +4918,25 @@ def register():
         return render_home(auth_error="不能使用自己的邀请码注册。", auth_mode="register", auth_values=auth_values), 400
 
     try:
+        consumed_code = consume_registration_code(registration_code)
+    except ValueError as exc:
+        refresh_captcha()
+        return render_home(auth_error=str(exc), auth_mode="register", auth_values=auth_values), 400
+    try:
         user = create_user(email, password, invited_by=inviter["id"] if inviter else None)
     except APIError:
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
+    try:
+        record_admin_log(
+            None,
+            "registration_code_use",
+            user,
+            f"{email} 使用 QQ 群注册码 {consumed_code['code']} 完成注册",
+            {"code": consumed_code["code"], "used_count": consumed_code.get("used_count"), "max_uses": consumed_code.get("max_uses")},
+        )
+    except Exception:
+        app.logger.warning("Failed to consume registration code %s for user %s", registration_code, user["id"], exc_info=True)
     if inviter:
         try:
             award_invite_bonus(inviter["id"])
@@ -4772,12 +5041,14 @@ def admin():
     page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
     current_url = build_admin_url(token, {**table_state, "page": pagination["page"]})
     recent_logs = list_admin_logs()[:6]
+    registration_codes = list_registration_codes()
     return render_template_string(
         ADMIN_PAGE,
         admin_user=user,
         users=users,
         stats=stats,
         recent_logs=recent_logs,
+        registration_codes=registration_codes,
         table_state={**table_state, "page": pagination["page"]},
         pagination=pagination,
         page_numbers=page_numbers,
@@ -4963,6 +5234,61 @@ def admin_update_role():
         {"is_admin": admin_enabled},
     )
     return redirect_with_message(admin_redirect_url(token), f"已将 {target_user['email']} {action}。")
+
+
+@app.post("/admin/registration-codes")
+def admin_create_registration_code():
+    limited = rate_limit("admin")
+    if limited:
+        return limited
+    user = current_user()
+    if not is_admin(user):
+        return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    try:
+        max_uses = int(request.form.get("max_uses", "20"))
+    except ValueError:
+        max_uses = 20
+    note = request.form.get("note", "").strip()
+    try:
+        code = create_registration_code(user, max_uses=max_uses, note=note)
+    except Exception as exc:
+        app.logger.warning("Failed to create registration code", exc_info=True)
+        return redirect_with_message(admin_redirect_url(token), f"生成注册码失败：{exc}")
+    record_admin_log(
+        user,
+        "registration_code_create",
+        None,
+        f"生成 QQ 群注册码 {code['code']}，可用 {code['max_uses']} 次",
+        {"code": code["code"], "max_uses": code["max_uses"], "note": code.get("note", "")},
+    )
+    return redirect_with_message(admin_redirect_url(token), f"已生成 QQ 群注册码：{code['code']}。请复制到 QQ 群 537124215 的群公告中。")
+
+
+@app.post("/admin/registration-codes/status")
+def admin_update_registration_code_status():
+    limited = rate_limit("admin")
+    if limited:
+        return limited
+    user = current_user()
+    if not is_admin(user):
+        return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
+    token = request.form.get("auth_token") or generate_auth_token(user["id"])
+    code_id = request.form.get("code_id", "").strip()
+    is_active = request.form.get("is_active", "") == "1"
+    try:
+        code = update_registration_code_status(code_id, is_active)
+    except ValueError as exc:
+        return redirect_with_message(admin_redirect_url(token), str(exc))
+    action = "启用" if is_active else "停用"
+    record_admin_log(
+        user,
+        "registration_code_status",
+        None,
+        f"{action} QQ 群注册码 {code['code']}",
+        {"code": code["code"], "is_active": is_active},
+    )
+    return redirect_with_message(admin_redirect_url(token), f"已{action} QQ 群注册码：{code['code']}。")
 
 
 @app.get("/admin/logs")

@@ -62,6 +62,26 @@ create unique index if not exists thesis_audit_users_invite_code_key
 on public.thesis_audit_users(invite_code)
 where invite_code is not null;
 
+create table if not exists public.thesis_audit_registration_codes (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,
+  note text not null default '',
+  max_uses integer not null default 20,
+  used_count integer not null default 0,
+  is_active boolean not null default true,
+  created_by text not null default '',
+  created_at timestamptz not null default now(),
+  constraint thesis_audit_registration_codes_max_uses_positive check (max_uses > 0),
+  constraint thesis_audit_registration_codes_used_count_nonnegative check (used_count >= 0),
+  constraint thesis_audit_registration_codes_used_count_within_limit check (used_count <= max_uses)
+);
+
+create unique index if not exists thesis_audit_registration_codes_code_key
+on public.thesis_audit_registration_codes(code);
+
+create index if not exists thesis_audit_registration_codes_created_at_idx
+on public.thesis_audit_registration_codes(created_at desc);
+
 create table if not exists public.thesis_audit_admin_logs (
   id uuid primary key default gen_random_uuid(),
   actor_user_id uuid references public.thesis_audit_users(id),
@@ -137,6 +157,8 @@ alter table public.thesis_audit_users enable row level security;
 
 alter table public.thesis_audit_admin_logs enable row level security;
 
+alter table public.thesis_audit_registration_codes enable row level security;
+
 alter table public.thesis_audit_reports enable row level security;
 
 do $$
@@ -179,6 +201,23 @@ begin
     select 1
     from pg_policies
     where schemaname = 'public'
+      and tablename = 'thesis_audit_registration_codes'
+      and policyname = 'service role can manage thesis audit registration codes'
+  ) then
+    create policy "service role can manage thesis audit registration codes"
+    on public.thesis_audit_registration_codes
+    for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
       and tablename = 'thesis_audit_reports'
       and policyname = 'service role can manage thesis audit reports'
   ) then
@@ -209,5 +248,41 @@ begin
 
   get diagnostics updated_count = row_count;
   return updated_count = 1;
+end;
+$$;
+
+create or replace function public.consume_thesis_audit_registration_code(
+  target_code text
+)
+returns table (
+  id uuid,
+  code text,
+  note text,
+  max_uses integer,
+  used_count integer,
+  is_active boolean,
+  created_by text,
+  created_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+  update public.thesis_audit_registration_codes c
+  set used_count = c.used_count + 1
+  where c.code = upper(regexp_replace(coalesce(target_code, ''), '[^A-Za-z0-9]', '', 'g'))
+    and c.is_active = true
+    and c.used_count < c.max_uses
+  returning
+    c.id,
+    c.code,
+    c.note,
+    c.max_uses,
+    c.used_count,
+    c.is_active,
+    c.created_by,
+    c.created_at;
 end;
 $$;
