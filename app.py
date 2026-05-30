@@ -319,6 +319,11 @@ def is_valid_email(email: str) -> bool:
     return bool(EMAIL_PATTERN.fullmatch((email or "").strip().lower()))
 
 
+def is_valid_registration_email(email: str) -> bool:
+    normalized = (email or "").strip().lower()
+    return is_valid_email(normalized) and normalized.endswith("@qq.com")
+
+
 def request_trace_payload(prefix: str = "") -> dict:
     return {
         f"{prefix}ip": client_ip(),
@@ -1945,8 +1950,8 @@ PAGE = """
             </form>
             <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
               <h2>注册</h2>
-              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。请确认密码、完成邮箱验证和数字验证。</p>
-              <input name="email" type="email" placeholder="邮箱" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
+              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。新注册仅支持 QQ 邮箱，并需要完成邮箱验证。</p>
+              <input name="email" type="email" placeholder="QQ 邮箱，例如 123456@qq.com" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
               {% if email_verification_enabled %}
                 <div class="verify-row">
                   <input id="register-email-code" name="email_code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="输入邮箱验证码" value="{{ auth_values.get('email_code', '') }}" required>
@@ -1964,7 +1969,7 @@ PAGE = """
                   {% if email_code_sent %}
                     验证码已发送到 {{ email_code_target }}，10 分钟内有效。
                   {% else %}
-                    使用你的邮箱接收 6 位验证码，发送前请先填写邮箱。
+                    使用 QQ 邮箱接收 6 位验证码，发送前请先填写邮箱。
                   {% endif %}
                 </p>
               {% else %}
@@ -4323,10 +4328,13 @@ def register():
     captcha_left = request.form.get("captcha_left", "")
     captcha_right = request.form.get("captcha_right", "")
     auth_values = registration_values(email, password, confirm_password, invite_code, email_code)
-    if not is_valid_email(email):
+    if not is_valid_registration_email(email):
         refresh_captcha()
-        return render_home(auth_error="请输入真实可用的邮箱地址，例如 name@qq.com。", auth_mode="register", auth_values=auth_values), 400
-    if email_verification_enabled() and not is_valid_email_code(email, email_code):
+        return render_home(auth_error="新注册仅支持 QQ 邮箱，请使用类似 123456@qq.com 的邮箱地址。", auth_mode="register", auth_values=auth_values), 400
+    if not email_verification_enabled():
+        refresh_captcha()
+        return render_home(auth_error="邮箱验证码服务尚未配置，暂时无法注册新账号。", auth_mode="register", auth_values=auth_values), 503
+    if not is_valid_email_code(email, email_code):
         refresh_captcha()
         return render_home(auth_error="邮箱验证码不正确，或已经过期，请重新发送后再试。", auth_mode="register", auth_values=auth_values), 400
     if len(password) < 6:
@@ -4384,8 +4392,8 @@ def send_register_email_code():
         return Response(message, status=429, mimetype="text/plain; charset=utf-8")
 
     email = request.form.get("email", "").strip().lower()
-    if not is_valid_email(email):
-        message = "请输入真实可用的邮箱地址后再发送验证码。"
+    if not is_valid_registration_email(email):
+        message = "新注册仅支持 QQ 邮箱，请使用类似 123456@qq.com 的邮箱地址。"
         if wants_json:
             return jsonify({"ok": False, "message": message}), 400
         return Response(message, status=400, mimetype="text/plain; charset=utf-8")
