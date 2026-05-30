@@ -42,9 +42,26 @@ create table if not exists public.thesis_audit_admin_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.thesis_audit_reports (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.thesis_audit_users(id),
+  user_email text not null default '',
+  original_filename text not null,
+  report_filename text not null default '',
+  report_storage_path text not null default '',
+  status text not null default 'success',
+  error_message text not null default '',
+  created_at timestamptz not null default now()
+);
+
+create index if not exists thesis_audit_reports_user_id_created_at_idx
+on public.thesis_audit_reports(user_id, created_at desc);
+
 alter table public.thesis_audit_users enable row level security;
 
 alter table public.thesis_audit_admin_logs enable row level security;
+
+alter table public.thesis_audit_reports enable row level security;
 
 do $$
 begin
@@ -74,6 +91,23 @@ begin
   ) then
     create policy "service role can manage thesis audit admin logs"
     on public.thesis_audit_admin_logs
+    for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'thesis_audit_reports'
+      and policyname = 'service role can manage thesis audit reports'
+  ) then
+    create policy "service role can manage thesis audit reports"
+    on public.thesis_audit_reports
     for all
     using (auth.role() = 'service_role')
     with check (auth.role() = 'service_role');

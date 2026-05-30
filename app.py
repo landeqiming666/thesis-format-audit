@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import multiprocessing
@@ -10,6 +11,7 @@ import re
 import tempfile
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from uuid import uuid4
@@ -54,6 +56,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
 ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
+REPORTS_TABLE = "thesis_audit_reports"
+REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
 ADMIN_SORT_OPTIONS = {
     "created_desc",
     "created_asc",
@@ -364,7 +368,7 @@ def list_users() -> list[dict]:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,submissions_used,submission_quota,account_status,is_admin,created_at")
+        .select("id,email,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
         .order("created_at", desc=True)
         .execute()
     )
@@ -380,6 +384,110 @@ def list_admin_logs() -> list[dict]:
         .execute()
     )
     return result.data or []
+
+
+def list_reports_for_user(user_id: str) -> list[dict]:
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def list_reports_for_admin() -> list[dict]:
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def find_report_by_id(report_id: str) -> dict | None:
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .eq("id", report_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+def create_report_record(
+    *,
+    user: dict,
+    original_filename: str,
+    report_filename: str,
+    status: str,
+    report_storage_path: str = "",
+    error_message: str = "",
+) -> dict:
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .insert(
+            {
+                "user_id": user["id"],
+                "user_email": user.get("email", ""),
+                "original_filename": original_filename,
+                "report_filename": report_filename,
+                "report_storage_path": report_storage_path,
+                "status": status,
+                "error_message": error_message,
+            }
+        )
+        .execute()
+    )
+    return result.data[0]
+
+
+def report_storage_path_for(user: dict, report_filename: str) -> str:
+    safe_email = secure_filename(user.get("email", "")) or user["id"]
+    return f"{user['id']}/{uuid4().hex}_{safe_email}_{secure_filename(report_filename)}"
+
+
+def upload_report_to_storage(storage_path: str, report_bytes: bytes) -> None:
+    file_obj = io.BytesIO(report_bytes)
+    get_supabase().storage.from_(REPORTS_BUCKET).upload(
+        path=storage_path,
+        file=file_obj,
+        file_options={
+            "content-type": "text/html; charset=utf-8",
+            "upsert": "true",
+        },
+    )
+
+
+def download_report_from_storage(storage_path: str) -> bytes:
+    return get_supabase().storage.from_(REPORTS_BUCKET).download(storage_path)
+
+
+def report_status_label(status: str) -> str:
+    return {
+        "success": "已完成",
+        "audit_failed": "检测失败",
+        "storage_failed": "存档失败",
+    }.get(status or "success", "未知")
+
+
+def format_datetime_display(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return raw
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def add_user_quota(user_id: str, amount: int) -> None:
@@ -433,7 +541,27 @@ def enrich_admin_user(user: dict) -> dict:
     item["is_super_admin"] = item.get("email", "").lower() in SUPER_ADMIN_EMAILS
     item["is_admin"] = bool(item.get("is_admin")) or item["is_super_admin"] or item.get("email", "").lower() in LEGACY_ADMIN_EMAILS
     item["remaining"] = remaining_submissions(item)
+    item["invite_count"] = 0
+    item["invited_by_email"] = ""
+    item["invite_link"] = ""
     return item
+
+
+def attach_invite_stats(users: list[dict]) -> list[dict]:
+    email_by_id = {item.get("id"): item.get("email", "") for item in users if item.get("id")}
+    invite_counts: defaultdict[str, int] = defaultdict(int)
+    for item in users:
+        inviter_id = item.get("invited_by")
+        if inviter_id:
+            invite_counts[str(inviter_id)] += 1
+    for item in users:
+        user_id = str(item.get("id", ""))
+        invite_code = normalize_invite_code(item.get("invite_code", ""))
+        item["invite_count"] = invite_counts.get(user_id, 0)
+        item["invited_by_email"] = email_by_id.get(item.get("invited_by"), "") if item.get("invited_by") else ""
+        item["invite_code"] = invite_code
+        item["invite_link"] = url_for("index", invite=invite_code, _external=True) if invite_code else ""
+    return users
 
 
 def parse_positive_int(value: str | None, default: int) -> int:
@@ -466,6 +594,17 @@ def redirect_with_message(destination: str, message: str):
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["message"] = message
     return redirect(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment)))
+
+
+def build_reports_url(auth_token: str, state: dict, endpoint: str, **overrides) -> str:
+    params = {
+        "auth_token": auth_token,
+        "q": state["q"],
+        "status": state["status"],
+        "page": state["page"],
+    }
+    params.update(overrides)
+    return url_for(endpoint, **params)
 
 
 def admin_table_state(auth_token: str) -> dict:
@@ -566,7 +705,44 @@ def summarize_admin_stats(users: list[dict]) -> dict:
         "frozen": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_FROZEN),
         "disabled": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_DISABLED),
         "admins": sum(1 for item in users if item.get("is_admin")),
+        "invited": sum(1 for item in users if item.get("invited_by")),
+        "invite_rewards": sum(int(item.get("invite_count", 0)) for item in users),
     }
+
+
+def enrich_report_item(item: dict) -> dict:
+    enriched = dict(item)
+    enriched["created_at_display"] = format_datetime_display(item.get("created_at", ""))
+    return enriched
+
+
+def report_table_state() -> dict:
+    return {
+        "q": request.args.get("q", "").strip(),
+        "status": (request.args.get("status", "all") or "all").strip().lower(),
+        "page": parse_positive_int(request.args.get("page"), 1),
+    }
+
+
+def apply_report_filters(reports: list[dict], state: dict) -> list[dict]:
+    keyword = state["q"].lower()
+    status = state["status"]
+    filtered: list[dict] = []
+    for item in reports:
+        haystack = " ".join(
+            [
+                item.get("user_email", ""),
+                item.get("original_filename", ""),
+                item.get("report_filename", ""),
+                item.get("created_at", ""),
+            ]
+        ).lower()
+        if keyword and keyword not in haystack:
+            continue
+        if status != "all" and item.get("status") != status:
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def record_admin_log(actor: dict | None, action: str, target: dict | None, summary: str, details: dict | None = None) -> None:
@@ -1012,6 +1188,12 @@ PAGE = """
       white-space: nowrap;
       margin-left: 12px;
     }
+    .top-links-inline {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
     .auth-grid {
       display: grid;
       grid-template-columns: 1fr;
@@ -1337,7 +1519,8 @@ PAGE = """
           <div class="panel-title"><strong>生成报告</strong><span>{{ max_submissions }} 次额度</span></div>
           <div class="account-bar">
             <span>当前账号：<strong>{{ user["email"] }}</strong><br>剩余次数：<strong><span id="remaining-count">{{ remaining }}</span> 次</strong></span>
-            <span>
+            <span class="top-links-inline">
+              <a class="logout-link" href="{{ url_for('my_reports', auth_token=auth_token) }}">我的检测记录</a>
               {% if is_admin %}<a class="logout-link" href="{{ url_for('admin', auth_token=auth_token) }}">管理后台</a>{% endif %}
               <a class="logout-link" href="{{ url_for('logout') }}">退出登录</a>
             </span>
@@ -1912,7 +2095,7 @@ ADMIN_PAGE = """
     }
     .stats {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(7, minmax(0, 1fr));
       gap: 16px;
       margin-bottom: 20px;
     }
@@ -2044,6 +2227,36 @@ ADMIN_PAGE = """
       border: 1px solid var(--line);
       background: var(--surface-strong);
       font-weight: 900;
+    }
+    .invite-cell {
+      display: grid;
+      gap: 8px;
+      min-width: 150px;
+    }
+    .invite-code-mini {
+      display: inline-flex;
+      width: fit-content;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .08em;
+    }
+    .mini-link {
+      width: fit-content;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+    .mini-link:hover {
+      filter: none;
+      transform: none;
+      text-decoration: underline;
     }
     .status-badge {
       display: inline-flex;
@@ -2317,6 +2530,7 @@ ADMIN_PAGE = """
           <span class="muted">管理员：{{ admin_user["email"] }}</span>
         </div>
         <div class="top-links">
+          <a class="top-link" href="{{ url_for('admin_reports', auth_token=auth_token) }}">检测记录</a>
           <a class="top-link" href="{{ url_for('admin_logs', auth_token=auth_token) }}">操作日志</a>
           <a class="top-link" href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
           <a class="top-link" href="{{ url_for('logout') }}">退出登录</a>
@@ -2349,6 +2563,16 @@ ADMIN_PAGE = """
         <span class="stat-label">管理员</span>
         <span class="stat-value">{{ stats["admins"] }}</span>
         <div class="stat-hint">含最高管理员和普通管理员</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">邀请注册</span>
+        <span class="stat-value">{{ stats["invited"] }}</span>
+        <div class="stat-hint">通过邀请码注册的新用户</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">奖励次数</span>
+        <span class="stat-value">{{ stats["invite_rewards"] }}</span>
+        <div class="stat-hint">已发放的邀请奖励次数</div>
       </div>
     </section>
     <section class="panel">
@@ -2395,6 +2619,7 @@ ADMIN_PAGE = """
               <th>状态</th>
               <th>已用 / 总额度</th>
               <th>剩余</th>
+              <th>邀请</th>
               <th>注册时间</th>
               <th>调整次数</th>
               <th>账号操作</th>
@@ -2425,6 +2650,18 @@ ADMIN_PAGE = """
                 </td>
                 <td data-label="已用 / 总额度"><span class="quota" data-quota-text>{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
                 <td data-label="剩余"><strong data-remaining-text>{{ item["remaining"] }}</strong></td>
+                <td data-label="邀请">
+                  <div class="invite-cell">
+                    {% if item["invite_code"] %}
+                      <span class="invite-code-mini">{{ item["invite_code"] }}</span>
+                      <span class="muted">邀请 {{ item["invite_count"] }} 人</span>
+                      {% if item["invited_by_email"] %}<span class="muted">来自：{{ item["invited_by_email"] }}</span>{% endif %}
+                      <button class="mini-link" type="button" data-copy-text="{{ item['invite_link'] }}">复制邀请链接</button>
+                    {% else %}
+                      <span class="muted">暂无邀请码</span>
+                    {% endif %}
+                  </div>
+                </td>
                 <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
                 <td data-label="调整次数">
                   <div class="actions">
@@ -2572,6 +2809,19 @@ ADMIN_PAGE = """
     const userTable = document.getElementById('user-table');
     const adminNotice = document.getElementById('admin-notice');
 
+    const copyText = async text => {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const helper = document.createElement('input');
+      helper.value = text;
+      document.body.appendChild(helper);
+      helper.select();
+      document.execCommand('copy');
+      helper.remove();
+    };
+
     const showAdminNotice = (message, isError = false) => {
       if (!adminNotice) return;
       adminNotice.textContent = message;
@@ -2630,6 +2880,17 @@ ADMIN_PAGE = """
             button.disabled = false;
             button.textContent = originalText;
           }
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-copy-text]').forEach(button => {
+      button.addEventListener('click', async () => {
+        try {
+          await copyText(button.dataset.copyText || '');
+          showAdminNotice('邀请链接已复制。');
+        } catch (_error) {
+          showAdminNotice('复制失败，请手动复制邀请码。', true);
         }
       });
     });
@@ -2861,6 +3122,658 @@ ADMIN_LOG_PAGE = """
 """
 
 
+MY_REPORTS_PAGE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>我的检测记录 - UPC本科论文格式检测工具</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #16202a;
+      --muted: #607181;
+      --paper: #f3efe6;
+      --surface: rgba(255, 255, 255, .88);
+      --surface-strong: #ffffff;
+      --line: #d7d9d2;
+      --accent: #176f58;
+      --accent-soft: #d8ece5;
+      --warn: #9d4131;
+      --warn-soft: #f7e0db;
+      --shadow: rgba(22, 32, 42, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 12%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 28rem),
+        var(--paper);
+      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    main {
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 48px;
+    }
+    .topbar, .summary, .empty-state, .record-item {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 56px);
+      line-height: 1;
+    }
+    .copy {
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.8;
+    }
+    .top-links {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    a {
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .link-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      padding: 18px 22px;
+      margin-bottom: 18px;
+    }
+    .toolbar, .pager {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+      margin-bottom: 18px;
+    }
+    .toolbar {
+      flex-wrap: wrap;
+    }
+    .toolbar form {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) minmax(160px, 220px) auto auto;
+      gap: 12px;
+      width: 100%;
+    }
+    .field, .select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font: 14px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+      outline: 0;
+    }
+    .pager-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pager-link {
+      display: inline-flex;
+      min-width: 40px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+    }
+    .pager-link.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .summary strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 28px;
+      line-height: 1;
+    }
+    .summary span {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .records {
+      display: grid;
+      gap: 14px;
+    }
+    .record-item {
+      padding: 18px 20px;
+    }
+    .record-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .record-title {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.4;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.8;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+    .status-success {
+      border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+      color: var(--accent);
+    }
+    .status-failed,
+    .status-storage {
+      border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: var(--warn);
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    .action-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+    }
+    .error-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: var(--warn);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .empty-state {
+      padding: 42px 24px;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.9;
+    }
+    @media (max-width: 820px) {
+      .topbar, .record-head, .toolbar, .pager {
+        flex-direction: column;
+      }
+      .toolbar form {
+        grid-template-columns: 1fr;
+      }
+      .summary {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="topbar">
+      <div>
+        <h1>我的检测记录</h1>
+        <p class="copy">你可以在这里查看历史检测结果，并重新下载已经生成成功的 HTML 报告。</p>
+      </div>
+      <div class="top-links">
+        <a class="link-chip" href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
+        {% if is_admin %}<a class="link-chip" href="{{ url_for('admin_reports', auth_token=auth_token) }}">后台检测记录</a>{% endif %}
+        <a class="link-chip" href="{{ url_for('logout') }}">退出登录</a>
+      </div>
+    </section>
+    <section class="summary">
+      <div><span>总记录数</span><strong>{{ stats['total'] }}</strong></div>
+      <div><span>成功报告</span><strong>{{ stats['success'] }}</strong></div>
+      <div><span>失败/异常</span><strong>{{ stats['failed'] }}</strong></div>
+    </section>
+    <section class="toolbar">
+      <form method="get" action="{{ url_for('my_reports') }}">
+        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+        <input name="page" type="hidden" value="1">
+        <input class="field" name="q" type="search" value="{{ table_state['q'] }}" placeholder="搜索原文件名、报告名或时间">
+        <select class="select" name="status">
+          <option value="all">全部状态</option>
+          <option value="success" {% if table_state['status'] == 'success' %}selected{% endif %}>仅看成功</option>
+          <option value="audit_failed" {% if table_state['status'] == 'audit_failed' %}selected{% endif %}>仅看检测失败</option>
+          <option value="storage_failed" {% if table_state['status'] == 'storage_failed' %}selected{% endif %}>仅看存档失败</option>
+        </select>
+        <button class="link-chip" type="submit">应用筛选</button>
+        <a class="link-chip" href="{{ url_for('my_reports', auth_token=auth_token) }}">重置</a>
+      </form>
+    </section>
+    {% if reports %}
+      <section class="records">
+        {% for item in reports %}
+          <article class="record-item">
+            <div class="record-head">
+              <div>
+                <h2 class="record-title">{{ item['original_filename'] }}</h2>
+                <div class="meta">生成时间：{{ item['created_at_display'] }}</div>
+                <div class="meta">报告文件：{{ item['report_filename'] or '未生成' }}</div>
+              </div>
+              <span class="status {% if item['status'] == 'success' %}status-success{% elif item['status'] == 'storage_failed' %}status-storage{% else %}status-failed{% endif %}">
+                {{ report_status_labels.get(item['status'], item['status']) }}
+              </span>
+            </div>
+            {% if item['error_message'] %}
+              <div class="error-note">{{ item['error_message'] }}</div>
+            {% endif %}
+            <div class="actions">
+              {% if item['status'] == 'success' and item['report_storage_path'] %}
+                <a class="action-link" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">重新下载报告</a>
+              {% endif %}
+            </div>
+          </article>
+        {% endfor %}
+      </section>
+      <section class="pager">
+        <div class="meta">当前显示第 {{ pagination['start'] }} - {{ pagination['end'] }} 条，共 {{ pagination['total'] }} 条</div>
+        <div class="pager-links">
+          {% if pagination['page'] > 1 %}
+            <a class="pager-link" href="{{ build_reports_url(auth_token, table_state, page=pagination['page'] - 1) }}">上一页</a>
+          {% endif %}
+          {% for page_number in page_numbers %}
+            <a class="pager-link {% if page_number == pagination['page'] %}active{% endif %}" href="{{ build_reports_url(auth_token, table_state, page=page_number) }}">{{ page_number }}</a>
+          {% endfor %}
+          {% if pagination['page'] < pagination['pages'] %}
+            <a class="pager-link" href="{{ build_reports_url(auth_token, table_state, page=pagination['page'] + 1) }}">下一页</a>
+          {% endif %}
+        </div>
+      </section>
+    {% else %}
+      <section class="empty-state">
+        你还没有检测记录。上传一篇论文生成报告后，这里就会自动保存历史记录。
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>
+"""
+
+
+ADMIN_REPORTS_PAGE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>检测记录 - 管理后台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #16202a;
+      --muted: #607181;
+      --paper: #f3efe6;
+      --surface: rgba(255, 255, 255, .88);
+      --surface-strong: #ffffff;
+      --line: #d7d9d2;
+      --accent: #176f58;
+      --accent-soft: #d8ece5;
+      --warn: #9d4131;
+      --warn-soft: #f7e0db;
+      --shadow: rgba(22, 32, 42, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 12%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 28rem),
+        var(--paper);
+      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    main {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 48px;
+    }
+    .topbar, .summary, .panel {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 56px);
+      line-height: 1;
+    }
+    .copy {
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.8;
+    }
+    .top-links {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    a {
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .link-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      padding: 18px 22px;
+      margin-bottom: 18px;
+    }
+    .toolbar, .pager {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+      margin-bottom: 18px;
+    }
+    .toolbar {
+      flex-wrap: wrap;
+    }
+    .toolbar form {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) minmax(180px, 220px) auto auto;
+      gap: 12px;
+      width: 100%;
+    }
+    .field, .select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font: 14px/1.4 "PingFang SC", "Noto Sans SC", sans-serif;
+      outline: 0;
+    }
+    .summary strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 28px;
+      line-height: 1;
+    }
+    .summary span {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .panel {
+      overflow: hidden;
+    }
+    .pager-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pager-link {
+      display: inline-flex;
+      min-width: 40px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+    }
+    .pager-link.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      background: color-mix(in srgb, var(--accent-soft) 28%, transparent);
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.8;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+    .status-success {
+      border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+      color: var(--accent);
+    }
+    .status-failed,
+    .status-storage {
+      border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
+      background: color-mix(in srgb, var(--warn-soft) 72%, transparent);
+      color: var(--warn);
+    }
+    .error-note {
+      color: var(--warn);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .empty-state {
+      padding: 40px 22px;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.9;
+    }
+    @media (max-width: 820px) {
+      .topbar, .toolbar, .pager {
+        flex-direction: column;
+      }
+      .toolbar form {
+        grid-template-columns: 1fr;
+      }
+      .summary {
+        grid-template-columns: 1fr;
+      }
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      tr { border-bottom: 1px solid var(--line); padding: 14px; }
+      td { border: 0; padding: 8px 4px; }
+      td::before {
+        content: attr(data-label);
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 3px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="topbar">
+      <div>
+        <h1>检测记录</h1>
+        <p class="copy">查看所有用户的检测结果、生成状态与重新下载记录入口。</p>
+      </div>
+      <div class="top-links">
+        <a class="link-chip" href="{{ url_for('admin', auth_token=auth_token) }}">返回管理后台</a>
+        <a class="link-chip" href="{{ url_for('admin_logs', auth_token=auth_token) }}">操作日志</a>
+      </div>
+    </section>
+    <section class="summary">
+      <div><span>总记录数</span><strong>{{ stats['total'] }}</strong></div>
+      <div><span>成功报告</span><strong>{{ stats['success'] }}</strong></div>
+      <div><span>检测失败</span><strong>{{ stats['audit_failed'] }}</strong></div>
+      <div><span>存档失败</span><strong>{{ stats['storage_failed'] }}</strong></div>
+    </section>
+    <section class="toolbar">
+      <form method="get" action="{{ url_for('admin_reports') }}">
+        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+        <input name="page" type="hidden" value="1">
+        <input class="field" name="q" type="search" value="{{ table_state['q'] }}" placeholder="搜索用户邮箱、原文件名、报告名或时间">
+        <select class="select" name="status">
+          <option value="all">全部状态</option>
+          <option value="success" {% if table_state['status'] == 'success' %}selected{% endif %}>仅看成功</option>
+          <option value="audit_failed" {% if table_state['status'] == 'audit_failed' %}selected{% endif %}>仅看检测失败</option>
+          <option value="storage_failed" {% if table_state['status'] == 'storage_failed' %}selected{% endif %}>仅看存档失败</option>
+        </select>
+        <button class="link-chip" type="submit">应用筛选</button>
+        <a class="link-chip" href="{{ url_for('admin_reports', auth_token=auth_token) }}">重置</a>
+      </form>
+    </section>
+    <section class="panel">
+      {% if reports %}
+        <table>
+          <thead>
+            <tr>
+              <th>用户</th>
+              <th>原文件名</th>
+              <th>状态</th>
+              <th>生成时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in reports %}
+              <tr>
+                <td data-label="用户">
+                  <div>{{ item['user_email'] }}</div>
+                  <div class="meta">{{ item['user_id'] }}</div>
+                </td>
+                <td data-label="原文件名">
+                  <div>{{ item['original_filename'] }}</div>
+                  <div class="meta">{{ item['report_filename'] or '未生成报告名' }}</div>
+                </td>
+                <td data-label="状态">
+                  <span class="status {% if item['status'] == 'success' %}status-success{% elif item['status'] == 'storage_failed' %}status-storage{% else %}status-failed{% endif %}">
+                    {{ report_status_labels.get(item['status'], item['status']) }}
+                  </span>
+                  {% if item['error_message'] %}
+                    <div class="error-note">{{ item['error_message'] }}</div>
+                  {% endif %}
+                </td>
+                <td data-label="生成时间" class="meta">{{ item['created_at_display'] }}</td>
+                <td data-label="操作">
+                  {% if item['status'] == 'success' and item['report_storage_path'] %}
+                    <a class="link-chip" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">下载报告</a>
+                  {% else %}
+                    <span class="meta">暂无可下载报告</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <section class="pager">
+          <div class="meta">当前显示第 {{ pagination['start'] }} - {{ pagination['end'] }} 条，共 {{ pagination['total'] }} 条</div>
+          <div class="pager-links">
+            {% if pagination['page'] > 1 %}
+              <a class="pager-link" href="{{ build_reports_url(auth_token, table_state, page=pagination['page'] - 1) }}">上一页</a>
+            {% endif %}
+            {% for page_number in page_numbers %}
+              <a class="pager-link {% if page_number == pagination['page'] %}active{% endif %}" href="{{ build_reports_url(auth_token, table_state, page=page_number) }}">{{ page_number }}</a>
+            {% endfor %}
+            {% if pagination['page'] < pagination['pages'] %}
+              <a class="pager-link" href="{{ build_reports_url(auth_token, table_state, page=pagination['page'] + 1) }}">下一页</a>
+            {% endif %}
+          </div>
+        </section>
+      {% else %}
+        <div class="empty-state">还没有任何检测记录。</div>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 @app.get("/")
 def index() -> str:
     return render_home()
@@ -2948,7 +3861,7 @@ def admin():
         return redirect(url_for("index"))
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
     table_state = admin_table_state(token)
-    all_users = [enrich_admin_user(item) for item in list_users()]
+    all_users = attach_invite_stats([enrich_admin_user(item) for item in list_users()])
     stats = summarize_admin_stats(all_users)
     filtered_users = apply_admin_user_filters(all_users, table_state)
     sorted_users = sort_admin_users(filtered_users, table_state["sort"])
@@ -3177,6 +4090,100 @@ def admin_logs():
     )
 
 
+@app.get("/reports")
+def my_reports():
+    user = current_user()
+    if user is None:
+        return redirect(url_for("index"))
+    token = request.values.get("auth_token") or generate_auth_token(user["id"])
+    table_state = report_table_state()
+    reports = [enrich_report_item(item) for item in list_reports_for_user(user["id"])]
+    filtered_reports = apply_report_filters(reports, table_state)
+    page_reports, pagination = paginate_items(filtered_reports, table_state["page"], 10)
+    page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
+    stats = {
+        "total": len(reports),
+        "success": sum(1 for item in reports if item.get("status") == "success"),
+        "failed": sum(1 for item in reports if item.get("status") != "success"),
+    }
+    return render_template_string(
+        MY_REPORTS_PAGE,
+        auth_token=token,
+        user=user,
+        reports=page_reports,
+        stats=stats,
+        is_admin=is_admin(user),
+        table_state={**table_state, "page": pagination["page"]},
+        pagination=pagination,
+        page_numbers=page_numbers,
+        build_reports_url=lambda auth, state, **overrides: build_reports_url(auth, state, "my_reports", **overrides),
+        report_status_labels={
+            "success": report_status_label("success"),
+            "audit_failed": report_status_label("audit_failed"),
+            "storage_failed": report_status_label("storage_failed"),
+        },
+    )
+
+
+@app.get("/admin/reports")
+def admin_reports():
+    user = current_user()
+    if not is_admin(user):
+        return redirect(url_for("index"))
+    token = request.values.get("auth_token") or generate_auth_token(user["id"])
+    table_state = report_table_state()
+    reports = [enrich_report_item(item) for item in list_reports_for_admin()]
+    filtered_reports = apply_report_filters(reports, table_state)
+    page_reports, pagination = paginate_items(filtered_reports, table_state["page"], 20)
+    page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
+    stats = {
+        "total": len(reports),
+        "success": sum(1 for item in reports if item.get("status") == "success"),
+        "audit_failed": sum(1 for item in reports if item.get("status") == "audit_failed"),
+        "storage_failed": sum(1 for item in reports if item.get("status") == "storage_failed"),
+    }
+    return render_template_string(
+        ADMIN_REPORTS_PAGE,
+        auth_token=token,
+        reports=page_reports,
+        stats=stats,
+        table_state={**table_state, "page": pagination["page"]},
+        pagination=pagination,
+        page_numbers=page_numbers,
+        build_reports_url=lambda auth, state, **overrides: build_reports_url(auth, state, "admin_reports", **overrides),
+        report_status_labels={
+            "success": report_status_label("success"),
+            "audit_failed": report_status_label("audit_failed"),
+            "storage_failed": report_status_label("storage_failed"),
+        },
+    )
+
+
+@app.get("/reports/<report_id>/download")
+def download_report(report_id: str):
+    user = current_user()
+    if user is None:
+        return redirect(url_for("index"))
+    report = find_report_by_id(report_id)
+    if report is None:
+        return Response("报告不存在。", status=404, mimetype="text/plain; charset=utf-8")
+    if not is_admin(user) and report.get("user_id") != user.get("id"):
+        return Response("没有权限下载这个报告。", status=403, mimetype="text/plain; charset=utf-8")
+    if report.get("status") != "success" or not report.get("report_storage_path"):
+        return Response("这个报告暂时不可下载。", status=404, mimetype="text/plain; charset=utf-8")
+    try:
+        report_bytes = download_report_from_storage(report["report_storage_path"])
+    except Exception:
+        app.logger.exception("Failed to download stored report %s", report_id)
+        return Response("下载报告失败，请稍后再试。", status=500, mimetype="text/plain; charset=utf-8")
+    return send_file(
+        io.BytesIO(report_bytes),
+        as_attachment=True,
+        download_name=report.get("report_filename") or "thesis_format_audit_report.html",
+        mimetype="text/html",
+    )
+
+
 @app.post("/audit")
 def audit():
     limited = rate_limit("audit")
@@ -3198,6 +4205,7 @@ def audit():
     if names is None:
         return render_home(error="当前只支持 .docx 文件。"), 400
     _safe_name, download_name = names
+    original_filename = upload.filename.strip() or "thesis.docx"
 
     with tempfile.TemporaryDirectory(prefix="thesis-audit-") as tmp:
         tmp_path = Path(tmp)
@@ -3209,13 +4217,48 @@ def audit():
             validate_docx_package(docx_path)
             run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
+            error_message = f"{exc}"
+            try:
+                create_report_record(
+                    user=user,
+                    original_filename=original_filename,
+                    report_filename=download_name,
+                    status="audit_failed",
+                    error_message=error_message,
+                )
+            except Exception:
+                app.logger.warning("Failed to create failed report record for user %s", user["id"], exc_info=True)
             return audit_error_response(exc)
+
+        report_bytes = report_path.read_bytes()
+        storage_path = report_storage_path_for(user, download_name)
+        report_status = "success"
+        report_error_message = ""
+        try:
+          upload_report_to_storage(storage_path, report_bytes)
+        except Exception as exc:
+          storage_path = ""
+          report_status = "storage_failed"
+          report_error_message = f"报告已生成，但存档失败：{exc}"
+          app.logger.warning("Failed to upload report to storage for user %s", user["id"], exc_info=True)
+
+        try:
+            create_report_record(
+                user=user,
+                original_filename=original_filename,
+                report_filename=download_name,
+                status=report_status,
+                report_storage_path=storage_path,
+                error_message=report_error_message,
+            )
+        except Exception:
+            app.logger.warning("Failed to create report record for user %s", user["id"], exc_info=True)
 
         increment_submissions(user["id"])
         fresh_user = find_user_by_id(user["id"])
         remaining = remaining_submissions(fresh_user)
 
-        response = send_file(report_path, as_attachment=True, download_name=download_name, mimetype="text/html")
+        response = send_file(io.BytesIO(report_bytes), as_attachment=True, download_name=download_name, mimetype="text/html")
         response.headers["X-Remaining-Submissions"] = str(remaining)
         return response
 
