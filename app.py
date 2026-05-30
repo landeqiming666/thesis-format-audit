@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -8,15 +9,18 @@ import os
 import queue
 import random
 import re
+import smtplib
+import ssl
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from uuid import uuid4
 
-from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_file, session, url_for
+from flask import Flask, Response, jsonify, has_request_context, redirect, render_template_string, request, send_file, session, url_for
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
@@ -26,6 +30,21 @@ from werkzeug.utils import secure_filename
 from zipfile import BadZipFile, ZipFile
 
 from thesis_format_audit import run_audit
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from google.cloud import storage as gcs_storage
+    from google.oauth2 import service_account
+except ImportError:
+    gcs_storage = None
+    service_account = None
+
+if load_dotenv:
+    load_dotenv()
 
 
 app = Flask(__name__)
@@ -42,12 +61,18 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 MAX_SUBMISSIONS = 2
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
+MAX_TRACKED_USER_AGENT_LENGTH = 320
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
+EMAIL_CODE_LENGTH = 6
+EMAIL_CODE_MAX_AGE = 10 * 60
+EMAIL_CODE_RESEND_SECONDS = 60
 ACCOUNT_STATUS_ACTIVE = "active"
 ACCOUNT_STATUS_FROZEN = "frozen"
 ACCOUNT_STATUS_DISABLED = "disabled"
 RATE_LIMITS = {
     "login": (10, 5 * 60),
     "register": (5, 60 * 60),
+    "email_code": (8, 60 * 60),
     "audit": (8, 60 * 60),
     "admin": (30, 5 * 60),
 }
@@ -58,6 +83,32 @@ SUPABASE_TABLE = "thesis_audit_users"
 ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
 REPORTS_TABLE = "thesis_audit_reports"
 REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
+GMAIL_SMTP_HOST = os.environ.get("GMAIL_SMTP_HOST", "smtp.gmail.com")
+GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT", "465"))
+GMAIL_SMTP_USER = os.environ.get("GMAIL_SMTP_USER", "").strip()
+GMAIL_SMTP_APP_PASSWORD = os.environ.get("GMAIL_SMTP_APP_PASSWORD", "").strip()
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "UPC论文格式检测工具").strip()
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
+GCS_PREFIX = os.environ.get("GCS_PREFIX", "thesis-audit").strip("/")
+GCS_PROJECT = os.environ.get("GCS_PROJECT", "")
+GCS_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+USER_COLUMNS = (
+    "id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,"
+    "invite_code,invited_by,register_ip,register_user_agent,last_login_at,last_login_ip,"
+    "last_login_user_agent,last_audit_at,last_audit_ip,last_audit_user_agent,created_at"
+)
+ADMIN_USER_COLUMNS = (
+    "id,email,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,"
+    "register_ip,register_user_agent,last_login_at,last_login_ip,last_login_user_agent,"
+    "last_audit_at,last_audit_ip,last_audit_user_agent,created_at"
+)
+REPORT_COLUMNS = (
+    "id,user_id,user_email,original_filename,report_filename,report_storage_path,status,"
+    "error_message,client_ip,user_agent,original_storage_backend,original_storage_path,"
+    "original_gcs_path,original_size_bytes,original_sha256,report_storage_backend,report_gcs_path,"
+    "report_size_bytes,report_sha256,created_at"
+)
+_GCS_CLIENT = None
 ADMIN_SORT_OPTIONS = {
     "created_desc",
     "created_asc",
@@ -190,6 +241,91 @@ def client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
+def email_verification_enabled() -> bool:
+    return bool(GMAIL_SMTP_USER and GMAIL_SMTP_APP_PASSWORD)
+
+
+def generate_email_code() -> str:
+    return "".join(str(random.randint(0, 9)) for _ in range(EMAIL_CODE_LENGTH))
+
+
+def store_email_code(email: str, code: str) -> None:
+    session["email_code_target"] = email.lower().strip()
+    session["email_code_value"] = code
+    session["email_code_sent_at"] = int(time.time())
+
+
+def email_code_remaining_seconds() -> int:
+    sent_at = int(session.get("email_code_sent_at", 0) or 0)
+    if sent_at <= 0:
+        return 0
+    elapsed = int(time.time()) - sent_at
+    return max(0, EMAIL_CODE_RESEND_SECONDS - elapsed)
+
+
+def clear_email_code() -> None:
+    session.pop("email_code_target", None)
+    session.pop("email_code_value", None)
+    session.pop("email_code_sent_at", None)
+
+
+def is_valid_email_code(email: str, code: str) -> bool:
+    target = session.get("email_code_target", "")
+    value = session.get("email_code_value", "")
+    sent_at = int(session.get("email_code_sent_at", 0) or 0)
+    if not target or not value or not sent_at:
+        return False
+    if int(time.time()) - sent_at > EMAIL_CODE_MAX_AGE:
+        return False
+    return target == email.lower().strip() and value == (code or "").strip()
+
+
+def send_registration_email_code(email: str, code: str) -> None:
+    if not email_verification_enabled():
+        raise RuntimeError("邮箱验证码服务尚未配置。")
+    message = EmailMessage()
+    message["Subject"] = "你的注册验证码"
+    message["From"] = f"{EMAIL_FROM_NAME} <{GMAIL_SMTP_USER}>"
+    message["To"] = email
+    message.set_content(
+        "\n".join(
+            [
+                f"你好，",
+                "",
+                f"你的注册验证码是：{code}",
+                f"验证码 {EMAIL_CODE_MAX_AGE // 60} 分钟内有效，请勿泄露给他人。",
+                "",
+                "如果这不是你的操作，请忽略这封邮件。",
+            ]
+        )
+    )
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, context=context, timeout=20) as server:
+        server.login(GMAIL_SMTP_USER, GMAIL_SMTP_APP_PASSWORD)
+        server.send_message(message)
+
+
+def request_user_agent() -> str:
+    if not has_request_context():
+        return ""
+    return (request.headers.get("User-Agent", "") or "")[:MAX_TRACKED_USER_AGENT_LENGTH]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(EMAIL_PATTERN.fullmatch((email or "").strip().lower()))
+
+
+def request_trace_payload(prefix: str = "") -> dict:
+    return {
+        f"{prefix}ip": client_ip(),
+        f"{prefix}user_agent": request_user_agent(),
+    }
+
+
 def rate_limit(scope: str) -> Response | None:
     max_requests, window_seconds = RATE_LIMITS[scope]
     now = time.time()
@@ -222,11 +358,32 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
+def gcs_is_configured() -> bool:
+    return bool(GCS_BUCKET and gcs_storage is not None)
+
+
+def get_gcs_client():
+    global _GCS_CLIENT
+    if not gcs_is_configured():
+        raise RuntimeError("Google Cloud Storage is not configured.")
+    if _GCS_CLIENT is not None:
+        return _GCS_CLIENT
+    if GCS_CREDENTIALS_JSON:
+        if service_account is None:
+            raise RuntimeError("google-auth service account support is not available.")
+        info = json.loads(GCS_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(info)
+        _GCS_CLIENT = gcs_storage.Client(project=GCS_PROJECT or info.get("project_id"), credentials=credentials)
+    else:
+        _GCS_CLIENT = gcs_storage.Client(project=GCS_PROJECT or None)
+    return _GCS_CLIENT
+
+
 def find_user_by_id(user_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
+        .select(USER_COLUMNS)
         .eq("id", user_id)
         .maybe_single()
         .execute()
@@ -238,7 +395,7 @@ def find_user_by_email(email: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
+        .select(USER_COLUMNS)
         .eq("email", email)
         .maybe_single()
         .execute()
@@ -261,7 +418,7 @@ def find_user_by_invite_code(code: str) -> dict | None:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
+        .select(USER_COLUMNS)
         .eq("invite_code", invite_code)
         .maybe_single()
         .execute()
@@ -299,6 +456,7 @@ def ensure_user_invite_code(user: dict | None) -> dict | None:
 
 
 def create_user(email: str, password: str, invited_by: str | None = None) -> dict:
+    trace = request_trace_payload()
     payload = {
         "email": email,
         "password_hash": generate_password_hash(password, method="pbkdf2:sha256"),
@@ -306,6 +464,11 @@ def create_user(email: str, password: str, invited_by: str | None = None) -> dic
         "account_status": ACCOUNT_STATUS_ACTIVE,
         "is_admin": email in SUPER_ADMIN_EMAILS,
         "invite_code": create_unique_invite_code(),
+        "register_ip": trace["ip"],
+        "register_user_agent": trace["user_agent"],
+        "last_login_at": utc_now_iso(),
+        "last_login_ip": trace["ip"],
+        "last_login_user_agent": trace["user_agent"],
     }
     if invited_by:
         payload["invited_by"] = invited_by
@@ -316,6 +479,38 @@ def create_user(email: str, password: str, invited_by: str | None = None) -> dic
         .execute()
     )
     return result.data[0]
+
+
+def update_user_login_trace(user_id: str) -> None:
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update(
+            {
+                "last_login_at": utc_now_iso(),
+                "last_login_ip": client_ip(),
+                "last_login_user_agent": request_user_agent(),
+            }
+        )
+        .eq("id", user_id)
+        .execute()
+    )
+
+
+def update_user_audit_trace(user_id: str) -> None:
+    (
+        get_supabase()
+        .table(SUPABASE_TABLE)
+        .update(
+            {
+                "last_audit_at": utc_now_iso(),
+                "last_audit_ip": client_ip(),
+                "last_audit_user_agent": request_user_agent(),
+            }
+        )
+        .eq("id", user_id)
+        .execute()
+    )
 
 
 def increment_submissions(user_id: str) -> None:
@@ -368,7 +563,7 @@ def list_users() -> list[dict]:
     result = (
         get_supabase()
         .table(SUPABASE_TABLE)
-        .select("id,email,submissions_used,submission_quota,account_status,is_admin,invite_code,invited_by,created_at")
+        .select(ADMIN_USER_COLUMNS)
         .order("created_at", desc=True)
         .execute()
     )
@@ -390,7 +585,7 @@ def list_reports_for_user(user_id: str) -> list[dict]:
     result = (
         get_supabase()
         .table(REPORTS_TABLE)
-        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .select(REPORT_COLUMNS)
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
@@ -402,7 +597,7 @@ def list_reports_for_admin() -> list[dict]:
     result = (
         get_supabase()
         .table(REPORTS_TABLE)
-        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .select(REPORT_COLUMNS)
         .order("created_at", desc=True)
         .execute()
     )
@@ -413,7 +608,7 @@ def find_report_by_id(report_id: str) -> dict | None:
     result = (
         get_supabase()
         .table(REPORTS_TABLE)
-        .select("id,user_id,user_email,original_filename,report_filename,report_storage_path,status,error_message,created_at")
+        .select(REPORT_COLUMNS)
         .eq("id", report_id)
         .maybe_single()
         .execute()
@@ -428,6 +623,15 @@ def create_report_record(
     report_filename: str,
     status: str,
     report_storage_path: str = "",
+    original_storage_backend: str = "",
+    original_storage_path: str = "",
+    original_gcs_path: str = "",
+    original_size_bytes: int = 0,
+    original_sha256: str = "",
+    report_storage_backend: str = "",
+    report_gcs_path: str = "",
+    report_size_bytes: int = 0,
+    report_sha256: str = "",
     error_message: str = "",
 ) -> dict:
     result = (
@@ -442,6 +646,17 @@ def create_report_record(
                 "report_storage_path": report_storage_path,
                 "status": status,
                 "error_message": error_message,
+                "client_ip": client_ip(),
+                "user_agent": request_user_agent(),
+                "original_storage_backend": original_storage_backend,
+                "original_storage_path": original_storage_path,
+                "original_gcs_path": original_gcs_path,
+                "original_size_bytes": original_size_bytes,
+                "original_sha256": original_sha256,
+                "report_storage_backend": report_storage_backend,
+                "report_gcs_path": report_gcs_path,
+                "report_size_bytes": report_size_bytes,
+                "report_sha256": report_sha256,
             }
         )
         .execute()
@@ -454,20 +669,90 @@ def report_storage_path_for(user: dict, report_filename: str) -> str:
     return f"{user['id']}/{uuid4().hex}_{safe_email}_{secure_filename(report_filename)}"
 
 
-def upload_report_to_storage(storage_path: str, report_bytes: bytes) -> None:
-    file_obj = io.BytesIO(report_bytes)
+def original_storage_path_for(user: dict, original_filename: str) -> str:
+    safe_email = secure_filename(user.get("email", "")) or user["id"]
+    safe_filename = secure_filename(original_filename) or "thesis.docx"
+    return f"{user['id']}/{uuid4().hex}_{safe_email}_{safe_filename}"
+
+
+def gcs_object_path(kind: str, user: dict, storage_path: str) -> str:
+    parts = [part for part in [GCS_PREFIX, kind, storage_path] if part]
+    return "/".join(parts)
+
+
+def sha256_hex(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def upload_to_supabase_storage(storage_path: str, content: bytes, content_type: str) -> None:
     get_supabase().storage.from_(REPORTS_BUCKET).upload(
         path=storage_path,
-        file=file_obj,
+        file=content,
         file_options={
-            "content-type": "text/html; charset=utf-8",
+            "content-type": content_type,
             "upsert": "true",
         },
     )
 
 
-def download_report_from_storage(storage_path: str) -> bytes:
+def upload_to_gcs_storage(object_path: str, content: bytes, content_type: str) -> None:
+    bucket = get_gcs_client().bucket(GCS_BUCKET)
+    blob = bucket.blob(object_path)
+    blob.upload_from_string(content, content_type=content_type)
+
+
+def upload_report_to_storage(storage_path: str, report_bytes: bytes) -> str:
+    upload_to_supabase_storage(storage_path, report_bytes, "text/html; charset=utf-8")
+    return "supabase"
+
+
+def upload_original_to_storage(storage_path: str, original_bytes: bytes) -> str:
+    upload_to_supabase_storage(
+        storage_path,
+        original_bytes,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    return "supabase"
+
+
+def upload_report_to_gcs(user: dict, storage_path: str, report_bytes: bytes) -> str:
+    object_path = gcs_object_path("reports", user, storage_path)
+    upload_to_gcs_storage(object_path, report_bytes, "text/html; charset=utf-8")
+    return object_path
+
+
+def upload_original_to_gcs(user: dict, storage_path: str, original_bytes: bytes) -> str:
+    object_path = gcs_object_path("originals", user, storage_path)
+    upload_to_gcs_storage(
+        object_path,
+        original_bytes,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    return object_path
+
+
+def download_from_supabase_storage(storage_path: str) -> bytes:
     return get_supabase().storage.from_(REPORTS_BUCKET).download(storage_path)
+
+
+def download_from_gcs_storage(object_path: str) -> bytes:
+    return get_gcs_client().bucket(GCS_BUCKET).blob(object_path).download_as_bytes()
+
+
+def download_report_from_storage(report: dict) -> bytes:
+    if report.get("report_storage_path"):
+        return download_from_supabase_storage(report["report_storage_path"])
+    if report.get("report_gcs_path"):
+        return download_from_gcs_storage(report["report_gcs_path"])
+    raise FileNotFoundError("Report storage path is empty.")
+
+
+def download_original_from_storage(report: dict) -> bytes:
+    if report.get("original_storage_path"):
+        return download_from_supabase_storage(report["original_storage_path"])
+    if report.get("original_gcs_path"):
+        return download_from_gcs_storage(report["original_gcs_path"])
+    raise FileNotFoundError("Original storage path is empty.")
 
 
 def report_status_label(status: str) -> str:
@@ -544,6 +829,9 @@ def enrich_admin_user(user: dict) -> dict:
     item["invite_count"] = 0
     item["invited_by_email"] = ""
     item["invite_link"] = ""
+    item["created_at_display"] = format_datetime_display(item.get("created_at", ""))
+    item["last_login_at_display"] = format_datetime_display(item.get("last_login_at", ""))
+    item["last_audit_at_display"] = format_datetime_display(item.get("last_audit_at", ""))
     return item
 
 
@@ -639,7 +927,19 @@ def apply_admin_user_filters(users: list[dict], state: dict) -> list[dict]:
     quota = state["quota"]
     filtered: list[dict] = []
     for item in users:
-        haystack = f"{item.get('email', '')} {item.get('id', '')} {item.get('created_at', '')}".lower()
+        haystack = " ".join(
+            [
+                item.get("email", ""),
+                item.get("id", ""),
+                item.get("created_at", ""),
+                item.get("register_ip", ""),
+                item.get("last_login_ip", ""),
+                item.get("last_audit_ip", ""),
+                item.get("register_user_agent", ""),
+                item.get("last_login_user_agent", ""),
+                item.get("last_audit_user_agent", ""),
+            ]
+        ).lower()
         if keyword and keyword not in haystack:
             continue
         if status != "all" and item.get("account_status", ACCOUNT_STATUS_ACTIVE) != status:
@@ -713,7 +1013,23 @@ def summarize_admin_stats(users: list[dict]) -> dict:
 def enrich_report_item(item: dict) -> dict:
     enriched = dict(item)
     enriched["created_at_display"] = format_datetime_display(item.get("created_at", ""))
+    enriched["original_size_display"] = format_bytes(int(item.get("original_size_bytes") or 0))
+    enriched["report_size_display"] = format_bytes(int(item.get("report_size_bytes") or 0))
+    enriched["original_sha_short"] = (item.get("original_sha256") or "")[:12]
+    enriched["report_sha_short"] = (item.get("report_sha256") or "")[:12]
     return enriched
+
+
+def format_bytes(size: int) -> str:
+    if size <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
 
 
 def report_table_state() -> dict:
@@ -734,6 +1050,8 @@ def apply_report_filters(reports: list[dict], state: dict) -> list[dict]:
                 item.get("user_email", ""),
                 item.get("original_filename", ""),
                 item.get("report_filename", ""),
+                item.get("client_ip", ""),
+                item.get("user_agent", ""),
                 item.get("created_at", ""),
             ]
         ).lower()
@@ -845,6 +1163,11 @@ def render_home(
         auth_token=request.values.get("auth_token", ""),
         invite_code=invite_code,
         invite_link=invite_link,
+        email_verification_enabled=email_verification_enabled(),
+        email_code_target=session.get("email_code_target", ""),
+        email_code_sent=email_code_remaining_seconds() > 0,
+        email_code_remaining_seconds=email_code_remaining_seconds(),
+        email_code_resend_seconds=EMAIL_CODE_RESEND_SECONDS,
         error=error,
         auth_error=auth_error,
     )
@@ -859,12 +1182,19 @@ def refresh_captcha() -> None:
     session["captcha_answer"] = str(left + right)
 
 
-def registration_values(email: str, password: str, confirm_password: str, invite_code: str = "") -> dict:
+def registration_values(
+    email: str,
+    password: str,
+    confirm_password: str,
+    invite_code: str = "",
+    email_code: str = "",
+) -> dict:
     return {
         "register_email": email,
         "register_password": password,
         "register_confirm_password": confirm_password,
         "invite_code": normalize_invite_code(invite_code),
+        "email_code": (email_code or "").strip(),
     }
 
 
@@ -1250,6 +1580,27 @@ PAGE = """
       gap: 10px;
       align-items: stretch;
     }
+    .verify-row {
+      display: grid;
+      grid-template-columns: 1fr 148px;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .verify-row input {
+      margin-bottom: 0;
+    }
+    .verify-button {
+      width: 100%;
+      margin: 0;
+      padding: 0 12px;
+      font-size: 14px;
+      box-shadow: none;
+    }
+    .verify-note {
+      margin: 8px 0 12px;
+      color: var(--muted);
+      font: 12px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
     .captcha-chip {
       display: grid;
       place-items: center;
@@ -1479,6 +1830,7 @@ PAGE = """
       .panel { padding: 22px; }
       .auth-grid { grid-template-columns: 1fr; }
       .captcha-row { grid-template-columns: 1fr; }
+      .verify-row { grid-template-columns: 1fr; }
       .quota-help { grid-template-columns: 1fr; }
       .quota-actions { align-items: flex-start; }
       .quota-number { width: fit-content; }
@@ -1593,8 +1945,31 @@ PAGE = """
             </form>
             <form class="auth-box {% if auth_mode == 'register' %}active{% endif %}" method="post" action="{{ url_for('register') }}" data-auth-panel="register">
               <h2>注册</h2>
-              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。请确认密码并完成数字验证。</p>
+              <p class="auth-copy">创建账号后可生成 {{ max_submissions }} 次报告。请确认密码、完成邮箱验证和数字验证。</p>
               <input name="email" type="email" placeholder="邮箱" autocomplete="email" value="{{ auth_values.get('register_email', '') }}" required>
+              {% if email_verification_enabled %}
+                <div class="verify-row">
+                  <input id="register-email-code" name="email_code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="输入邮箱验证码" value="{{ auth_values.get('email_code', '') }}" required>
+                  <button
+                    id="send-email-code"
+                    class="verify-button"
+                    type="button"
+                    data-email-target="{{ email_code_target }}"
+                    data-resend-seconds="{{ email_code_remaining_seconds }}"
+                  >
+                    {% if email_code_sent %}{{ email_code_remaining_seconds }} 秒后重发{% else %}发送验证码{% endif %}
+                  </button>
+                </div>
+                <p id="email-code-note" class="verify-note">
+                  {% if email_code_sent %}
+                    验证码已发送到 {{ email_code_target }}，10 分钟内有效。
+                  {% else %}
+                    使用你的邮箱接收 6 位验证码，发送前请先填写邮箱。
+                  {% endif %}
+                </p>
+              {% else %}
+                <p class="verify-note">当前邮箱验证码服务尚未配置，管理员配置 Gmail 后会自动启用。</p>
+              {% endif %}
               <input name="password" type="password" placeholder="至少 6 位密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_password', '') }}" required>
               <input name="confirm_password" type="password" placeholder="再次输入密码" autocomplete="new-password" minlength="6" value="{{ auth_values.get('register_confirm_password', '') }}" required>
               <input name="invite_code" type="text" placeholder="邀请码（可选）" value="{{ auth_values.get('invite_code', invite_code) }}">
@@ -1665,6 +2040,10 @@ PAGE = """
     const form = document.getElementById('audit-form');
     const fileInput = document.getElementById('docx');
     const submitButton = document.getElementById('submit-button');
+    const registerEmailInput = document.querySelector('[data-auth-panel="register"] input[name="email"]');
+    const registerEmailCodeInput = document.getElementById('register-email-code');
+    const sendEmailCodeButton = document.getElementById('send-email-code');
+    const emailCodeNote = document.getElementById('email-code-note');
     const progressWrap = document.getElementById('progress-wrap');
     const progressBar = document.getElementById('progress-bar');
     const progressPercent = document.getElementById('progress-percent');
@@ -1690,6 +2069,29 @@ PAGE = """
       [82, '正在生成 HTML 报告...'],
       [92, '报告快好了，请稍等...']
     ];
+    let resendCountdownTimer = null;
+
+    const startEmailCodeCountdown = seconds => {
+      if (!sendEmailCodeButton) return;
+      window.clearInterval(resendCountdownTimer);
+      let remainingSeconds = Number(seconds || 0);
+      const paint = () => {
+        if (remainingSeconds > 0) {
+          sendEmailCodeButton.disabled = true;
+          sendEmailCodeButton.textContent = `${remainingSeconds} 秒后重发`;
+        } else {
+          sendEmailCodeButton.disabled = false;
+          sendEmailCodeButton.textContent = '发送验证码';
+          window.clearInterval(resendCountdownTimer);
+        }
+      };
+      paint();
+      if (remainingSeconds <= 0) return;
+      resendCountdownTimer = window.setInterval(() => {
+        remainingSeconds -= 1;
+        paint();
+      }, 1000);
+    };
 
     const closeModal = () => {
       if (!infoModal) return;
@@ -1839,6 +2241,57 @@ PAGE = """
         }
       });
     });
+
+    if (sendEmailCodeButton) {
+      startEmailCodeCountdown(Number(sendEmailCodeButton.dataset.resendSeconds || '0'));
+      sendEmailCodeButton.addEventListener('click', async () => {
+        const email = (registerEmailInput?.value || '').trim();
+        if (!email) {
+          showModal({
+            title: '先填写邮箱',
+            body: '请先输入你要注册的邮箱，再发送验证码。'
+          });
+          registerEmailInput?.focus();
+          return;
+        }
+
+        sendEmailCodeButton.disabled = true;
+        sendEmailCodeButton.textContent = '发送中...';
+        try {
+          const payload = new FormData();
+          payload.append('email', email);
+          const response = await fetch('{{ url_for("send_register_email_code") }}', {
+            method: 'POST',
+            body: payload,
+            credentials: 'same-origin',
+            headers: {
+              'Accept': 'application/json',
+              'X-Requested-With': 'fetch'
+            }
+          });
+          const data = await response.json();
+          if (!response.ok || data.ok === false) {
+            throw new Error(data.message || '发送验证码失败，请稍后再试。');
+          }
+          if (emailCodeNote) {
+            emailCodeNote.textContent = `验证码已发送到 ${email}，10 分钟内有效。`;
+          }
+          startEmailCodeCountdown(Number(data.resend_seconds || {{ email_code_resend_seconds }}));
+          showModal({
+            title: '验证码已发送',
+            body: `我们已经把 6 位验证码发送到了 ${email}，请到邮箱中查看。`
+          });
+          registerEmailCodeInput?.focus();
+        } catch (error) {
+          sendEmailCodeButton.disabled = false;
+          sendEmailCodeButton.textContent = '发送验证码';
+          showModal({
+            title: '发送失败',
+            body: error.message || '邮箱验证码发送失败，请稍后再试。'
+          });
+        }
+      });
+    }
 
     if (fileInput && uploadTitle && uploadMeta) fileInput.addEventListener('change', () => {
       const file = fileInput.files[0];
@@ -2233,6 +2686,28 @@ ADMIN_PAGE = """
       gap: 8px;
       min-width: 150px;
     }
+    .trace-cell {
+      display: grid;
+      gap: 7px;
+      min-width: 220px;
+      max-width: 340px;
+    }
+    .trace-line {
+      display: grid;
+      gap: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .trace-line strong {
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .ua {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .invite-code-mini {
       display: inline-flex;
       width: fit-content;
@@ -2620,6 +3095,7 @@ ADMIN_PAGE = """
               <th>已用 / 总额度</th>
               <th>剩余</th>
               <th>邀请</th>
+              <th>来源追踪</th>
               <th>注册时间</th>
               <th>调整次数</th>
               <th>账号操作</th>
@@ -2662,7 +3138,26 @@ ADMIN_PAGE = """
                     {% endif %}
                   </div>
                 </td>
-                <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
+                <td data-label="来源追踪">
+                  <div class="trace-cell">
+                    <div class="trace-line">
+                      <strong>注册 IP：{{ item["register_ip"] or "旧账号未记录" }}</strong>
+                      <span>{{ item["created_at_display"] or item["created_at"] }}</span>
+                      {% if item["register_user_agent"] %}<span class="ua" title="{{ item['register_user_agent'] }}">{{ item["register_user_agent"] }}</span>{% endif %}
+                    </div>
+                    <div class="trace-line">
+                      <strong>最后登录：{{ item["last_login_ip"] or "暂无" }}</strong>
+                      <span>{{ item["last_login_at_display"] or "暂无登录记录" }}</span>
+                      {% if item["last_login_user_agent"] %}<span class="ua" title="{{ item['last_login_user_agent'] }}">{{ item["last_login_user_agent"] }}</span>{% endif %}
+                    </div>
+                    <div class="trace-line">
+                      <strong>最后检测：{{ item["last_audit_ip"] or "暂无" }}</strong>
+                      <span>{{ item["last_audit_at_display"] or "暂无检测记录" }}</span>
+                      {% if item["last_audit_user_agent"] %}<span class="ua" title="{{ item['last_audit_user_agent'] }}">{{ item["last_audit_user_agent"] }}</span>{% endif %}
+                    </div>
+                  </div>
+                </td>
+                <td data-label="注册时间" class="muted">{{ item["created_at_display"] or item["created_at"] }}</td>
                 <td data-label="调整次数">
                   <div class="actions">
                     <div class="action-group">
@@ -3294,6 +3789,12 @@ MY_REPORTS_PAGE = """
       font-size: 13px;
       line-height: 1.8;
     }
+    .ua {
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .status {
       display: inline-flex;
       align-items: center;
@@ -3401,6 +3902,9 @@ MY_REPORTS_PAGE = """
                 <h2 class="record-title">{{ item['original_filename'] }}</h2>
                 <div class="meta">生成时间：{{ item['created_at_display'] }}</div>
                 <div class="meta">报告文件：{{ item['report_filename'] or '未生成' }}</div>
+                {% if item['report_size_display'] %}
+                  <div class="meta">报告大小：{{ item['report_size_display'] }}{% if item['report_sha_short'] %} · SHA256 {{ item['report_sha_short'] }}...{% endif %}</div>
+                {% endif %}
               </div>
               <span class="status {% if item['status'] == 'success' %}status-success{% elif item['status'] == 'storage_failed' %}status-storage{% else %}status-failed{% endif %}">
                 {{ report_status_labels.get(item['status'], item['status']) }}
@@ -3410,7 +3914,7 @@ MY_REPORTS_PAGE = """
               <div class="error-note">{{ item['error_message'] }}</div>
             {% endif %}
             <div class="actions">
-              {% if item['status'] == 'success' and item['report_storage_path'] %}
+              {% if item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path']) %}
                 <a class="action-link" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">重新下载报告</a>
               {% endif %}
             </div>
@@ -3433,7 +3937,7 @@ MY_REPORTS_PAGE = """
       </section>
     {% else %}
       <section class="empty-state">
-        你还没有检测记录。上传一篇论文生成报告后，这里就会自动保存历史记录。
+        你还没有检测记录。上传一篇论文生成报告后，这里会显示历史记录。
       </section>
     {% endif %}
   </main>
@@ -3716,6 +4220,7 @@ ADMIN_REPORTS_PAGE = """
               <th>原文件名</th>
               <th>状态</th>
               <th>生成时间</th>
+              <th>来源</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -3729,6 +4234,17 @@ ADMIN_REPORTS_PAGE = """
                 <td data-label="原文件名">
                   <div>{{ item['original_filename'] }}</div>
                   <div class="meta">{{ item['report_filename'] or '未生成报告名' }}</div>
+                  {% if item['original_size_display'] %}
+                    <div class="meta">原文 {{ item['original_size_display'] }}{% if item['original_sha_short'] %} · SHA256 {{ item['original_sha_short'] }}...{% endif %}</div>
+                  {% endif %}
+                  <div class="meta">
+                    原文：{% if item['original_storage_path'] %}Supabase{% else %}未存 Supabase{% endif %}
+                    {% if item['original_gcs_path'] %} / GCS{% endif %}
+                  </div>
+                  <div class="meta">
+                    报告：{% if item['report_storage_path'] %}Supabase{% else %}未存 Supabase{% endif %}
+                    {% if item['report_gcs_path'] %} / GCS{% endif %}
+                  </div>
                 </td>
                 <td data-label="状态">
                   <span class="status {% if item['status'] == 'success' %}status-success{% elif item['status'] == 'storage_failed' %}status-storage{% else %}status-failed{% endif %}">
@@ -3739,11 +4255,23 @@ ADMIN_REPORTS_PAGE = """
                   {% endif %}
                 </td>
                 <td data-label="生成时间" class="meta">{{ item['created_at_display'] }}</td>
-                <td data-label="操作">
-                  {% if item['status'] == 'success' and item['report_storage_path'] %}
-                    <a class="link-chip" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">下载报告</a>
+                <td data-label="来源" class="meta">
+                  <div>{{ item['client_ip'] or '旧记录未记录 IP' }}</div>
+                  {% if item['user_agent'] %}
+                    <div class="ua" title="{{ item['user_agent'] }}">{{ item['user_agent'] }}</div>
                   {% else %}
-                    <span class="meta">暂无可下载报告</span>
+                    <div>旧记录未记录浏览器</div>
+                  {% endif %}
+                </td>
+                <td data-label="操作">
+                  {% if item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path']) %}
+                    <a class="link-chip" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">下载报告</a>
+                  {% endif %}
+                  {% if item['original_storage_path'] or item['original_gcs_path'] %}
+                    <a class="link-chip" href="{{ url_for('download_original', report_id=item['id'], auth_token=auth_token) }}">下载原文</a>
+                  {% endif %}
+                  {% if not ((item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path'])) or item['original_storage_path'] or item['original_gcs_path']) %}
+                    <span class="meta">暂无可下载文件</span>
                   {% endif %}
                 </td>
               </tr>
@@ -3790,13 +4318,17 @@ def register():
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
     invite_code = normalize_invite_code(request.form.get("invite_code", ""))
+    email_code = request.form.get("email_code", "").strip()
     captcha_answer = request.form.get("captcha_answer", "").strip()
     captcha_left = request.form.get("captcha_left", "")
     captcha_right = request.form.get("captcha_right", "")
-    auth_values = registration_values(email, password, confirm_password, invite_code)
-    if not email or "@" not in email:
+    auth_values = registration_values(email, password, confirm_password, invite_code, email_code)
+    if not is_valid_email(email):
         refresh_captcha()
-        return render_home(auth_error="请输入有效邮箱。", auth_mode="register", auth_values=auth_values), 400
+        return render_home(auth_error="请输入真实可用的邮箱地址，例如 name@qq.com。", auth_mode="register", auth_values=auth_values), 400
+    if email_verification_enabled() and not is_valid_email_code(email, email_code):
+        refresh_captcha()
+        return render_home(auth_error="邮箱验证码不正确，或已经过期，请重新发送后再试。", auth_mode="register", auth_values=auth_values), 400
     if len(password) < 6:
         refresh_captcha()
         return render_home(auth_error="密码至少需要 6 位。", auth_mode="register", auth_values=auth_values), 400
@@ -3825,8 +4357,59 @@ def register():
             award_invite_bonus(inviter["id"])
         except Exception:
             app.logger.warning("Failed to award invite bonus for inviter %s", inviter["id"], exc_info=True)
+    clear_email_code()
     session["user_id"] = user["id"]
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
+
+
+@app.post("/register/email-code")
+def send_register_email_code():
+    wants_json = request.headers.get("X-Requested-With") == "fetch" or "application/json" in request.headers.get("Accept", "")
+    limited = rate_limit("email_code")
+    if limited:
+        message = limited.get_data(as_text=True)
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), limited.status_code
+        return Response(message, status=limited.status_code, mimetype="text/plain; charset=utf-8")
+    if not email_verification_enabled():
+        message = "邮箱验证码服务尚未配置。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), 503
+        return Response(message, status=503, mimetype="text/plain; charset=utf-8")
+    resend_seconds = email_code_remaining_seconds()
+    if resend_seconds > 0:
+        message = f"请在 {resend_seconds} 秒后再重新发送。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), 429
+        return Response(message, status=429, mimetype="text/plain; charset=utf-8")
+
+    email = request.form.get("email", "").strip().lower()
+    if not is_valid_email(email):
+        message = "请输入真实可用的邮箱地址后再发送验证码。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), 400
+        return Response(message, status=400, mimetype="text/plain; charset=utf-8")
+    if find_user_by_email(email) is not None:
+        message = "这个邮箱已经注册，请直接登录。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), 400
+        return Response(message, status=400, mimetype="text/plain; charset=utf-8")
+
+    code = generate_email_code()
+    try:
+        send_registration_email_code(email, code)
+    except Exception:
+        app.logger.exception("Failed to send registration email code to %s", email)
+        message = "验证码发送失败，请稍后再试。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message}), 500
+        return Response(message, status=500, mimetype="text/plain; charset=utf-8")
+
+    store_email_code(email, code)
+    message = "验证码已发送，请到邮箱中查看。"
+    if wants_json:
+        return jsonify({"ok": True, "message": message, "resend_seconds": EMAIL_CODE_RESEND_SECONDS})
+    return Response(message, mimetype="text/plain; charset=utf-8")
 
 
 @app.post("/login")
@@ -3844,6 +4427,10 @@ def login():
         return render_home(auth_error="邮箱或密码不正确。请确认这个邮箱已经注册，并且密码没有输错。", auth_mode="login", auth_values=auth_values), 400
     if not is_account_active(user):
         return render_home(auth_error=account_block_message(user), auth_mode="login", auth_values=auth_values), 403
+    try:
+        update_user_login_trace(user["id"])
+    except Exception:
+        app.logger.warning("Failed to update login trace for user %s", user["id"], exc_info=True)
     session["user_id"] = user["id"]
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
@@ -4169,10 +4756,10 @@ def download_report(report_id: str):
         return Response("报告不存在。", status=404, mimetype="text/plain; charset=utf-8")
     if not is_admin(user) and report.get("user_id") != user.get("id"):
         return Response("没有权限下载这个报告。", status=403, mimetype="text/plain; charset=utf-8")
-    if report.get("status") != "success" or not report.get("report_storage_path"):
+    if report.get("status") != "success" or not (report.get("report_storage_path") or report.get("report_gcs_path")):
         return Response("这个报告暂时不可下载。", status=404, mimetype="text/plain; charset=utf-8")
     try:
-        report_bytes = download_report_from_storage(report["report_storage_path"])
+        report_bytes = download_report_from_storage(report)
     except Exception:
         app.logger.exception("Failed to download stored report %s", report_id)
         return Response("下载报告失败，请稍后再试。", status=500, mimetype="text/plain; charset=utf-8")
@@ -4181,6 +4768,31 @@ def download_report(report_id: str):
         as_attachment=True,
         download_name=report.get("report_filename") or "thesis_format_audit_report.html",
         mimetype="text/html",
+    )
+
+
+@app.get("/reports/<report_id>/original")
+def download_original(report_id: str):
+    user = current_user()
+    if user is None:
+        return redirect(url_for("index"))
+    report = find_report_by_id(report_id)
+    if report is None:
+        return Response("记录不存在。", status=404, mimetype="text/plain; charset=utf-8")
+    if not is_admin(user):
+        return Response("只有管理员可以下载原始论文文件。", status=403, mimetype="text/plain; charset=utf-8")
+    if not (report.get("original_storage_path") or report.get("original_gcs_path")):
+        return Response("这条记录没有保存原始文件。", status=404, mimetype="text/plain; charset=utf-8")
+    try:
+        original_bytes = download_original_from_storage(report)
+    except Exception:
+        app.logger.exception("Failed to download original upload %s", report_id)
+        return Response("下载原始文件失败，请稍后再试。", status=500, mimetype="text/plain; charset=utf-8")
+    return send_file(
+        io.BytesIO(original_bytes),
+        as_attachment=True,
+        download_name=report.get("original_filename") or "thesis.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
 
@@ -4206,6 +4818,10 @@ def audit():
         return render_home(error="当前只支持 .docx 文件。"), 400
     _safe_name, download_name = names
     original_filename = upload.filename.strip() or "thesis.docx"
+    try:
+        update_user_audit_trace(user["id"])
+    except Exception:
+        app.logger.warning("Failed to update audit trace for user %s", user["id"], exc_info=True)
 
     with tempfile.TemporaryDirectory(prefix="thesis-audit-") as tmp:
         tmp_path = Path(tmp)
@@ -4215,6 +4831,23 @@ def audit():
 
         try:
             validate_docx_package(docx_path)
+            original_bytes = docx_path.read_bytes()
+            original_storage_path = original_storage_path_for(user, original_filename)
+            original_archive_path = original_storage_path
+            original_storage_backend = ""
+            original_gcs_path = ""
+            original_size_bytes = len(original_bytes)
+            original_sha256 = sha256_hex(original_bytes)
+            try:
+                original_storage_backend = upload_original_to_storage(original_storage_path, original_bytes)
+            except Exception:
+                original_storage_path = ""
+                app.logger.warning("Failed to upload original docx to Supabase for user %s", user["id"], exc_info=True)
+            if gcs_is_configured():
+                try:
+                    original_gcs_path = upload_original_to_gcs(user, original_archive_path, original_bytes)
+                except Exception:
+                    app.logger.warning("Failed to upload original docx to GCS for user %s", user["id"], exc_info=True)
             run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
             error_message = f"{exc}"
@@ -4224,6 +4857,11 @@ def audit():
                     original_filename=original_filename,
                     report_filename=download_name,
                     status="audit_failed",
+                    original_storage_backend=locals().get("original_storage_backend", ""),
+                    original_storage_path=locals().get("original_storage_path", ""),
+                    original_gcs_path=locals().get("original_gcs_path", ""),
+                    original_size_bytes=locals().get("original_size_bytes", 0),
+                    original_sha256=locals().get("original_sha256", ""),
                     error_message=error_message,
                 )
             except Exception:
@@ -4232,15 +4870,32 @@ def audit():
 
         report_bytes = report_path.read_bytes()
         storage_path = report_storage_path_for(user, download_name)
+        report_archive_path = storage_path
         report_status = "success"
         report_error_message = ""
+        report_storage_backend = ""
+        report_gcs_path = ""
+        report_size_bytes = len(report_bytes)
+        report_sha256 = sha256_hex(report_bytes)
         try:
-          upload_report_to_storage(storage_path, report_bytes)
+            report_storage_backend = upload_report_to_storage(storage_path, report_bytes)
         except Exception as exc:
-          storage_path = ""
-          report_status = "storage_failed"
-          report_error_message = f"报告已生成，但存档失败：{exc}"
-          app.logger.warning("Failed to upload report to storage for user %s", user["id"], exc_info=True)
+            storage_path = ""
+            report_status = "storage_failed"
+            report_error_message = f"报告已生成，但 Supabase 存档失败：{exc}"
+            app.logger.warning("Failed to upload report to Supabase for user %s", user["id"], exc_info=True)
+        if gcs_is_configured():
+            try:
+                report_gcs_path = upload_report_to_gcs(user, report_archive_path, report_bytes)
+                if not storage_path:
+                    report_status = "success"
+                    report_error_message = report_error_message or "Supabase 存档失败，但 GCS 归档成功。"
+            except Exception as exc:
+                app.logger.warning("Failed to upload report to GCS for user %s", user["id"], exc_info=True)
+                if report_error_message:
+                    report_error_message += f"；GCS 归档失败：{exc}"
+                else:
+                    report_error_message = f"GCS 归档失败：{exc}"
 
         try:
             create_report_record(
@@ -4249,6 +4904,15 @@ def audit():
                 report_filename=download_name,
                 status=report_status,
                 report_storage_path=storage_path,
+                original_storage_backend=original_storage_backend,
+                original_storage_path=original_storage_path,
+                original_gcs_path=original_gcs_path,
+                original_size_bytes=original_size_bytes,
+                original_sha256=original_sha256,
+                report_storage_backend=report_storage_backend,
+                report_gcs_path=report_gcs_path,
+                report_size_bytes=report_size_bytes,
+                report_sha256=report_sha256,
                 error_message=report_error_message,
             )
         except Exception:

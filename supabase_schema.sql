@@ -8,6 +8,14 @@ create table if not exists public.thesis_audit_users (
   is_admin boolean not null default false,
   invite_code text,
   invited_by uuid references public.thesis_audit_users(id),
+  register_ip text not null default '',
+  register_user_agent text not null default '',
+  last_login_at timestamptz,
+  last_login_ip text not null default '',
+  last_login_user_agent text not null default '',
+  last_audit_at timestamptz,
+  last_audit_ip text not null default '',
+  last_audit_user_agent text not null default '',
   created_at timestamptz not null default now()
 );
 
@@ -25,6 +33,30 @@ add column if not exists invite_code text;
 
 alter table public.thesis_audit_users
 add column if not exists invited_by uuid references public.thesis_audit_users(id);
+
+alter table public.thesis_audit_users
+add column if not exists register_ip text not null default '';
+
+alter table public.thesis_audit_users
+add column if not exists register_user_agent text not null default '';
+
+alter table public.thesis_audit_users
+add column if not exists last_login_at timestamptz;
+
+alter table public.thesis_audit_users
+add column if not exists last_login_ip text not null default '';
+
+alter table public.thesis_audit_users
+add column if not exists last_login_user_agent text not null default '';
+
+alter table public.thesis_audit_users
+add column if not exists last_audit_at timestamptz;
+
+alter table public.thesis_audit_users
+add column if not exists last_audit_ip text not null default '';
+
+alter table public.thesis_audit_users
+add column if not exists last_audit_user_agent text not null default '';
 
 create unique index if not exists thesis_audit_users_invite_code_key
 on public.thesis_audit_users(invite_code)
@@ -51,8 +83,52 @@ create table if not exists public.thesis_audit_reports (
   report_storage_path text not null default '',
   status text not null default 'success',
   error_message text not null default '',
+  client_ip text not null default '',
+  user_agent text not null default '',
+  original_storage_backend text not null default '',
+  original_storage_path text not null default '',
+  original_gcs_path text not null default '',
+  original_size_bytes bigint not null default 0,
+  original_sha256 text not null default '',
+  report_storage_backend text not null default '',
+  report_gcs_path text not null default '',
+  report_size_bytes bigint not null default 0,
+  report_sha256 text not null default '',
   created_at timestamptz not null default now()
 );
+
+alter table public.thesis_audit_reports
+add column if not exists client_ip text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists user_agent text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_storage_backend text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_storage_path text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_gcs_path text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_size_bytes bigint not null default 0;
+
+alter table public.thesis_audit_reports
+add column if not exists original_sha256 text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists report_storage_backend text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists report_gcs_path text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists report_size_bytes bigint not null default 0;
+
+alter table public.thesis_audit_reports
+add column if not exists report_sha256 text not null default '';
 
 create index if not exists thesis_audit_reports_user_id_created_at_idx
 on public.thesis_audit_reports(user_id, created_at desc);

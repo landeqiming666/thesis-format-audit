@@ -17,9 +17,21 @@ SUPABASE_URL=你的 Supabase URL
 SUPABASE_SERVICE_ROLE_KEY=你的 service role key
 SECRET_KEY=随便生成一串很长的随机字符串
 SUPER_ADMIN_EMAILS=2818242447@qq.com
+REPORTS_BUCKET=thesis-audit-reports
 ```
 
 `SUPER_ADMIN_EMAILS` 是最高管理员邮箱，用英文逗号分隔；普通管理员可以在后台页面里设置。
+
+如果要同时归档到 Google Cloud Storage，再增加：
+
+```text
+GCS_BUCKET=你的 Google Cloud Storage bucket 名
+GCS_PREFIX=thesis-audit
+GCS_PROJECT=你的 Google Cloud project id
+GOOGLE_APPLICATION_CREDENTIALS_JSON=服务账号 JSON 内容
+```
+
+不配置 GCS 时，系统会只使用 Supabase；配置后会启用 Google Cloud Storage 作为第二存储后端。
 
 ## 2. 启动服务
 

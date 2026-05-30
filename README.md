@@ -34,18 +34,56 @@ http://127.0.0.1:8000
 
 ## Supabase 配置
 
-注册和 3 次提交限制使用 Supabase 保存。
+注册、提交次数和后台检测记录使用 Supabase。
 
 1. 在 Supabase SQL Editor 执行 `supabase_schema.sql`。
-2. 在部署平台设置环境变量：
+2. 确认 Supabase Storage 里存在私有 bucket：`thesis-audit-reports`。
+3. 在部署平台设置环境变量：
 
 ```text
 SUPABASE_URL=你的 Supabase Project URL
 SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
 SECRET_KEY=任意一段随机长字符串
+REPORTS_BUCKET=thesis-audit-reports
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` 只能放在服务端环境变量里，不要写进前端页面或公开仓库。
+
+## Gmail 注册验证码
+
+注册邮箱验证码使用 Gmail SMTP。请使用 Google App Password，不要使用谷歌账号登录密码。
+
+1. 打开 Google 账号安全设置。
+2. 开启两步验证。
+3. 在 App Passwords 里生成一个应用专用密码。
+4. 在 `.env` 或部署平台环境变量里配置：
+
+```text
+GMAIL_SMTP_USER=你的 Gmail 邮箱
+GMAIL_SMTP_APP_PASSWORD=Google App Password
+GMAIL_SMTP_HOST=smtp.gmail.com
+GMAIL_SMTP_PORT=465
+EMAIL_FROM_NAME=UPC论文格式检测工具
+```
+
+本地可以先运行测试脚本确认发信正常：
+
+```bash
+python check_email_smtp.py 收件邮箱@example.com
+```
+
+## Google Cloud Storage 可选归档
+
+如果要启用 Google Cloud Storage 作为第二存储后端，配置这些环境变量即可。没有配置时系统会继续只用 Supabase，不影响正常检测。
+
+```text
+GCS_BUCKET=你的 Google Cloud Storage bucket 名
+GCS_PREFIX=thesis-audit
+GCS_PROJECT=你的 Google Cloud project id
+GOOGLE_APPLICATION_CREDENTIALS_JSON=服务账号 JSON 内容
+```
+
+建议给服务账号最小权限，只授予目标 bucket 的对象读写权限。`GOOGLE_APPLICATION_CREDENTIALS_JSON` 是密钥，不能提交到 GitHub 或 Hugging Face 仓库。
 
 ## Hugging Face Spaces 部署
 
