@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import multiprocessing
 import os
+import queue
 import random
 import tempfile
 import time
@@ -12,17 +15,25 @@ from flask import Flask, Response, redirect, render_template_string, request, se
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+from zipfile import BadZipFile, ZipFile
 
 from thesis_format_audit import run_audit
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "32"))
+MAX_DOCX_ENTRIES = int(os.environ.get("MAX_DOCX_ENTRIES", "1500"))
+MAX_DOCX_UNCOMPRESSED_MB = int(os.environ.get("MAX_DOCX_UNCOMPRESSED_MB", "180"))
+AUDIT_TIMEOUT_SECONDS = int(os.environ.get("AUDIT_TIMEOUT_SECONDS", "105"))
+
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 MAX_SUBMISSIONS = 3
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
@@ -57,6 +68,71 @@ def uploaded_docx_names(filename: str) -> tuple[str, str] | None:
     display_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
     display_stem = display_name[:-5].strip() or Path(safe_name).stem or "thesis"
     return safe_name, f"{display_stem}_format_audit_report.html"
+
+
+def validate_docx_package(path: Path) -> None:
+    if path.stat().st_size <= 0:
+        raise ValueError("上传的文件是空文件，请重新选择 .docx。")
+
+    try:
+        with ZipFile(path) as package:
+            infos = package.infolist()
+            names = {info.filename for info in infos}
+            if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                raise ValueError("这个 .docx 缺少 Word 正文结构，请在 Word/WPS 中另存为 .docx 后再上传。")
+            if len(infos) > MAX_DOCX_ENTRIES:
+                raise ValueError("这个 .docx 内部文件过多，暂时无法安全检测。请压缩图片或另存为 .docx 后再试。")
+            uncompressed = sum(info.file_size for info in infos)
+            if uncompressed > MAX_DOCX_UNCOMPRESSED_MB * 1024 * 1024:
+                raise ValueError(f"这个 .docx 解压后超过 {MAX_DOCX_UNCOMPRESSED_MB}MB，建议先压缩图片后再上传。")
+    except BadZipFile as exc:
+        raise ValueError("这个文件扩展名是 .docx，但内部不是有效的 Word 文档包。请重新另存为 .docx 后上传。") from exc
+
+
+def audit_worker(docx_path: str, report_path: str, result_queue) -> None:
+    try:
+        run_audit(Path(docx_path), Path(report_path))
+        result_queue.put(("ok", ""))
+    except Exception as exc:
+        result_queue.put((exc.__class__.__name__, str(exc)))
+
+
+def run_audit_with_timeout(docx_path: Path, report_path: Path) -> None:
+    start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    ctx = multiprocessing.get_context(start_method)
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=audit_worker, args=(str(docx_path), str(report_path), result_queue))
+    process.start()
+    process.join(AUDIT_TIMEOUT_SECONDS)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        raise TimeoutError("检测时间过长，已自动停止。请先压缩图片、删除无关附件，或把论文拆小后再试。")
+
+    try:
+        status, message = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise RuntimeError(f"检测进程异常退出，退出码 {process.exitcode}。") from exc
+
+    if status == "ok":
+        return
+    if status == "ValueError":
+        raise ValueError(message)
+    raise RuntimeError(message or "未知检测错误")
+
+
+def audit_error_response(exc: Exception) -> Response:
+    if isinstance(exc, (ValueError, TimeoutError)):
+        message = f"检测失败：{exc}"
+    else:
+        error_id = uuid4().hex[:8]
+        app.logger.exception("Audit failed [%s]", error_id)
+        message = f"检测失败：服务器处理这个文件时遇到异常（错误编号 {error_id}）。请稍后重试，或在 Word/WPS 中另存为 .docx 后再上传。"
+    return Response(message, status=500, mimetype="text/plain; charset=utf-8")
 
 
 def auth_serializer() -> URLSafeTimedSerializer:
@@ -104,6 +180,11 @@ def add_security_headers(response: Response) -> Response:
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     return response
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_upload(_exc):
+    return Response(f"文件太大了，当前最多支持 {MAX_UPLOAD_MB}MB。请先压缩图片或另存为较小的 .docx。", status=413, mimetype="text/plain; charset=utf-8")
 
 
 def get_supabase() -> Client:
@@ -704,6 +785,22 @@ PAGE = """
       font: 900 22px/1 "PingFang SC", "Noto Sans SC", sans-serif;
       letter-spacing: .04em;
     }
+    .group-invite {
+      margin-top: 18px;
+      padding: 15px 16px;
+      border: 1px solid color-mix(in srgb, var(--accent) 44%, var(--line));
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 54%, transparent), transparent 70%),
+        var(--surface-strong);
+      color: var(--accent-strong);
+      font: 700 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .group-invite strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+      font-size: 15px;
+    }
     .facts {
       display: flex;
       flex-wrap: wrap;
@@ -776,7 +873,7 @@ PAGE = """
             {% if remaining > 0 %}
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
               <div class="quota-help">
-                <p><span class="quota-label">增加检测次数</span>加入官方 QQ 群，联系管理员增加账号额度。</p>
+                <p><span class="quota-label">增加检测次数</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加账号额度。</p>
                 <strong class="quota-number">537124215</strong>
               </div>
               <label for="docx">选择论文文件</label>
@@ -803,7 +900,7 @@ PAGE = """
             {% else %}
               <p class="error">这个账号的检测额度已经用完。</p>
               <div class="quota-help">
-                <p><span class="quota-label">额度已用完</span>加入官方 QQ 群，联系管理员增加检测次数。</p>
+                <p><span class="quota-label">额度已用完</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加检测次数。</p>
                 <strong class="quota-number">537124215</strong>
               </div>
             {% endif %}
@@ -841,6 +938,10 @@ PAGE = """
           <div class="auth-rules">
             <div class="auth-rule"><span>1</span><p>每个账号最多生成 {{ max_submissions }} 次报告，次数保存在数据库中。</p></div>
             <div class="auth-rule"><span>2</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
+          </div>
+          <div class="group-invite">
+            <strong>加入 QQ 群可领取检测机会</strong>
+            QQ 群号：537124215。进群后可联系管理员领取额外检测机会。
           </div>
         {% endif %}
       </div>
@@ -1329,9 +1430,10 @@ def audit():
         upload.save(docx_path)
 
         try:
-            run_audit(docx_path, report_path)
+            validate_docx_package(docx_path)
+            run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
-            return Response(f"检测失败：{exc}", status=500, mimetype="text/plain; charset=utf-8")
+            return audit_error_response(exc)
 
         increment_submissions(user["id"])
         fresh_user = find_user_by_id(user["id"])

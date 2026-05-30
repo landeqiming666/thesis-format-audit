@@ -1,0 +1,11 @@
+.git
+.venv
+.env
+.env.*
+__pycache__
+*.pyc
+*.log
+*.docx
+*_format_audit_report.html
+.DS_Store
+/tmp
