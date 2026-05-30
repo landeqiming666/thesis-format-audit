@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing
 import os
@@ -10,6 +11,7 @@ import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from uuid import uuid4
 
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_file, session, url_for
@@ -51,6 +53,20 @@ RATE_BUCKETS: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = "thesis_audit_users"
+ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
+ADMIN_SORT_OPTIONS = {
+    "created_desc",
+    "created_asc",
+    "remaining_desc",
+    "remaining_asc",
+    "quota_desc",
+    "quota_asc",
+    "used_desc",
+    "used_asc",
+    "email_asc",
+    "email_desc",
+}
+ADMIN_PER_PAGE_OPTIONS = {10, 20, 50, 100}
 SUPER_ADMIN_EMAILS = {
     email.strip().lower()
     for email in os.environ.get("SUPER_ADMIN_EMAILS", "2818242447@qq.com").split(",")
@@ -355,6 +371,17 @@ def list_users() -> list[dict]:
     return result.data or []
 
 
+def list_admin_logs() -> list[dict]:
+    result = (
+        get_supabase()
+        .table(ADMIN_LOG_TABLE)
+        .select("id,actor_user_id,actor_email,action,target_user_id,target_email,summary,details,created_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
 def add_user_quota(user_id: str, amount: int) -> None:
     user = find_user_by_id(user_id)
     if user is None:
@@ -399,6 +426,169 @@ def admin_user_quota_payload(user: dict) -> dict:
         "submission_quota": user_quota(user),
         "remaining": remaining_submissions(user),
     }
+
+
+def enrich_admin_user(user: dict) -> dict:
+    item = dict(user)
+    item["is_super_admin"] = item.get("email", "").lower() in SUPER_ADMIN_EMAILS
+    item["is_admin"] = bool(item.get("is_admin")) or item["is_super_admin"] or item.get("email", "").lower() in LEGACY_ADMIN_EMAILS
+    item["remaining"] = remaining_submissions(item)
+    return item
+
+
+def parse_positive_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int(value or "")
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def admin_per_page(value: str | None) -> int:
+    parsed = parse_positive_int(value, 20)
+    return parsed if parsed in ADMIN_PER_PAGE_OPTIONS else 20
+
+
+def admin_sort_value(value: str | None) -> str:
+    candidate = (value or "created_desc").strip().lower()
+    return candidate if candidate in ADMIN_SORT_OPTIONS else "created_desc"
+
+
+def admin_redirect_url(token: str, fallback_endpoint: str = "admin") -> str:
+    candidate = (request.form.get("next") or request.values.get("next") or "").strip()
+    if candidate.startswith("/admin"):
+        return candidate
+    return url_for(fallback_endpoint, auth_token=token)
+
+
+def redirect_with_message(destination: str, message: str):
+    parts = urlsplit(destination)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["message"] = message
+    return redirect(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment)))
+
+
+def admin_table_state(auth_token: str) -> dict:
+    return {
+        "auth_token": auth_token,
+        "q": request.args.get("q", "").strip(),
+        "status": (request.args.get("status", "all") or "all").strip().lower(),
+        "quota": (request.args.get("quota", "all") or "all").strip().lower(),
+        "sort": admin_sort_value(request.args.get("sort")),
+        "per_page": admin_per_page(request.args.get("per_page")),
+        "page": parse_positive_int(request.args.get("page"), 1),
+    }
+
+
+def build_admin_url(auth_token: str, state: dict, **overrides) -> str:
+    params = {
+        "auth_token": auth_token,
+        "q": state["q"],
+        "status": state["status"],
+        "quota": state["quota"],
+        "sort": state["sort"],
+        "per_page": state["per_page"],
+        "page": state["page"],
+    }
+    params.update(overrides)
+    return url_for("admin", **params)
+
+
+def apply_admin_user_filters(users: list[dict], state: dict) -> list[dict]:
+    keyword = state["q"].lower()
+    status = state["status"]
+    quota = state["quota"]
+    filtered: list[dict] = []
+    for item in users:
+        haystack = f"{item.get('email', '')} {item.get('id', '')} {item.get('created_at', '')}".lower()
+        if keyword and keyword not in haystack:
+            continue
+        if status != "all" and item.get("account_status", ACCOUNT_STATUS_ACTIVE) != status:
+            continue
+        remaining = int(item.get("remaining", 0))
+        if quota == "remaining" and remaining <= 0:
+            continue
+        if quota == "empty" and remaining > 0:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def sort_admin_users(users: list[dict], sort_key: str) -> list[dict]:
+    if sort_key == "created_asc":
+        return sorted(users, key=lambda item: item.get("created_at", ""))
+    if sort_key == "remaining_desc":
+        return sorted(users, key=lambda item: (-int(item.get("remaining", 0)), item.get("email", "").lower()))
+    if sort_key == "remaining_asc":
+        return sorted(users, key=lambda item: (int(item.get("remaining", 0)), item.get("email", "").lower()))
+    if sort_key == "quota_desc":
+        return sorted(users, key=lambda item: (-int(item.get("submission_quota", 0)), item.get("email", "").lower()))
+    if sort_key == "quota_asc":
+        return sorted(users, key=lambda item: (int(item.get("submission_quota", 0)), item.get("email", "").lower()))
+    if sort_key == "used_desc":
+        return sorted(users, key=lambda item: (-int(item.get("submissions_used", 0)), item.get("email", "").lower()))
+    if sort_key == "used_asc":
+        return sorted(users, key=lambda item: (int(item.get("submissions_used", 0)), item.get("email", "").lower()))
+    if sort_key == "email_asc":
+        return sorted(users, key=lambda item: item.get("email", "").lower())
+    if sort_key == "email_desc":
+        return sorted(users, key=lambda item: item.get("email", "").lower(), reverse=True)
+    return sorted(users, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def paginate_items(items: list[dict], page: int, per_page: int) -> tuple[list[dict], dict]:
+    total = len(items)
+    total_pages = max(1, (total + per_page - 1) // per_page) if total else 1
+    current_page = min(max(page, 1), total_pages)
+    start_index = (current_page - 1) * per_page
+    end_index = start_index + per_page
+    page_items = items[start_index:end_index]
+    return page_items, {
+        "total": total,
+        "page": current_page,
+        "per_page": per_page,
+        "pages": total_pages,
+        "start": start_index + 1 if total else 0,
+        "end": min(end_index, total),
+    }
+
+
+def build_page_numbers(current_page: int, total_pages: int, radius: int = 2) -> list[int]:
+    start = max(1, current_page - radius)
+    end = min(total_pages, current_page + radius)
+    return list(range(start, end + 1))
+
+
+def summarize_admin_stats(users: list[dict]) -> dict:
+    return {
+        "total": len(users),
+        "active": sum(1 for item in users if item.get("account_status", ACCOUNT_STATUS_ACTIVE) == ACCOUNT_STATUS_ACTIVE),
+        "frozen": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_FROZEN),
+        "disabled": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_DISABLED),
+        "admins": sum(1 for item in users if item.get("is_admin")),
+    }
+
+
+def record_admin_log(actor: dict | None, action: str, target: dict | None, summary: str, details: dict | None = None) -> None:
+    try:
+        (
+            get_supabase()
+            .table(ADMIN_LOG_TABLE)
+            .insert(
+                {
+                    "actor_user_id": actor.get("id") if actor else None,
+                    "actor_email": actor.get("email", "") if actor else "",
+                    "action": action,
+                    "target_user_id": target.get("id") if target else None,
+                    "target_email": target.get("email", "") if target else "",
+                    "summary": summary,
+                    "details": details or {},
+                }
+            )
+            .execute()
+        )
+    except Exception:
+        app.logger.warning("Failed to record admin log for action %s", action, exc_info=True)
 
 
 def update_user_status(user_id: str, status: str) -> None:
@@ -1350,6 +1540,68 @@ PAGE = """
       infoModal.setAttribute('aria-hidden', 'false');
     };
 
+    const copyText = async text => {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const helper = document.createElement('input');
+      helper.value = text;
+      document.body.appendChild(helper);
+      helper.select();
+      document.execCommand('copy');
+      helper.remove();
+    };
+
+    const showQuotaExhaustedModal = source => {
+      const body = source === 'download'
+        ? `本次报告已经下载成功，你的检测额度也已经用完。加入官方 QQ 群 ${GROUP_NUMBER} 可领取新的检测机会。`
+        : `你的检测额度已经用完。加入官方 QQ 群 ${GROUP_NUMBER} 可领取新的检测机会。`;
+      showModal({
+        title: '检测额度已用完',
+        body,
+        primaryText: '复制群号',
+        secondaryText: '稍后再说',
+        onPrimary: async () => {
+          try {
+            await copyText(GROUP_NUMBER);
+            showModal({
+              title: '群号已复制',
+              body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
+            });
+          } catch (_error) {
+            showModal({
+              title: '复制失败',
+              body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
+            });
+          }
+        }
+      });
+    };
+
+    const showPostAuditReminderModal = () => {
+      showModal({
+        title: '下载成功',
+        body: `检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。也欢迎加入官方 QQ 群 ${GROUP_NUMBER}，领取检测机会或咨询使用问题。`,
+        primaryText: '复制群号',
+        secondaryText: '我知道了',
+        onPrimary: async () => {
+          try {
+            await copyText(GROUP_NUMBER);
+            showModal({
+              title: '群号已复制',
+              body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
+            });
+          } catch (_error) {
+            showModal({
+              title: '复制失败',
+              body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
+            });
+          }
+        }
+      });
+    };
+
     if (modalPrimary) modalPrimary.addEventListener('click', () => {
       if (modalPrimaryHandler) modalPrimaryHandler();
       closeModal();
@@ -1370,16 +1622,7 @@ PAGE = """
 
     const copyGroupNumber = async () => {
       try {
-        if (navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(GROUP_NUMBER);
-        } else {
-          const helper = document.createElement('input');
-          helper.value = GROUP_NUMBER;
-          document.body.appendChild(helper);
-          helper.select();
-          document.execCommand('copy');
-          helper.remove();
-        }
+        await copyText(GROUP_NUMBER);
         showModal({
           title: '群号已复制',
           body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
@@ -1400,16 +1643,7 @@ PAGE = """
       button.addEventListener('click', async () => {
         const inviteLink = button.dataset.copyInvite || '';
         try {
-          if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(inviteLink);
-          } else {
-            const helper = document.createElement('input');
-            helper.value = inviteLink;
-            document.body.appendChild(helper);
-            helper.select();
-            document.execCommand('copy');
-            helper.remove();
-          }
+          await copyText(inviteLink);
           showModal({
             title: '邀请链接已复制',
             body: '好友通过你的链接注册成功后，你会自动增加 1 次检测额度。'
@@ -1452,6 +1686,10 @@ PAGE = """
         fileInput.files = transfer.files;
         fileInput.dispatchEvent(new Event('change', { bubbles: true }));
       });
+    }
+
+    if (remainingCount && Number(remainingCount.textContent) <= 0) {
+      window.setTimeout(() => showQuotaExhaustedModal('page'), 220);
     }
 
     if (form && fileInput && submitButton && progressWrap) form.addEventListener('submit', async event => {
@@ -1535,10 +1773,11 @@ PAGE = """
         URL.revokeObjectURL(downloadUrl);
         updateRemainingCount(response);
         finishDownloadState();
-        showModal({
-          title: '下载成功',
-          body: '检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。'
-        });
+        if (remainingCount && Number(remainingCount.textContent) <= 0) {
+          showQuotaExhaustedModal('download');
+        } else {
+          showPostAuditReminderModal();
+        }
       } catch (error) {
         finished = true;
         window.clearInterval(progressTimer);
@@ -1725,7 +1964,7 @@ ADMIN_PAGE = """
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(160px, .42fr));
+      grid-template-columns: minmax(0, 1.4fr) repeat(4, minmax(140px, .38fr)) auto;
       gap: 12px;
       padding: 18px;
       border-bottom: 1px solid var(--line);
@@ -1758,6 +1997,11 @@ ADMIN_PAGE = """
       border-bottom: 1px solid var(--line);
       color: var(--muted);
       font-size: 13px;
+    }
+    .toolbar-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
     }
     .table-wrap {
       overflow-x: auto;
@@ -1912,6 +2156,86 @@ ADMIN_PAGE = """
       width: 88px;
       padding: 9px 10px;
     }
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, .36);
+    }
+    .pager-info {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pager-links {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pager-link {
+      display: inline-flex;
+      min-width: 40px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .pager-link.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .log-preview {
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .section-head h2 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+    .log-list {
+      display: grid;
+      gap: 0;
+    }
+    .log-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) auto;
+      gap: 16px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .log-item:last-child {
+      border-bottom: 0;
+    }
+    .log-item strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+    .log-meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
     .empty-state {
       padding: 42px 18px;
       color: var(--muted);
@@ -1924,7 +2248,7 @@ ADMIN_PAGE = """
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .toolbar {
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr;
       }
     }
     @media (max-width: 820px) {
@@ -1949,6 +2273,14 @@ ADMIN_PAGE = """
       .summary-bar {
         align-items: flex-start;
         flex-direction: column;
+      }
+      .toolbar-actions,
+      .pager,
+      .section-head,
+      .log-item {
+        align-items: flex-start;
+        flex-direction: column;
+        grid-template-columns: 1fr;
       }
       table, thead, tbody, tr, th, td { display: block; }
       thead { display: none; }
@@ -1985,6 +2317,7 @@ ADMIN_PAGE = """
           <span class="muted">管理员：{{ admin_user["email"] }}</span>
         </div>
         <div class="top-links">
+          <a class="top-link" href="{{ url_for('admin_logs', auth_token=auth_token) }}">操作日志</a>
           <a class="top-link" href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
           <a class="top-link" href="{{ url_for('logout') }}">退出登录</a>
         </div>
@@ -2019,24 +2352,39 @@ ADMIN_PAGE = """
       </div>
     </section>
     <section class="panel">
-      <div class="toolbar">
-        <input id="search-input" class="field" type="search" placeholder="搜索邮箱、用户 ID 或注册时间">
-        <select id="status-filter" class="select">
+      <form class="toolbar" method="get" action="{{ url_for('admin') }}">
+        <input name="auth_token" type="hidden" value="{{ auth_token }}">
+        <input name="page" type="hidden" value="1">
+        <input name="q" class="field" type="search" placeholder="搜索邮箱、用户 ID 或注册时间" value="{{ table_state['q'] }}">
+        <select name="status" class="select">
           <option value="all">全部状态</option>
-          <option value="active">仅看正常</option>
-          <option value="frozen">仅看冻结</option>
-          <option value="disabled">仅看已注销</option>
+          <option value="active" {% if table_state['status'] == 'active' %}selected{% endif %}>仅看正常</option>
+          <option value="frozen" {% if table_state['status'] == 'frozen' %}selected{% endif %}>仅看冻结</option>
+          <option value="disabled" {% if table_state['status'] == 'disabled' %}selected{% endif %}>仅看已注销</option>
         </select>
-        <select id="quota-filter" class="select">
+        <select name="quota" class="select">
           <option value="all">全部额度情况</option>
-          <option value="remaining">仅看仍有次数</option>
-          <option value="empty">仅看额度用完</option>
+          <option value="remaining" {% if table_state['quota'] == 'remaining' %}selected{% endif %}>仅看仍有次数</option>
+          <option value="empty" {% if table_state['quota'] == 'empty' %}selected{% endif %}>仅看额度用完</option>
         </select>
-        <button id="reset-filter" class="ghost-button" type="button">重置筛选</button>
-      </div>
+        <select name="sort" class="select">
+          {% for option in sort_options %}
+            <option value="{{ option['value'] }}" {% if table_state['sort'] == option['value'] %}selected{% endif %}>{{ option['label'] }}</option>
+          {% endfor %}
+        </select>
+        <select name="per_page" class="select">
+          {% for size in per_page_options %}
+            <option value="{{ size }}" {% if table_state['per_page'] == size %}selected{% endif %}>每页 {{ size }} 条</option>
+          {% endfor %}
+        </select>
+        <div class="toolbar-actions">
+          <button type="submit">应用筛选</button>
+          <a class="top-link" href="{{ reset_url }}">重置</a>
+        </div>
+      </form>
       <div class="summary-bar">
-        <span>共 <strong id="visible-count">{{ users|length }}</strong> 个账号正在显示</span>
-        <span>支持快速额度发放/扣减、自定义调整、冻结、恢复和注销操作</span>
+        <span>共筛选出 <strong>{{ pagination['total'] }}</strong> 个账号，当前显示第 {{ pagination['start'] }} - {{ pagination['end'] }} 条</span>
+        <span>支持快速额度发放/扣减、自定义调整、冻结、恢复、注销和权限管理</span>
       </div>
       <div class="table-wrap">
         <table>
@@ -2054,12 +2402,8 @@ ADMIN_PAGE = """
           </thead>
           <tbody id="user-table">
             {% for item in users %}
-              {% set remaining = [item["submission_quota"] - item["submissions_used"], 0] | max %}
               <tr
                 data-user-id="{{ item['id'] }}"
-                data-search="{{ item['email'] }} {{ item['id'] }} {{ item['created_at'] }}"
-                data-status="{{ item['account_status'] }}"
-                data-remaining="{{ remaining }}"
               >
                 <td data-label="账号">
                   <div class="email">{{ item["email"] }}</div>
@@ -2080,7 +2424,7 @@ ADMIN_PAGE = """
                   </span>
                 </td>
                 <td data-label="已用 / 总额度"><span class="quota" data-quota-text>{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
-                <td data-label="剩余"><strong data-remaining-text>{{ remaining }}</strong></td>
+                <td data-label="剩余"><strong data-remaining-text>{{ item["remaining"] }}</strong></td>
                 <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
                 <td data-label="调整次数">
                   <div class="actions">
@@ -2088,6 +2432,7 @@ ADMIN_PAGE = """
                       {% for amount in [1, 3, 10] %}
                         <form class="quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
                           <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="next" type="hidden" value="{{ current_url }}">
                           <input name="user_id" type="hidden" value="{{ item["id"] }}">
                           <input name="amount" type="hidden" value="{{ amount }}">
                           <button class="compact-button" type="submit">+{{ amount }}</button>
@@ -2096,6 +2441,7 @@ ADMIN_PAGE = """
                       {% for amount in [1, 3, 10] %}
                         <form class="quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
                           <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="next" type="hidden" value="{{ current_url }}">
                           <input name="user_id" type="hidden" value="{{ item["id"] }}">
                           <input name="amount" type="hidden" value="{{ amount }}">
                           <button class="ghost-button compact-button" type="submit">-{{ amount }}</button>
@@ -2104,12 +2450,14 @@ ADMIN_PAGE = """
                     </div>
                     <form class="inline-form quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
                       <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                      <input name="next" type="hidden" value="{{ current_url }}">
                       <input name="user_id" type="hidden" value="{{ item["id"] }}">
                       <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
                       <button class="ghost-button compact-button" type="submit">增加</button>
                     </form>
                     <form class="inline-form quota-form" method="post" action="{{ url_for('admin_reduce_quota') }}">
                       <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                      <input name="next" type="hidden" value="{{ current_url }}">
                       <input name="user_id" type="hidden" value="{{ item["id"] }}">
                       <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
                       <button class="ghost-button compact-button" type="submit">减少</button>
@@ -2124,6 +2472,7 @@ ADMIN_PAGE = """
                       {% elif item["is_admin"] %}
                         <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认取消 {{ item['email'] }} 的管理员权限吗？">
                           <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="next" type="hidden" value="{{ current_url }}">
                           <input name="user_id" type="hidden" value="{{ item["id"] }}">
                           <input name="is_admin" type="hidden" value="0">
                           <button class="ghost-button compact-button" type="submit">取消管理员</button>
@@ -2131,6 +2480,7 @@ ADMIN_PAGE = """
                       {% else %}
                         <form method="post" action="{{ url_for('admin_update_role') }}" data-confirm="确认把 {{ item['email'] }} 设为管理员吗？管理员可以进入后台管理用户额度和账号状态。">
                           <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                          <input name="next" type="hidden" value="{{ current_url }}">
                           <input name="user_id" type="hidden" value="{{ item["id"] }}">
                           <input name="is_admin" type="hidden" value="1">
                           <button class="compact-button" type="submit">设为管理员</button>
@@ -2140,6 +2490,7 @@ ADMIN_PAGE = """
                     {% if item["account_status"] == "active" %}
                       <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认冻结 {{ item['email'] }} 吗？冻结后该账号将不能登录和检测。">
                         <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="next" type="hidden" value="{{ current_url }}">
                         <input name="user_id" type="hidden" value="{{ item["id"] }}">
                         <input name="status" type="hidden" value="frozen">
                         <button class="info-button compact-button" type="submit">冻结</button>
@@ -2147,16 +2498,19 @@ ADMIN_PAGE = """
                     {% else %}
                       <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认恢复 {{ item['email'] }} 吗？恢复后账号可继续使用。">
                         <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="next" type="hidden" value="{{ current_url }}">
                         <input name="user_id" type="hidden" value="{{ item["id"] }}">
                         <input name="status" type="hidden" value="active">
                         <button class="ghost-button compact-button" type="submit">恢复</button>
                       </form>
                     {% endif %}
                     {% if item["account_status"] != "disabled" %}
-                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm="确认注销 {{ item['email'] }} 吗？注销后该账号将被停用。">
+                      <form method="post" action="{{ url_for('admin_update_status') }}" data-confirm-email="{{ item['email'] }}">
                         <input name="auth_token" type="hidden" value="{{ auth_token }}">
+                        <input name="next" type="hidden" value="{{ current_url }}">
                         <input name="user_id" type="hidden" value="{{ item["id"] }}">
                         <input name="status" type="hidden" value="disabled">
+                        <input name="confirm_email" type="hidden" value="">
                         <button class="warn-button compact-button" type="submit">注销</button>
                       </form>
                     {% endif %}
@@ -2167,17 +2521,55 @@ ADMIN_PAGE = """
           </tbody>
         </table>
       </div>
-      <div id="empty-state" class="empty-state" hidden>没有匹配到符合条件的账号，试试清空搜索词或调整筛选条件。</div>
+      {% if not users %}
+        <div class="empty-state">没有匹配到符合条件的账号，试试清空搜索词或调整筛选条件。</div>
+      {% endif %}
+      <div class="pager">
+        <div class="pager-info">第 {{ pagination['page'] }} / {{ pagination['pages'] }} 页</div>
+        <div class="pager-links">
+          {% if pagination['page'] > 1 %}
+            <a class="pager-link" href="{{ build_admin_url(auth_token, table_state, page=pagination['page'] - 1) }}">上一页</a>
+          {% endif %}
+          {% for page_number in page_numbers %}
+            <a class="pager-link {% if page_number == pagination['page'] %}active{% endif %}" href="{{ build_admin_url(auth_token, table_state, page=page_number) }}">{{ page_number }}</a>
+          {% endfor %}
+          {% if pagination['page'] < pagination['pages'] %}
+            <a class="pager-link" href="{{ build_admin_url(auth_token, table_state, page=pagination['page'] + 1) }}">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+    <section class="log-preview">
+      <div class="section-head">
+        <div>
+          <h2>最近操作</h2>
+          <div class="log-meta">最近几次关键后台动作，方便快速核对是否有误操作。</div>
+        </div>
+        <a class="top-link" href="{{ url_for('admin_logs', auth_token=auth_token) }}">查看全部日志</a>
+      </div>
+      {% if recent_logs %}
+        <div class="log-list">
+          {% for log in recent_logs %}
+            <div class="log-item">
+              <div>
+                <strong>{{ log['summary'] }}</strong>
+                <div class="log-meta">操作者：{{ log['actor_email'] or '未知管理员' }}</div>
+              </div>
+              <div class="log-meta">
+                目标账号：{{ log['target_email'] or '无' }}<br>
+                动作类型：{{ log['action'] }}
+              </div>
+              <div class="log-meta">{{ log['created_at'] }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state">还没有后台操作日志。</div>
+      {% endif %}
     </section>
   </main>
   <script>
-    const searchInput = document.getElementById('search-input');
-    const statusFilter = document.getElementById('status-filter');
-    const quotaFilter = document.getElementById('quota-filter');
-    const resetFilter = document.getElementById('reset-filter');
     const userTable = document.getElementById('user-table');
-    const visibleCount = document.getElementById('visible-count');
-    const emptyState = document.getElementById('empty-state');
     const adminNotice = document.getElementById('admin-notice');
 
     const showAdminNotice = (message, isError = false) => {
@@ -2192,42 +2584,6 @@ ADMIN_PAGE = """
         ? 'color-mix(in srgb, var(--warn-soft) 72%, transparent)'
         : 'color-mix(in srgb, var(--accent-soft) 58%, transparent)';
     };
-
-    const applyFilters = () => {
-      if (!userTable) return;
-      const keyword = (searchInput?.value || '').trim().toLowerCase();
-      const status = statusFilter?.value || 'all';
-      const quota = quotaFilter?.value || 'all';
-      let shown = 0;
-
-      userTable.querySelectorAll('tr').forEach(row => {
-        const searchText = (row.dataset.search || '').toLowerCase();
-        const rowStatus = row.dataset.status || 'active';
-        const remaining = Number(row.dataset.remaining || '0');
-        const matchesKeyword = !keyword || searchText.includes(keyword);
-        const matchesStatus = status === 'all' || rowStatus === status;
-        const matchesQuota = quota === 'all' || (quota === 'remaining' ? remaining > 0 : remaining <= 0);
-        const visible = matchesKeyword && matchesStatus && matchesQuota;
-        row.hidden = !visible;
-        if (visible) shown += 1;
-      });
-
-      if (visibleCount) visibleCount.textContent = String(shown);
-      if (emptyState) emptyState.hidden = shown !== 0;
-    };
-
-    [searchInput, statusFilter, quotaFilter].forEach(element => {
-      if (!element) return;
-      element.addEventListener('input', applyFilters);
-      element.addEventListener('change', applyFilters);
-    });
-
-    if (resetFilter) resetFilter.addEventListener('click', () => {
-      if (searchInput) searchInput.value = '';
-      if (statusFilter) statusFilter.value = 'all';
-      if (quotaFilter) quotaFilter.value = 'all';
-      applyFilters();
-    });
 
     document.querySelectorAll('.quota-form').forEach(form => {
       form.addEventListener('submit', async event => {
@@ -2259,7 +2615,6 @@ ADMIN_PAGE = """
 
           const row = userTable?.querySelector(`tr[data-user-id="${payload.user.id}"]`);
           if (row) {
-            row.dataset.remaining = String(payload.user.remaining);
             const quotaText = row.querySelector('[data-quota-text]');
             const remainingText = row.querySelector('[data-remaining-text]');
             if (quotaText) quotaText.textContent = `${payload.user.submissions_used} / ${payload.user.submission_quota}`;
@@ -2268,7 +2623,6 @@ ADMIN_PAGE = """
           const customAmount = form.querySelector('input[name="amount"][type="number"]');
           if (customAmount) customAmount.value = '';
           showAdminNotice(payload.message || '次数已调整。');
-          applyFilters();
         } catch (error) {
           showAdminNotice(error.message || '调整次数失败，请稍后再试。', true);
         } finally {
@@ -2287,8 +2641,221 @@ ADMIN_PAGE = """
       });
     });
 
-    applyFilters();
+    document.querySelectorAll('form[data-confirm-email]').forEach(form => {
+      form.addEventListener('submit', event => {
+        const email = form.dataset.confirmEmail || '';
+        const typed = window.prompt(`这是高风险操作。请输入目标邮箱 ${email} 确认注销：`, '');
+        if (typed === null) {
+          event.preventDefault();
+          return;
+        }
+        if (typed.trim().toLowerCase() !== email.toLowerCase()) {
+          event.preventDefault();
+          showAdminNotice('输入的邮箱与目标账号不一致，已取消注销操作。', true);
+          return;
+        }
+        const field = form.querySelector('input[name="confirm_email"]');
+        if (field) field.value = typed.trim();
+      });
+    });
   </script>
+</body>
+</html>
+"""
+
+
+ADMIN_LOG_PAGE = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>操作日志 - 管理后台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #16202a;
+      --muted: #607181;
+      --paper: #f3efe6;
+      --surface: rgba(255, 255, 255, .86);
+      --surface-strong: #ffffff;
+      --line: #d7d9d2;
+      --accent: #176f58;
+      --shadow: rgba(22, 32, 42, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 12%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 28rem),
+        var(--paper);
+      font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 48px;
+    }
+    .topbar, .section-head, .pager {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    h1, h2 {
+      margin: 0;
+    }
+    .copy {
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.8;
+    }
+    a {
+      color: var(--accent);
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .panel {
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(16px);
+    }
+    .section-head {
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .log-list {
+      display: grid;
+    }
+    .log-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) auto;
+      gap: 16px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .log-item:last-child {
+      border-bottom: 0;
+    }
+    .log-item strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.8;
+    }
+    .details {
+      margin-top: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--muted);
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .empty-state {
+      padding: 40px 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .pager {
+      padding: 18px;
+      border-top: 1px solid var(--line);
+    }
+    .pager-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pager-link {
+      display: inline-flex;
+      min-width: 40px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .pager-link.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    @media (max-width: 820px) {
+      .topbar, .section-head, .pager, .log-item {
+        align-items: flex-start;
+        flex-direction: column;
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="topbar">
+      <div>
+        <h1>操作日志</h1>
+        <p class="copy">这里会记录管理员的关键动作，包括额度调整、权限变更、冻结、恢复和注销。</p>
+      </div>
+      <div>
+        <a href="{{ url_for('admin', auth_token=auth_token) }}">返回管理后台</a>
+      </div>
+    </div>
+    <section class="panel">
+      <div class="section-head">
+        <h2>最近记录</h2>
+        <div class="meta">当前显示第 {{ pagination['start'] }} - {{ pagination['end'] }} 条，共 {{ pagination['total'] }} 条</div>
+      </div>
+      {% if logs %}
+        <div class="log-list">
+          {% for log in logs %}
+            <div class="log-item">
+              <div>
+                <strong>{{ log['summary'] }}</strong>
+                <div class="meta">操作者：{{ log['actor_email'] or '未知管理员' }}</div>
+                {% if log['details_pretty'] %}
+                  <div class="details">{{ log['details_pretty'] }}</div>
+                {% endif %}
+              </div>
+              <div class="meta">
+                目标账号：{{ log['target_email'] or '无' }}<br>
+                动作类型：{{ log['action'] }}
+              </div>
+              <div class="meta">{{ log['created_at'] }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state">还没有后台操作日志。</div>
+      {% endif %}
+      <div class="pager">
+        <div class="meta">第 {{ pagination['page'] }} / {{ pagination['pages'] }} 页</div>
+        <div class="pager-links">
+          {% if pagination['page'] > 1 %}
+            <a class="pager-link" href="{{ url_for('admin_logs', auth_token=auth_token, page=pagination['page'] - 1) }}">上一页</a>
+          {% endif %}
+          {% for page_number in page_numbers %}
+            <a class="pager-link {% if page_number == pagination['page'] %}active{% endif %}" href="{{ url_for('admin_logs', auth_token=auth_token, page=page_number) }}">{{ page_number }}</a>
+          {% endfor %}
+          {% if pagination['page'] < pagination['pages'] %}
+            <a class="pager-link" href="{{ url_for('admin_logs', auth_token=auth_token, page=pagination['page'] + 1) }}">下一页</a>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+  </main>
 </body>
 </html>
 """
@@ -2380,22 +2947,40 @@ def admin():
     if not is_admin(user):
         return redirect(url_for("index"))
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
-    users = list_users()
-    for item in users:
-        item["is_super_admin"] = item.get("email", "").lower() in SUPER_ADMIN_EMAILS
-        item["is_admin"] = bool(item.get("is_admin")) or item["is_super_admin"] or item.get("email", "").lower() in LEGACY_ADMIN_EMAILS
-    stats = {
-        "total": len(users),
-        "active": sum(1 for item in users if item.get("account_status", ACCOUNT_STATUS_ACTIVE) == ACCOUNT_STATUS_ACTIVE),
-        "frozen": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_FROZEN),
-        "disabled": sum(1 for item in users if item.get("account_status") == ACCOUNT_STATUS_DISABLED),
-        "admins": sum(1 for item in users if item.get("is_admin")),
-    }
+    table_state = admin_table_state(token)
+    all_users = [enrich_admin_user(item) for item in list_users()]
+    stats = summarize_admin_stats(all_users)
+    filtered_users = apply_admin_user_filters(all_users, table_state)
+    sorted_users = sort_admin_users(filtered_users, table_state["sort"])
+    users, pagination = paginate_items(sorted_users, table_state["page"], table_state["per_page"])
+    page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
+    current_url = build_admin_url(token, {**table_state, "page": pagination["page"]})
+    recent_logs = list_admin_logs()[:6]
     return render_template_string(
         ADMIN_PAGE,
         admin_user=user,
         users=users,
         stats=stats,
+        recent_logs=recent_logs,
+        table_state={**table_state, "page": pagination["page"]},
+        pagination=pagination,
+        page_numbers=page_numbers,
+        current_url=current_url,
+        reset_url=url_for("admin", auth_token=token),
+        sort_options=[
+            {"value": "created_desc", "label": "按注册时间倒序"},
+            {"value": "created_asc", "label": "按注册时间正序"},
+            {"value": "remaining_desc", "label": "按剩余次数从高到低"},
+            {"value": "remaining_asc", "label": "按剩余次数从低到高"},
+            {"value": "quota_desc", "label": "按总额度从高到低"},
+            {"value": "quota_asc", "label": "按总额度从低到高"},
+            {"value": "used_desc", "label": "按已用次数从高到低"},
+            {"value": "used_asc", "label": "按已用次数从低到高"},
+            {"value": "email_asc", "label": "按邮箱 A-Z"},
+            {"value": "email_desc", "label": "按邮箱 Z-A"},
+        ],
+        per_page_options=sorted(ADMIN_PER_PAGE_OPTIONS),
+        build_admin_url=build_admin_url,
         can_manage_admins=is_super_admin(user),
         status_labels={
             ACCOUNT_STATUS_ACTIVE: account_status_label(ACCOUNT_STATUS_ACTIVE),
@@ -2436,11 +3021,18 @@ def admin_add_quota():
     except ValueError as exc:
         if wants_json:
             return jsonify({"ok": False, "message": str(exc)}), 400
-        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+        return redirect_with_message(admin_redirect_url(token), str(exc))
     message = f"已增加 {amount} 次额度。"
+    record_admin_log(
+        user,
+        "quota_add",
+        target_user,
+        f"给 {target_user['email']} 增加了 {amount} 次额度",
+        {"amount": amount, "submission_quota": user_quota(target_user), "remaining": remaining_submissions(target_user)},
+    )
     if wants_json:
         return jsonify({"ok": True, "message": message, "user": admin_user_quota_payload(target_user)})
-    return redirect(url_for("admin", auth_token=token, message=message))
+    return redirect_with_message(admin_redirect_url(token), message)
 
 
 @app.post("/admin/quota/reduce")
@@ -2472,11 +3064,18 @@ def admin_reduce_quota():
     except ValueError as exc:
         if wants_json:
             return jsonify({"ok": False, "message": str(exc)}), 400
-        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+        return redirect_with_message(admin_redirect_url(token), str(exc))
     message = f"已减少 {amount} 次额度。"
+    record_admin_log(
+        user,
+        "quota_reduce",
+        target_user,
+        f"给 {target_user['email']} 减少了 {amount} 次额度",
+        {"amount": amount, "submission_quota": user_quota(target_user), "remaining": remaining_submissions(target_user)},
+    )
     if wants_json:
         return jsonify({"ok": True, "message": message, "user": admin_user_quota_payload(target_user)})
-    return redirect(url_for("admin", auth_token=token, message=message))
+    return redirect_with_message(admin_redirect_url(token), message)
 
 
 @app.post("/admin/status")
@@ -2490,21 +3089,32 @@ def admin_update_status():
     token = request.form.get("auth_token") or generate_auth_token(user["id"])
     target_user_id = request.form.get("user_id", "")
     status = request.form.get("status", "").strip().lower()
+    confirm_email = request.form.get("confirm_email", "").strip().lower()
     target_user = find_user_by_id(target_user_id)
     if target_user is None:
-        return redirect(url_for("admin", auth_token=token, message="用户不存在。"))
+        return redirect_with_message(admin_redirect_url(token), "用户不存在。")
     target_is_privileged = is_super_admin(target_user) or is_admin(target_user)
     if target_is_privileged and not is_super_admin(user):
-        return redirect(url_for("admin", auth_token=token, message="普通管理员不能修改其他管理员账号状态。"))
+        return redirect_with_message(admin_redirect_url(token), "普通管理员不能修改其他管理员账号状态。")
     if is_super_admin(target_user) and status != ACCOUNT_STATUS_ACTIVE:
-        return redirect(url_for("admin", auth_token=token, message="最高管理员账号不能被冻结或注销。"))
+        return redirect_with_message(admin_redirect_url(token), "最高管理员账号不能被冻结或注销。")
     if target_user_id == user.get("id") and status == ACCOUNT_STATUS_DISABLED:
-        return redirect(url_for("admin", auth_token=token, message="不能注销当前管理员账号。"))
+        return redirect_with_message(admin_redirect_url(token), "不能注销当前管理员账号。")
+    if status == ACCOUNT_STATUS_DISABLED and confirm_email != target_user.get("email", "").strip().lower():
+        return redirect_with_message(admin_redirect_url(token), "注销确认失败，请输入目标邮箱后再试。")
     try:
         update_user_status(target_user_id, status)
     except ValueError as exc:
-        return redirect(url_for("admin", auth_token=token, message=str(exc)))
-    return redirect(url_for("admin", auth_token=token, message=f"账号状态已更新为：{account_status_label(status)}。"))
+        return redirect_with_message(admin_redirect_url(token), str(exc))
+    refreshed_target = find_user_by_id(target_user_id)
+    record_admin_log(
+        user,
+        "status_update",
+        refreshed_target,
+        f"将 {target_user['email']} 的账号状态更新为 {account_status_label(status)}",
+        {"status": status},
+    )
+    return redirect_with_message(admin_redirect_url(token), f"账号状态已更新为：{account_status_label(status)}。")
 
 
 @app.post("/admin/role")
@@ -2520,15 +3130,51 @@ def admin_update_role():
     admin_enabled = request.form.get("is_admin", "") == "1"
     target_user = find_user_by_id(target_user_id)
     if target_user is None:
-        return redirect(url_for("admin", auth_token=token, message="用户不存在。"))
+        return redirect_with_message(admin_redirect_url(token), "用户不存在。")
     if is_super_admin(target_user):
-        return redirect(url_for("admin", auth_token=token, message="最高管理员权限不能在后台取消。"))
+        return redirect_with_message(admin_redirect_url(token), "最高管理员权限不能在后台取消。")
     try:
         update_user_admin(target_user_id, admin_enabled)
     except ValueError as exc:
-        return redirect(url_for("admin", auth_token=token, message=str(exc)))
+        return redirect_with_message(admin_redirect_url(token), str(exc))
     action = "设为管理员" if admin_enabled else "取消管理员"
-    return redirect(url_for("admin", auth_token=token, message=f"已将 {target_user['email']} {action}。"))
+    refreshed_target = find_user_by_id(target_user_id)
+    record_admin_log(
+        user,
+        "role_update",
+        refreshed_target,
+        f"已将 {target_user['email']} {action}",
+        {"is_admin": admin_enabled},
+    )
+    return redirect_with_message(admin_redirect_url(token), f"已将 {target_user['email']} {action}。")
+
+
+@app.get("/admin/logs")
+def admin_logs():
+    user = current_user()
+    if not is_admin(user):
+        return redirect(url_for("index"))
+    token = request.values.get("auth_token") or generate_auth_token(user["id"])
+    page = parse_positive_int(request.args.get("page"), 1)
+    logs = list_admin_logs()
+    for item in logs:
+        details = item.get("details")
+        if details in (None, "", {}):
+            item["details_pretty"] = ""
+        else:
+            try:
+                item["details_pretty"] = json.dumps(details, ensure_ascii=False, indent=2)
+            except TypeError:
+                item["details_pretty"] = str(details)
+    page_logs, pagination = paginate_items(logs, page, 20)
+    page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
+    return render_template_string(
+        ADMIN_LOG_PAGE,
+        auth_token=token,
+        logs=page_logs,
+        pagination=pagination,
+        page_numbers=page_numbers,
+    )
 
 
 @app.post("/audit")

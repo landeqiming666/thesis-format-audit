@@ -30,13 +30,55 @@ create unique index if not exists thesis_audit_users_invite_code_key
 on public.thesis_audit_users(invite_code)
 where invite_code is not null;
 
+create table if not exists public.thesis_audit_admin_logs (
+  id uuid primary key default gen_random_uuid(),
+  actor_user_id uuid references public.thesis_audit_users(id),
+  actor_email text not null default '',
+  action text not null,
+  target_user_id uuid references public.thesis_audit_users(id),
+  target_email text not null default '',
+  summary text not null,
+  details jsonb,
+  created_at timestamptz not null default now()
+);
+
 alter table public.thesis_audit_users enable row level security;
 
-create policy "service role can manage thesis audit users"
-on public.thesis_audit_users
-for all
-using (auth.role() = 'service_role')
-with check (auth.role() = 'service_role');
+alter table public.thesis_audit_admin_logs enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'thesis_audit_users'
+      and policyname = 'service role can manage thesis audit users'
+  ) then
+    create policy "service role can manage thesis audit users"
+    on public.thesis_audit_users
+    for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'thesis_audit_admin_logs'
+      and policyname = 'service role can manage thesis audit admin logs'
+  ) then
+    create policy "service role can manage thesis audit admin logs"
+    on public.thesis_audit_admin_logs
+    for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');
+  end if;
+end $$;
 
 create or replace function public.increment_thesis_audit_submissions(
   target_user_id uuid,
