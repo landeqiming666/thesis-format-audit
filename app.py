@@ -14,7 +14,7 @@ import ssl
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
@@ -69,6 +69,7 @@ EMAIL_CODE_RESEND_SECONDS = 60
 ACCOUNT_STATUS_ACTIVE = "active"
 ACCOUNT_STATUS_FROZEN = "frozen"
 ACCOUNT_STATUS_DISABLED = "disabled"
+CHINA_TZ = timezone(timedelta(hours=8))
 RATE_LIMITS = {
     "login": (10, 5 * 60),
     "register": (5, 60 * 60),
@@ -906,11 +907,16 @@ def format_datetime_display(value: str) -> str:
     if not raw:
         return ""
     normalized = raw.replace("Z", "+00:00")
+    if re.search(r"[+-]\d{2}$", normalized):
+        normalized = f"{normalized}:00"
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return raw
-    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local_time = parsed.astimezone(CHINA_TZ)
+    return local_time.strftime("%Y年%m月%d日 %H:%M:%S")
 
 
 def add_user_quota(user_id: str, amount: int) -> None:
