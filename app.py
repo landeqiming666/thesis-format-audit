@@ -246,7 +246,7 @@ def find_user_by_invite_code(code: str) -> dict | None:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return result.data if result is not None else None
 
 
 def create_unique_invite_code() -> str:
