@@ -1699,35 +1699,52 @@ PAGE = """
       background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface-strong));
     }
     .group-invite {
-      margin-top: 18px;
-      padding: 15px 16px;
-      border: 1px solid color-mix(in srgb, var(--accent) 44%, var(--line));
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      margin: 0 0 22px;
+      padding: 22px;
+      border: 2px solid color-mix(in srgb, var(--accent) 62%, var(--line));
       background:
-        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 54%, transparent), transparent 70%),
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 78%, transparent), transparent 74%),
         var(--surface-strong);
       color: var(--accent-strong);
-      font: 700 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+      box-shadow: 0 20px 52px color-mix(in srgb, var(--accent) 18%, transparent);
+      font: 800 14px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
     .group-invite strong {
       display: block;
-      margin-bottom: 4px;
+      margin-bottom: 6px;
       color: var(--ink);
-      font-size: 15px;
+      font-size: 20px;
+      line-height: 1.25;
     }
     .group-invite-head {
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: flex-start;
       gap: 12px;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .group-invite-head strong {
       margin: 0;
     }
     .group-number {
-      margin-top: 6px;
-      font: 900 18px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
-      letter-spacing: .05em;
+      margin: 8px 0 2px;
+      color: var(--accent-strong);
+      font: 900 30px/1.05 "PingFang SC", "Noto Sans SC", sans-serif;
+      letter-spacing: .04em;
+    }
+    .group-copy-button {
+      min-width: 148px;
+      padding: 14px 18px;
+      border-width: 2px;
+      font-size: 15px;
+    }
+    .group-copy-button::before {
+      content: "⧉";
+      margin-right: 7px;
     }
     .invite-card {
       margin: 0 0 20px;
@@ -1839,7 +1856,10 @@ PAGE = """
       .quota-help { grid-template-columns: 1fr; }
       .quota-actions { align-items: flex-start; }
       .quota-number { width: fit-content; }
+      .group-invite { grid-template-columns: 1fr; padding: 18px; }
       .group-invite-head { align-items: flex-start; flex-direction: column; }
+      .group-number { font-size: 26px; }
+      .group-copy-button { width: 100%; }
       .modal-card { padding: 20px; }
       .modal-actions { flex-direction: column; }
       .modal-actions button { width: 100%; }
@@ -2274,7 +2294,18 @@ PAGE = """
               'X-Requested-With': 'fetch'
             }
           });
-          const data = await response.json();
+          const responseText = await response.text();
+          let data = {};
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch (_error) {
+            data = {
+              ok: false,
+              message: response.ok
+                ? '服务器返回格式异常，请稍后重试。'
+                : '验证码服务暂时不可用，请稍后重试。'
+            };
+          }
           if (!response.ok || data.ok === false) {
             throw new Error(data.message || '发送验证码失败，请稍后再试。');
           }
