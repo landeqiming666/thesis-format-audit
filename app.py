@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 
-from flask import Flask, Response, redirect, render_template_string, request, send_file, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
@@ -311,6 +311,15 @@ def add_user_quota(user_id: str, amount: int) -> None:
         .eq("id", user_id)
         .execute()
     )
+
+
+def admin_user_quota_payload(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "submissions_used": int(user["submissions_used"]),
+        "submission_quota": user_quota(user),
+        "remaining": remaining_submissions(user),
+    }
 
 
 def update_user_status(user_id: str, status: str) -> None:
@@ -1560,6 +1569,9 @@ ADMIN_PAGE = """
       color: var(--accent);
       font-weight: 800;
     }
+    .notice[hidden] {
+      display: none;
+    }
     .toolbar {
       display: grid;
       grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(160px, .42fr));
@@ -1827,7 +1839,7 @@ ADMIN_PAGE = """
         </div>
       </div>
     </div>
-    {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+    <div id="admin-notice" class="notice" {% if not message %}hidden{% endif %}>{{ message }}</div>
     <section class="stats">
       <div class="stat-card">
         <span class="stat-label">总用户数</span>
@@ -1893,6 +1905,7 @@ ADMIN_PAGE = """
             {% for item in users %}
               {% set remaining = [item["submission_quota"] - item["submissions_used"], 0] | max %}
               <tr
+                data-user-id="{{ item['id'] }}"
                 data-search="{{ item['email'] }} {{ item['id'] }} {{ item['created_at'] }}"
                 data-status="{{ item['account_status'] }}"
                 data-remaining="{{ remaining }}"
@@ -1915,14 +1928,14 @@ ADMIN_PAGE = """
                     {{ status_labels.get(item["account_status"], "未知") }}
                   </span>
                 </td>
-                <td data-label="已用 / 总额度"><span class="quota">{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
-                <td data-label="剩余"><strong>{{ remaining }}</strong></td>
+                <td data-label="已用 / 总额度"><span class="quota" data-quota-text>{{ item["submissions_used"] }} / {{ item["submission_quota"] }}</span></td>
+                <td data-label="剩余"><strong data-remaining-text>{{ remaining }}</strong></td>
                 <td data-label="注册时间" class="muted">{{ item["created_at"] }}</td>
                 <td data-label="增加次数">
                   <div class="actions">
                     <div class="action-group">
                       {% for amount in [1, 3, 10] %}
-                        <form method="post" action="{{ url_for('admin_add_quota') }}">
+                        <form class="quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
                           <input name="auth_token" type="hidden" value="{{ auth_token }}">
                           <input name="user_id" type="hidden" value="{{ item["id"] }}">
                           <input name="amount" type="hidden" value="{{ amount }}">
@@ -1930,7 +1943,7 @@ ADMIN_PAGE = """
                         </form>
                       {% endfor %}
                     </div>
-                    <form class="inline-form" method="post" action="{{ url_for('admin_add_quota') }}">
+                    <form class="inline-form quota-form" method="post" action="{{ url_for('admin_add_quota') }}">
                       <input name="auth_token" type="hidden" value="{{ auth_token }}">
                       <input name="user_id" type="hidden" value="{{ item["id"] }}">
                       <input class="inline-number" name="amount" type="number" min="1" step="1" placeholder="自定义">
@@ -2000,6 +2013,20 @@ ADMIN_PAGE = """
     const userTable = document.getElementById('user-table');
     const visibleCount = document.getElementById('visible-count');
     const emptyState = document.getElementById('empty-state');
+    const adminNotice = document.getElementById('admin-notice');
+
+    const showAdminNotice = (message, isError = false) => {
+      if (!adminNotice) return;
+      adminNotice.textContent = message;
+      adminNotice.hidden = false;
+      adminNotice.style.color = isError ? 'var(--warn)' : 'var(--accent)';
+      adminNotice.style.borderColor = isError
+        ? 'color-mix(in srgb, var(--warn) 38%, var(--line))'
+        : 'color-mix(in srgb, var(--accent) 38%, var(--line))';
+      adminNotice.style.background = isError
+        ? 'color-mix(in srgb, var(--warn-soft) 72%, transparent)'
+        : 'color-mix(in srgb, var(--accent-soft) 58%, transparent)';
+    };
 
     const applyFilters = () => {
       if (!userTable) return;
@@ -2035,6 +2062,57 @@ ADMIN_PAGE = """
       if (statusFilter) statusFilter.value = 'all';
       if (quotaFilter) quotaFilter.value = 'all';
       applyFilters();
+    });
+
+    document.querySelectorAll('.quota-form').forEach(form => {
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        const button = form.querySelector('button[type="submit"]');
+        const originalText = button?.textContent || '';
+        if (button) {
+          button.disabled = true;
+          button.textContent = '处理中';
+        }
+
+        try {
+          const response = await fetch(form.action, {
+            method: 'POST',
+            body: new FormData(form),
+            credentials: 'same-origin',
+            headers: {
+              'Accept': 'application/json',
+              'X-Requested-With': 'fetch'
+            }
+          });
+          const contentType = response.headers.get('content-type') || '';
+          const payload = contentType.includes('application/json')
+            ? await response.json()
+            : { ok: response.ok, message: await response.text() };
+          if (!response.ok || payload.ok === false) {
+            throw new Error(payload.message || '增加次数失败，请稍后再试。');
+          }
+
+          const row = userTable?.querySelector(`tr[data-user-id="${payload.user.id}"]`);
+          if (row) {
+            row.dataset.remaining = String(payload.user.remaining);
+            const quotaText = row.querySelector('[data-quota-text]');
+            const remainingText = row.querySelector('[data-remaining-text]');
+            if (quotaText) quotaText.textContent = `${payload.user.submissions_used} / ${payload.user.submission_quota}`;
+            if (remainingText) remainingText.textContent = String(payload.user.remaining);
+          }
+          const customAmount = form.querySelector('input[name="amount"][type="number"]');
+          if (customAmount) customAmount.value = '';
+          showAdminNotice(payload.message || '次数已增加。');
+          applyFilters();
+        } catch (error) {
+          showAdminNotice(error.message || '增加次数失败，请稍后再试。', true);
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+          }
+        }
+      });
     });
 
     document.querySelectorAll('form[data-confirm]').forEach(form => {
@@ -2152,11 +2230,16 @@ def admin():
 
 @app.post("/admin/quota")
 def admin_add_quota():
+    wants_json = request.headers.get("X-Requested-With") == "fetch" or "application/json" in request.headers.get("Accept", "")
     limited = rate_limit("admin")
     if limited:
+        if wants_json:
+            return jsonify({"ok": False, "message": limited.get_data(as_text=True)}), limited.status_code
         return limited
     user = current_user()
     if not is_admin(user):
+        if wants_json:
+            return jsonify({"ok": False, "message": "没有权限。"}), 403
         return Response("没有权限。", status=403, mimetype="text/plain; charset=utf-8")
     token = request.form.get("auth_token") or generate_auth_token(user["id"])
     target_user_id = request.form.get("user_id", "")
@@ -2165,12 +2248,20 @@ def admin_add_quota():
     except ValueError:
         amount = 0
     if amount <= 0:
+        if wants_json:
+            return jsonify({"ok": False, "message": "增加次数必须大于 0。"}), 400
         return redirect(url_for("admin", auth_token=token, message="增加次数必须大于 0。"))
     try:
         add_user_quota(target_user_id, amount)
+        target_user = find_user_by_id(target_user_id)
     except ValueError as exc:
+        if wants_json:
+            return jsonify({"ok": False, "message": str(exc)}), 400
         return redirect(url_for("admin", auth_token=token, message=str(exc)))
-    return redirect(url_for("admin", auth_token=token, message=f"已增加 {amount} 次额度。"))
+    message = f"已增加 {amount} 次额度。"
+    if wants_json:
+        return jsonify({"ok": True, "message": message, "user": admin_user_quota_payload(target_user)})
+    return redirect(url_for("admin", auth_token=token, message=message))
 
 
 @app.post("/admin/status")
