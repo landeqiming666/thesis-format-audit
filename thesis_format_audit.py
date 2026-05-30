@@ -2545,12 +2545,313 @@ def paragraph_context_points(raw: str, limit: int = 8) -> list[str]:
     return points
 
 
+def extract_literal_list_after(raw: str, marker: str):
+    if marker not in raw:
+        return None
+    payload = raw.split(marker, 1)[1].strip()
+    start = payload.find("[")
+    if start < 0:
+        return None
+    depth = 0
+    quote = ""
+    end = None
+    for offset, ch in enumerate(payload[start:], start=start):
+        if quote:
+            if ch == quote and payload[offset - 1] != "\\":
+                quote = ""
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = offset + 1
+                break
+    if end is None:
+        return None
+    try:
+        return ast.literal_eval(payload[start:end])
+    except Exception:
+        return None
+
+
+def clean_display_text(value, limit: int = 80) -> str:
+    text = html.unescape(str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def loc_label(value) -> str:
+    if isinstance(value, int):
+        return f"P{value}"
+    text = clean_display_text(value, limit=30)
+    if text.isdigit():
+        return f"P{text}"
+    if re.fullmatch(r"S\d+|T\d+|P\d+", text):
+        return text
+    return text
+
+
+def bool_issue(flag, issue: str) -> str:
+    return "" if flag is True else issue
+
+
+def format_font_issue_list(issues) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(issues, list):
+        return result
+    for issue in issues:
+        text = clean_display_text(issue, limit=40)
+        size = re.search(r"字号([\d.]+)", text)
+        if size:
+            formatted = f"当前有 {size.group(1)} pt 文字，应统一为小四 12 pt"
+        elif "中文字体" in text:
+            formatted = "中文字体应统一为宋体"
+        elif "西文字体" in text:
+            formatted = "英文和数字应统一为 Times New Roman"
+        elif text:
+            formatted = text
+        else:
+            continue
+        if formatted not in seen:
+            seen.add(formatted)
+            result.append(formatted)
+    return result
+
+
+def format_problem_tuple(item, item_name: str = "") -> str:
+    if isinstance(item, str):
+        return clean_display_text(item, limit=120)
+    if not isinstance(item, tuple):
+        return clean_display_text(item, limit=120)
+
+    values = list(item)
+    if not values:
+        return ""
+
+    loc = loc_label(values[0])
+
+    # Header/footer/page-number checks commonly store section number first.
+    if item_name == "页眉格式与内容" and len(values) >= 3:
+        section = f"S{values[0]}" if isinstance(values[0], int) else loc
+        return f"{section} 页眉为“{clean_display_text(values[1], 70)}”：{clean_display_text(values[2], 90)}"
+    if item_name == "页码格式" and len(values) >= 2:
+        section = f"S{values[0]}" if isinstance(values[0], int) else loc
+        issue = clean_display_text(values[1], 100)
+        size = re.search(r"字号([\d.]+)", issue)
+        if size:
+            return f"{section}：页码字号当前为 {size.group(1)} pt，应为五号 10.5 pt。"
+        return f"{section}：{issue}"
+
+    # Reference/citation font tuples should be handled before generic title tuples.
+    if item_name == "参考文献引用格式" and len(values) >= 6:
+        issues = []
+        if values[2] != 12:
+            issues.append(f"字号当前为 {values[2] or '未识别'}，应为小四 12 pt")
+        if values[3] != "Times New Roman":
+            issues.append(f"字体当前为 {values[3] or '未识别'}，应为 Times New Roman")
+        if values[4] is not True:
+            issues.append("引用标号应设置为上标")
+        return f"{loc} 引用标号“{clean_display_text(values[1], 20)}”：{'；'.join(issues)}。附近文字：“{clean_display_text(values[5], 54)}”"
+
+    # Abstract/body paragraph tuples: (para, line_ok, indent_ok, font_issues, sample)
+    if len(values) == 5 and isinstance(values[1], bool) and isinstance(values[2], bool) and isinstance(values[3], list):
+        issues = [
+            bool_issue(values[1], "行距应为 1.5 倍"),
+            bool_issue(values[2], "首行缩进应为 2 字符"),
+            *format_font_issue_list(values[3]),
+        ]
+        issues = [x for x in issues if x]
+        sample = clean_display_text(values[4], 56)
+        return f"{loc} “{sample}”：{'；'.join(issues) if issues else '存在段落格式异常'}。"
+
+    # English abstract tuples: (para, line_ok, indent_ok, before_ok, after_ok, snap_ok, font_issues, sample)
+    if len(values) >= 8 and all(isinstance(v, bool) for v in values[1:6]) and isinstance(values[6], list):
+        issues = [
+            bool_issue(values[1], "行距应为 1.5 倍"),
+            bool_issue(values[2], "首行缩进应为 2 字符"),
+            bool_issue(values[3], "段前应为 0.5 行"),
+            bool_issue(values[4], "段后应为 0.5 行"),
+            bool_issue(values[5], "需要勾选“如果定义了文档网格，则对齐到网格”"),
+            *format_font_issue_list(values[6]),
+        ]
+        issues = [x for x in issues if x]
+        sample = clean_display_text(values[7], 56)
+        return f"{loc} “{sample}”：{'；'.join(issues) if issues else '存在英文摘要格式异常'}。"
+
+    # Body/subitem tuples with indentation and optional bold/font problems.
+    if len(values) >= 4 and isinstance(values[1], bool) and isinstance(values[2], list):
+        issues = [bool_issue(values[1], "首行缩进应为 2 字符"), *format_font_issue_list(values[2])]
+        issues = [x for x in issues if x]
+        sample = clean_display_text(values[3], 56)
+        return f"{loc} “{sample}”：{'；'.join(issues) if issues else '存在正文段落格式异常'}。"
+    if len(values) >= 6 and isinstance(values[1], bool) and isinstance(values[2], bool) and isinstance(values[3], list):
+        issues = [
+            bool_issue(values[1], "首行缩进应为 2 字符"),
+            bool_issue(values[2], "行距应为 1.5 倍"),
+            *format_font_issue_list(values[3]),
+        ]
+        if values[4]:
+            issues.append("分项标题或正文不应额外加粗")
+        sample = clean_display_text(values[5], 56)
+        return f"{loc} “{sample}”：{'；'.join(x for x in issues if x)}。"
+
+    # Table of contents and title tuples: (para, issue, actual, expected/sample...)
+    if len(values) >= 4 and isinstance(values[0], int) and isinstance(values[1], str):
+        if str(values[2]).startswith("标题后空"):
+            current = clean_display_text(values[2], 30).replace("标题后", "当前标题后")
+            return f"{loc} “{clean_display_text(values[1], 58)}”：{current}，应空 1 行。"
+        issue = values[1]
+        if issue == "缩进":
+            sample = clean_display_text(values[4] if len(values) > 4 else "", 54)
+            return f"{loc} 目录条目“{sample}”：左缩进当前约 {values[2]}，{values[3]}。"
+        if issue == "字号":
+            sample = clean_display_text(values[3], 54)
+            actual = "未直接识别到" if values[2] is None else f"{values[2]} pt"
+            return f"{loc} 目录条目“{sample}”：字号当前为{actual}，应为小四 12 pt。"
+        if issue == "行距":
+            sample = clean_display_text(values[3], 54)
+            return f"{loc} 目录条目“{sample}”：行距当前为 {values[2]}，应为 1.5 倍。"
+        if issue == "字体":
+            sample = clean_display_text(values[3], 54)
+            return f"{loc} 目录条目“{sample}”：中文字体当前为 {values[2] or '未识别'}，应为宋体。"
+        title = clean_display_text(values[-1], 58)
+        return f"{loc} “{title}”：{clean_display_text(issue, 80)}。"
+
+    if len(values) == 3 and isinstance(values[0], int) and isinstance(values[1], str):
+        return f"{loc} “{clean_display_text(values[2], 58)}”：{clean_display_text(values[1], 90)}。"
+
+    # Font-size-only tuples: (para, size, sample)
+    if len(values) == 3 and isinstance(values[0], int) and isinstance(values[1], (int, float)):
+        return f"{loc} “{clean_display_text(values[2], 58)}”：当前字号约 {values[1]} pt，应为小四 12 pt。"
+
+    # Reference/citation font tuples.
+    if item_name == "参考文献字体" and len(values) >= 5:
+        issues = []
+        if values[1] in (None, ""):
+            issues.append("字号未直接识别到，建议统一设为小四 12 pt")
+        elif abs(float(values[1]) - 12) > 0.2:
+            issues.append(f"当前字号约 {values[1]} pt，应为小四 12 pt")
+        if values[2] != "宋体":
+            issues.append(f"中文字体当前为 {values[2] or '未识别'}，应为宋体")
+        if values[3] is not True:
+            issues.append("行距应为 1.5 倍")
+        return f"{loc} 参考文献“{clean_display_text(values[4], 58)}”：{'；'.join(issues) if issues else '字体需要人工复核'}。"
+    # Figure/table/reference coverage tuples.
+    if len(values) >= 3 and re.match(r"^(图|表)[A-Z]?\d+[-.]?\d*", str(values[0])):
+        return f"{clean_display_text(values[0], 20)} “{clean_display_text(values[1], 70)}”：{clean_display_text(values[2], 90)}。"
+    if len(values) >= 3 and isinstance(values[0], int) and re.match(r"^(图|表)[A-Z]?\d+[-.]?\d*", str(values[1])):
+        return f"{loc} {clean_display_text(values[1], 20)} “{clean_display_text(values[2], 70)}”需要在正文中明确引用。"
+
+    # Table/three-line-table/formula tuples where first value is already an item number.
+    if len(values) == 2:
+        return f"{loc}：{clean_display_text(values[1], 100)}"
+    if len(values) >= 3 and not isinstance(values[1], bool):
+        return f"{loc}：{clean_display_text(values[1], 70)}；{clean_display_text(values[2], 90)}"
+
+    parts = [str(x) for x in item if x not in (None, "", [])]
+    if not parts:
+        return ""
+    loc = loc_label(parts[0])
+    details = "；".join(parts[1:])
+    if not details:
+        return str(loc)
+    return f"{loc}：{details}"
+
+
+def generic_exception_points(raw: str, item_name: str = "", limit: int = 14) -> list[str]:
+    points: list[str] = []
+    for marker, label in (
+        ("异常项：", "异常项"),
+        ("提醒项：", "提醒项"),
+        ("需人工复核：", "需复核"),
+        ("点号编号异常：", "点号编号异常"),
+        ("连续性异常：", "连续性异常"),
+        ("图题格式异常：", "图题格式异常"),
+        ("图片缺少下方图题：", "图片缺少图题"),
+        ("未引用：", "未引用项"),
+        ("未充分引用：", "未充分引用项"),
+    ):
+        data = extract_literal_list_after(raw, marker)
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            text = format_problem_tuple(item, item_name)
+            if text:
+                points.append(f"{label}：{text}")
+            if len(points) >= limit:
+                return points
+    return points
+
+
+def generic_detected_points(raw: str, limit: int = 8) -> list[str]:
+    if "已检测：" not in raw:
+        return []
+    segment = raw.split("已检测：", 1)[1].split("；异常项：", 1)[0]
+    entries = [x.strip() for x in segment.split("；") if x.strip()]
+    points = []
+    for entry in entries[:limit]:
+        points.append(f"已检测到：{format_detected_entry(entry)}")
+    return points
+
+
+def format_detected_entry(entry: str) -> str:
+    entry = html.unescape(entry).strip()
+    header = re.fullmatch(r"(S\d+):(.+)", entry)
+    if header and "PAGE" not in entry:
+        return f"{header.group(1)} 页眉为“{clean_display_text(header.group(2), 80)}”"
+    page = re.match(r"(S\d+):PAGE,\s*centered=(True|False),\s*start=([^,]+),\s*runIssues=\[([^\]]*)\]", entry)
+    if page:
+        section, centered, start, run_issues = page.groups()
+        bits = [f"{section} 页脚有页码"]
+        bits.append("已居中" if centered == "True" else "未居中")
+        if start not in ("None", ""):
+            bits.append(f"起始页={start}")
+        issues = re.findall(r"'([^']+)'", run_issues)
+        bits.extend(issues)
+        return "，".join(bits)
+    return clean_display_text(entry, 120)
+
+
+def generic_suggestion_points(raw: str, item_name: str) -> list[str]:
+    suggestions: list[str] = []
+    if "未设置段前分页" in raw or "不能稳定保证单独起页" in raw:
+        suggestions.append("在 Word 中把该标题设置为“段前分页”，确保单独起页。")
+    if "官方检测要求使用中文括号" in raw:
+        suggestions.append(f"把页眉中的英文括号“(论文)”改为中文括号“（论文）”。")
+    if "页码未居中" in raw or "centered=False" in raw:
+        suggestions.append("把对应节的页脚页码设置为居中。")
+    if "字号12.0" in raw and ("页码" in item_name or "页脚" in raw):
+        suggestions.append("把页码字号改为五号 10.5pt，英文字体设为 Times New Roman。")
+    if "首行上边线缺失" in raw or "表头下方横线缺失" in raw or "末行下边线缺失" in raw:
+        suggestions.append("按三线表补齐顶线、表头线和底线，并删除多余竖线。")
+    if "表格样式为Table Grid" in raw:
+        suggestions.append("检查表格是否仍保留全框线；若有全框线，请改成三线表。")
+    if "保存地或保存单位缺失" in raw:
+        suggestions.append("学位论文类参考文献请补全保存地或保存单位信息。")
+    if "正文未检测到图号引用" in raw:
+        suggestions.append("在正文描述中加入对应图号引用，例如“如图3-1所示”。")
+    if "图片下方未检测到规范图题" in raw:
+        suggestions.append("在图片下方补充规范图题，例如“图3-1 图题名称”。")
+    return suggestions
+
+
 def human_evidence_points(f: Finding) -> list[str]:
     raw = evidence_plain_text(f.evidence)
     points: list[str] = []
 
     if f.status == "PASS":
         return ["检查通过，不需要处理。"]
+
+    points.extend(generic_exception_points(raw, f.item))
+    points.extend(generic_detected_points(raw))
+    points.extend(generic_suggestion_points(raw, f.item))
 
     if f.item == "参考文献字体":
         points.extend(human_reference_font_points(raw))
@@ -2714,6 +3015,16 @@ def split_reason_suggestion(f: Finding) -> tuple[list[str], list[str]]:
         "表格问题",
         "页眉问题",
         "页码问题",
+        "异常项",
+        "提醒项",
+        "需复核",
+        "点号编号异常",
+        "连续性异常",
+        "图题格式异常",
+        "图片缺少图题",
+        "未引用项",
+        "未充分引用项",
+        "已检测到",
         "P",
         "S",
         "T",
@@ -2730,6 +3041,11 @@ def split_reason_suggestion(f: Finding) -> tuple[list[str], list[str]]:
         "加粗",
         "居中",
         "勾选",
+        "把",
+        "补齐",
+        "加入",
+        "补充",
+        "删除",
     )
     reasons: list[str] = []
     suggestions: list[str] = []
