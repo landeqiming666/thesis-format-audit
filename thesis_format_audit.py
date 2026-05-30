@@ -557,6 +557,22 @@ def is_probable_body_paragraph(paragraph) -> bool:
     return True
 
 
+def is_body_or_caption_paragraph(paragraph) -> bool:
+    text = paragraph.text.strip()
+    if not text or has_drawing(paragraph):
+        return False
+    style = paragraph.style.name
+    if style.startswith(("Heading", "toc", "目录", "Bibliography")):
+        return False
+    if re.match(r"^\[\d+\]", text):
+        return False
+    if text in ("摘  要", "Abstract", "目  录", "致  谢", "参考文献", "附  录"):
+        return False
+    if text.startswith(("关键词", "Keywords")):
+        return False
+    return True
+
+
 def paragraph_has_numbering(paragraph) -> bool:
     ppr = paragraph._p.pPr
     return ppr is not None and ppr.find(qn("numPr")) is not None
@@ -1379,6 +1395,32 @@ def audit_body_and_numbering(ctx: AuditContext):
         "重要",
     )
 
+    paragraph_bad = []
+    for i, p in enumerate(doc.paragraphs):
+        if refs_start is not None and i >= refs_start:
+            continue
+        if i < 100 or not is_body_or_caption_paragraph(p):
+            continue
+        text = p.text.strip()
+        cap_like = re.match(r"^[图表]\d+[-.]\d+\s+", text) and len(text) < 100
+        align = effective_paragraph_alignment(p)
+        line = effective_line_spacing(p)
+        if cap_like:
+            align_ok = align == WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            align_ok = align in (WD_ALIGN_PARAGRAPH.JUSTIFY, None)
+        line_ok = line in (1.5, None)
+        if not align_ok or not line_ok:
+            paragraph_bad.append((i + 1, "图表题" if cap_like else "正文段落", align, line, text[:80]))
+    ctx.add(
+        "段落对齐与行距",
+        "PASS" if not paragraph_bad else "FAIL",
+        "正文段落",
+        "正文段落应两端对齐、1.5倍行距；图题和表题应居中，行距符合模板要求。",
+        "异常项：" + html.escape(str(paragraph_bad[:30])) if paragraph_bad else "未发现正文段落对齐或行距异常。",
+        "重要",
+    )
+
     subitem_bad = []
     subitem_pat = re.compile(r"^(?:\d+）|（\d+）|[①②③④⑤⑥⑦⑧⑨⑩])")
     for i, p in enumerate(doc.paragraphs):
@@ -1790,11 +1832,11 @@ def audit_tables(ctx: AuditContext):
     )
     ctx.add(
         "三线表结构",
-        "PASS" if not three_line_bad else "WARN",
+        "PASS" if not three_line_bad else "FAIL",
         "正文和附录表格",
         "表格一般采用三线表，必要时可加辅助线；本项检查首线、表头线、底线和明显竖线。",
-        "需人工复核：" + html.escape(str(three_line_bad[:25])) if three_line_bad else "未发现明显非三线表边框结构。",
-        "一般",
+        "异常项：" + html.escape(str(three_line_bad[:25])) if three_line_bad else "未发现明显非三线表边框结构。",
+        "重要",
     )
 
     cont_labels = []
@@ -2169,6 +2211,82 @@ def audit_references(ctx: AuditContext):
         "不同类型文献应按 GB/T 7714—2015 标注文献类型，如期刊[J]、会议[C]、专著[M]、标准[S]、电子文献/联机文献[OL]等。",
         "异常项：" + html.escape(str(ref_type_bad[:20])) if ref_type_bad else "未发现缺少类型标识或标准文献类型误用。",
         "重要",
+    )
+
+
+def audit_document_structure(ctx: AuditContext):
+    doc = ctx.doc
+    cn_abs = ctx.find_exact("摘  要")
+    cn_kw = find_first(doc, lambda p: p.text.strip().startswith("关键词"))
+    en_abs = ctx.find_exact("Abstract")
+    en_kw = find_first(doc, lambda p: p.text.strip().startswith("Keywords"))
+
+    def first_index(predicate) -> Optional[int]:
+        for i, paragraph in enumerate(doc.paragraphs):
+            if predicate(i, paragraph):
+                return i
+        return None
+
+    def previous_nonempty(before: Optional[int], after: Optional[int] = None, latin: bool = False) -> Optional[int]:
+        if before is None:
+            return None
+        start = before - 1
+        stop = after if after is not None else -1
+        for i in range(start, stop, -1):
+            text = doc.paragraphs[i].text.strip()
+            if not text:
+                continue
+            if "题  目" in text or text.startswith(("本 科", "20")):
+                continue
+            if latin and not re.search(r"[A-Za-z]{4,}", text):
+                continue
+            if not latin and not has_cjk(text):
+                continue
+            return i
+        return None
+
+    toc_idx = first_index(lambda _i, p: clean_text(p.text) == "目录" or paragraph_has_toc_field(p))
+    if toc_idx is None and xml_has_toc_field(ctx.document_xml):
+        toc_idx = (en_kw + 1) if en_kw is not None else None
+
+    found = [
+        ("封面", first_index(lambda i, p: "本科毕业设计" in clean_text(p.text) and i < 10)),
+        ("诚信声明", first_index(lambda _i, p: "原创性声明" in p.text)),
+        ("版权声明", first_index(lambda _i, p: "版权使用授权书" in p.text)),
+        ("中文标题", previous_nonempty(cn_abs)),
+        ("中文摘要", cn_abs),
+        ("中文关键词", cn_kw),
+        ("英文标题", previous_nonempty(en_abs, cn_kw, latin=True)),
+        ("英文摘要", en_abs),
+        ("英文关键词", en_kw),
+        ("中文目录", toc_idx),
+        ("正文", first_index(lambda _i, p: p.style.name == "Heading 1" and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip()))),
+        ("致谢", first_index(lambda _i, p: clean_text(p.text) == "致谢")),
+        ("参考文献", first_index(lambda _i, p: clean_text(p.text) == "参考文献")),
+    ]
+    appendix_idx = first_index(lambda _i, p: clean_text(p.text) == "附录")
+    if appendix_idx is not None:
+        found.append(("附录", appendix_idx))
+
+    missing = [name for name, pos in found if pos is None]
+    present = [(name, pos + 1) for name, pos in found if pos is not None]
+    order_bad = []
+    last_pos = -1
+    for name, pos in present:
+        if pos < last_pos:
+            order_bad.append((name, pos, "位置早于前一结构要素"))
+        last_pos = max(last_pos, pos)
+
+    status = "PASS" if not missing and not order_bad else "FAIL"
+    ctx.add(
+        "结构要素与顺序",
+        status,
+        "全文结构",
+        "论文结构应依次包含封面、诚信声明、版权声明、中文标题、中文摘要、中文关键词、英文标题、英文摘要、英文关键词、中文目录、正文、致谢、参考文献；附录非必有。",
+        f"已识别结构={html.escape(str(present))}"
+        + (f"<br>缺失={html.escape(str(missing))}" if missing else "")
+        + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else ""),
+        "严重" if missing or order_bad else "重要",
     )
 
 
@@ -3931,6 +4049,7 @@ def run_audit(path: Path, out: Path) -> AuditContext:
         audit_units(ctx)
         audit_formulas(ctx)
         audit_references(ctx)
+        audit_document_structure(ctx)
         audit_appendix(ctx)
         audit_acknowledgement(ctx)
         audit_headers_footers_structural(ctx)

@@ -768,6 +768,12 @@ PAGE = """
       margin: 0;
       color: var(--accent-strong);
     }
+    .quota-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+    }
     .quota-label {
       display: block;
       margin-bottom: 4px;
@@ -785,6 +791,19 @@ PAGE = """
       font: 900 22px/1 "PingFang SC", "Noto Sans SC", sans-serif;
       letter-spacing: .04em;
     }
+    .copy-button {
+      width: auto;
+      margin: 0;
+      padding: 11px 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 56%, var(--line));
+      background: var(--surface-strong);
+      color: var(--accent-strong);
+      box-shadow: none;
+      font-size: 13px;
+    }
+    .copy-button:hover {
+      background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface-strong));
+    }
     .group-invite {
       margin-top: 18px;
       padding: 15px 16px;
@@ -800,6 +819,71 @@ PAGE = """
       margin-bottom: 4px;
       color: var(--ink);
       font-size: 15px;
+    }
+    .group-invite-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .group-invite-head strong {
+      margin: 0;
+    }
+    .group-number {
+      margin-top: 6px;
+      font: 900 18px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
+      letter-spacing: .05em;
+    }
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(15, 22, 27, .48);
+      z-index: 30;
+    }
+    .modal.active {
+      display: flex;
+      animation: rise .22s ease both;
+    }
+    .modal-card {
+      width: min(480px, 100%);
+      border: 1px solid var(--line);
+      background: var(--surface-strong);
+      box-shadow: 0 24px 80px var(--shadow);
+      padding: 24px;
+    }
+    .modal-card h3 {
+      margin: 0 0 10px;
+      font: 800 24px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .modal-card p {
+      margin: 0;
+      color: var(--muted);
+      font: 14px/1.8 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .modal-actions button {
+      width: auto;
+      margin: 0;
+      padding: 12px 16px;
+    }
+    .ghost-button {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .ghost-button:hover {
+      background: var(--surface-strong);
+      color: var(--accent-strong);
     }
     .facts {
       display: flex;
@@ -828,7 +912,12 @@ PAGE = """
       .auth-grid { grid-template-columns: 1fr; }
       .captcha-row { grid-template-columns: 1fr; }
       .quota-help { grid-template-columns: 1fr; }
+      .quota-actions { align-items: flex-start; }
       .quota-number { width: fit-content; }
+      .group-invite-head { align-items: flex-start; flex-direction: column; }
+      .modal-card { padding: 20px; }
+      .modal-actions { flex-direction: column; }
+      .modal-actions button { width: 100%; }
       h1 { font-size: clamp(46px, 16vw, 68px); }
     }
   </style>
@@ -874,7 +963,10 @@ PAGE = """
               <p class="usage">每个账号最多可生成 {{ max_submissions }} 次报告。</p>
               <div class="quota-help">
                 <p><span class="quota-label">增加检测次数</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加账号额度。</p>
-                <strong class="quota-number">537124215</strong>
+                <div class="quota-actions">
+                  <strong class="quota-number">537124215</strong>
+                  <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
+                </div>
               </div>
               <label for="docx">选择论文文件</label>
               <label id="upload-card" class="upload-card" for="docx">
@@ -901,7 +993,10 @@ PAGE = """
               <p class="error">这个账号的检测额度已经用完。</p>
               <div class="quota-help">
                 <p><span class="quota-label">额度已用完</span>加入官方 QQ 群可领取检测机会，也可以联系管理员增加检测次数。</p>
-                <strong class="quota-number">537124215</strong>
+                <div class="quota-actions">
+                  <strong class="quota-number">537124215</strong>
+                  <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
+                </div>
               </div>
             {% endif %}
           </form>
@@ -940,14 +1035,29 @@ PAGE = """
             <div class="auth-rule"><span>2</span><p>数字验证只用于减少自动注册，不会收集额外信息。</p></div>
           </div>
           <div class="group-invite">
-            <strong>加入 QQ 群可领取检测机会</strong>
-            QQ 群号：537124215。进群后可联系管理员领取额外检测机会。
+            <div class="group-invite-head">
+              <strong>加入 QQ 群可领取检测机会</strong>
+              <button class="copy-button" type="button" data-copy-group>一键复制群号</button>
+            </div>
+            <div class="group-number">QQ 群号：537124215</div>
+            进群后可联系管理员领取额外检测机会。
           </div>
         {% endif %}
       </div>
     </section>
   </main>
+  <div id="info-modal" class="modal" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
+      <h3 id="modal-title">提示</h3>
+      <p id="modal-body"></p>
+      <div class="modal-actions">
+        <button id="modal-secondary" class="ghost-button" type="button" hidden>关闭</button>
+        <button id="modal-primary" type="button">我知道了</button>
+      </div>
+    </div>
+  </div>
   <script>
+    const GROUP_NUMBER = '537124215';
     const root = document.documentElement;
     const themeToggle = document.getElementById('theme-toggle');
     const savedTheme = localStorage.getItem('theme');
@@ -987,6 +1097,13 @@ PAGE = """
     const uploadMeta = document.getElementById('upload-meta');
     const downloadDone = document.getElementById('download-done');
     const remainingCount = document.getElementById('remaining-count');
+    const infoModal = document.getElementById('info-modal');
+    const modalTitle = document.getElementById('modal-title');
+    const modalBody = document.getElementById('modal-body');
+    const modalPrimary = document.getElementById('modal-primary');
+    const modalSecondary = document.getElementById('modal-secondary');
+    let modalPrimaryHandler = null;
+    let modalSecondaryHandler = null;
 
     const messages = [
       [10, '正在上传论文...'],
@@ -996,6 +1113,84 @@ PAGE = """
       [82, '正在生成 HTML 报告...'],
       [92, '报告快好了，请稍等...']
     ];
+
+    const closeModal = () => {
+      if (!infoModal) return;
+      infoModal.classList.remove('active');
+      infoModal.setAttribute('aria-hidden', 'true');
+      modalPrimaryHandler = null;
+      modalSecondaryHandler = null;
+    };
+
+    const showModal = ({
+      title,
+      body,
+      primaryText = '我知道了',
+      secondaryText = '',
+      onPrimary = null,
+      onSecondary = null
+    }) => {
+      if (!infoModal || !modalTitle || !modalBody || !modalPrimary || !modalSecondary) return;
+      modalTitle.textContent = title;
+      modalBody.textContent = body;
+      modalPrimary.textContent = primaryText;
+      modalPrimaryHandler = onPrimary;
+      modalSecondaryHandler = onSecondary;
+      if (secondaryText) {
+        modalSecondary.hidden = false;
+        modalSecondary.textContent = secondaryText;
+      } else {
+        modalSecondary.hidden = true;
+      }
+      infoModal.classList.add('active');
+      infoModal.setAttribute('aria-hidden', 'false');
+    };
+
+    if (modalPrimary) modalPrimary.addEventListener('click', () => {
+      if (modalPrimaryHandler) modalPrimaryHandler();
+      closeModal();
+    });
+
+    if (modalSecondary) modalSecondary.addEventListener('click', () => {
+      if (modalSecondaryHandler) modalSecondaryHandler();
+      closeModal();
+    });
+
+    if (infoModal) infoModal.addEventListener('click', event => {
+      if (event.target === infoModal) closeModal();
+    });
+
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && infoModal && infoModal.classList.contains('active')) closeModal();
+    });
+
+    const copyGroupNumber = async () => {
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(GROUP_NUMBER);
+        } else {
+          const helper = document.createElement('input');
+          helper.value = GROUP_NUMBER;
+          document.body.appendChild(helper);
+          helper.select();
+          document.execCommand('copy');
+          helper.remove();
+        }
+        showModal({
+          title: '群号已复制',
+          body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
+        });
+      } catch (_error) {
+        showModal({
+          title: '复制失败',
+          body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
+        });
+      }
+    };
+
+    document.querySelectorAll('[data-copy-group]').forEach(button => {
+      button.addEventListener('click', copyGroupNumber);
+    });
 
     if (fileInput && uploadTitle && uploadMeta) fileInput.addEventListener('change', () => {
       const file = fileInput.files[0];
@@ -1056,11 +1251,14 @@ PAGE = """
         progress = 100;
         progressBar.style.width = '100%';
         progressPercent.textContent = '100%';
-        progressMessage.textContent = '报告已开始下载';
+        progressMessage.textContent = '报告已下载成功';
         const noRemaining = remainingCount && Number(remainingCount.textContent) <= 0;
         submitButton.disabled = Boolean(noRemaining);
         submitButton.textContent = noRemaining ? '额度已用完' : '继续生成报告';
-        if (downloadDone) downloadDone.classList.add('active');
+        if (downloadDone) {
+          downloadDone.textContent = '报告已下载成功，请在浏览器中打开下载的 HTML 文件查看检测结果。';
+          downloadDone.classList.add('active');
+        }
       };
 
       const extractFilename = response => {
@@ -1106,6 +1304,10 @@ PAGE = """
         URL.revokeObjectURL(downloadUrl);
         updateRemainingCount(response);
         finishDownloadState();
+        showModal({
+          title: '下载成功',
+          body: '检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。'
+        });
       } catch (error) {
         finished = true;
         window.clearInterval(progressTimer);
