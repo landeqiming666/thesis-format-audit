@@ -3,7 +3,7 @@ create table if not exists public.thesis_audit_users (
   email text not null unique,
   password_hash text not null,
   submissions_used integer not null default 0,
-  submission_quota integer not null default 2,
+  submission_quota integer not null default 5,
   account_status text not null default 'active',
   is_admin boolean not null default false,
   invite_code text,
@@ -20,7 +20,7 @@ create table if not exists public.thesis_audit_users (
 );
 
 alter table public.thesis_audit_users
-add column if not exists submission_quota integer not null default 2;
+add column if not exists submission_quota integer not null default 5;
 
 alter table public.thesis_audit_users
 add column if not exists account_status text not null default 'active';
@@ -168,6 +168,24 @@ on public.thesis_audit_reports(user_id, created_at desc);
 create index if not exists thesis_audit_reports_college_created_at_idx
 on public.thesis_audit_reports(college_name, created_at desc);
 
+create table if not exists public.thesis_audit_events (
+  id uuid primary key default gen_random_uuid(),
+  event_type text not null,
+  user_id uuid references public.thesis_audit_users(id),
+  user_email text not null default '',
+  path text not null default '',
+  client_ip text not null default '',
+  user_agent text not null default '',
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists thesis_audit_events_type_created_at_idx
+on public.thesis_audit_events(event_type, created_at desc);
+
+create index if not exists thesis_audit_events_created_at_idx
+on public.thesis_audit_events(created_at desc);
+
 alter table public.thesis_audit_users enable row level security;
 
 alter table public.thesis_audit_admin_logs enable row level security;
@@ -175,6 +193,8 @@ alter table public.thesis_audit_admin_logs enable row level security;
 alter table public.thesis_audit_registration_codes enable row level security;
 
 alter table public.thesis_audit_reports enable row level security;
+
+alter table public.thesis_audit_events enable row level security;
 
 do $$
 begin
@@ -238,6 +258,23 @@ begin
   ) then
     create policy "service role can manage thesis audit reports"
     on public.thesis_audit_reports
+    for all
+    using (auth.role() = 'service_role')
+    with check (auth.role() = 'service_role');
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'thesis_audit_events'
+      and policyname = 'service role can manage thesis audit events'
+  ) then
+    create policy "service role can manage thesis audit events"
+    on public.thesis_audit_events
     for all
     using (auth.role() = 'service_role')
     with check (auth.role() = 'service_role');

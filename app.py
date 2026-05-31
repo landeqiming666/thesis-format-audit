@@ -15,7 +15,7 @@ import ssl
 import subprocess
 import tempfile
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -62,7 +62,7 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-MAX_SUBMISSIONS = 2
+MAX_SUBMISSIONS = 5
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 MAX_TRACKED_USER_AGENT_LENGTH = 320
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
@@ -113,6 +113,7 @@ SUPABASE_TABLE = "thesis_audit_users"
 ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
 REPORTS_TABLE = "thesis_audit_reports"
 REGISTRATION_CODES_TABLE = "thesis_audit_registration_codes"
+EVENTS_TABLE = "thesis_audit_events"
 REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
 GMAIL_SMTP_HOST = os.environ.get("GMAIL_SMTP_HOST", "smtp.gmail.com")
 GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT", "465"))
@@ -140,6 +141,7 @@ REPORT_COLUMNS = (
     "report_size_bytes,report_sha256,created_at"
 )
 REGISTRATION_CODE_COLUMNS = "id,code,note,max_uses,used_count,is_active,created_by,created_at"
+EVENT_COLUMNS = "id,event_type,user_id,user_email,path,client_ip,user_agent,metadata,created_at"
 _GCS_CLIENT = None
 ADMIN_SORT_OPTIONS = {
     "created_desc",
@@ -1353,6 +1355,122 @@ def summarize_admin_stats(users: list[dict]) -> dict:
         "admins": sum(1 for item in users if item.get("is_admin")),
         "invited": sum(1 for item in users if item.get("invited_by")),
         "invite_rewards": sum(int(item.get("invite_count", 0)) for item in users),
+    }
+
+
+def parse_datetime_value(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    if re.search(r"[+-]\d{2}$", normalized):
+        normalized = f"{normalized}:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(CHINA_TZ)
+
+
+def day_key(value: str | None) -> str:
+    parsed = parse_datetime_value(value)
+    return parsed.strftime("%m-%d") if parsed else "未知"
+
+
+def list_events_for_admin(limit: int = 3000) -> list[dict]:
+    try:
+        result = (
+            get_supabase()
+            .table(EVENTS_TABLE)
+            .select(EVENT_COLUMNS)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception:
+        app.logger.warning("Failed to load analytics events", exc_info=True)
+        return []
+
+
+def record_event(event_type: str, user: dict | None = None, metadata: dict | None = None) -> None:
+    try:
+        payload = {
+            "event_type": event_type[:60],
+            "user_id": user.get("id") if user else None,
+            "user_email": user.get("email", "") if user else "",
+            "path": request.path[:200] if has_request_context() else "",
+            "client_ip": client_ip(),
+            "user_agent": request_user_agent(),
+            "metadata": metadata or {},
+        }
+        get_supabase().table(EVENTS_TABLE).insert(payload).execute()
+    except Exception:
+        app.logger.debug("Failed to record analytics event %s", event_type, exc_info=True)
+
+
+def summarize_traffic_stats(users: list[dict], reports: list[dict], events: list[dict]) -> dict:
+    now = datetime.now(CHINA_TZ)
+
+    def in_days(item: dict, days: int) -> bool:
+        parsed = parse_datetime_value(item.get("created_at"))
+        return bool(parsed and parsed >= now - timedelta(days=days))
+
+    success_reports = [item for item in reports if item.get("status") == "success"]
+    event_types = Counter(item.get("event_type", "") for item in events)
+    report_ips = {item.get("client_ip", "") for item in reports if item.get("client_ip")}
+    event_ips = {item.get("client_ip", "") for item in events if item.get("client_ip")}
+    report_user_ids = {item.get("user_id", "") for item in reports if item.get("user_id")}
+    report_emails = {item.get("user_email", "") for item in reports if item.get("user_email")}
+
+    daily_reports: Counter[str] = Counter()
+    daily_visits: Counter[str] = Counter()
+    for item in reports:
+        daily_reports[day_key(item.get("created_at"))] += 1
+    for item in events:
+        if item.get("event_type") in ("page_view", "audit_submit", "audit_success", "audit_failed", "login_success", "register_success"):
+            daily_visits[day_key(item.get("created_at"))] += 1
+
+    recent_days = []
+    daily_peak = max([daily_visits.get((now - timedelta(days=offset)).strftime("%m-%d"), 0) + daily_reports.get((now - timedelta(days=offset)).strftime("%m-%d"), 0) for offset in range(13, -1, -1)] or [0])
+    for offset in range(13, -1, -1):
+        label = (now - timedelta(days=offset)).strftime("%m-%d")
+        visits = daily_visits.get(label, 0)
+        reports_count = daily_reports.get(label, 0)
+        recent_days.append(
+            {
+                "date": label,
+                "visits": visits,
+                "reports": reports_count,
+                "bar_percent": round(((visits + reports_count) / daily_peak) * 100, 1) if daily_peak else 0,
+            }
+        )
+
+    success_rate = round(len(success_reports) * 100 / len(reports), 1) if reports else 0
+    total_original_bytes = sum(int(item.get("original_size_bytes") or 0) for item in reports)
+    return {
+        "events_enabled": bool(events),
+        "page_views": event_types.get("page_view", 0),
+        "unique_ips": len(report_ips | event_ips),
+        "registered_users": len(users),
+        "active_users": len(report_user_ids | report_emails),
+        "total_reports": len(reports),
+        "success_reports": len(success_reports),
+        "success_rate": success_rate,
+        "today_reports": sum(1 for item in reports if in_days(item, 1)),
+        "week_reports": sum(1 for item in reports if in_days(item, 7)),
+        "month_reports": sum(1 for item in reports if in_days(item, 30)),
+        "today_events": sum(1 for item in events if in_days(item, 1)),
+        "week_events": sum(1 for item in events if in_days(item, 7)),
+        "month_events": sum(1 for item in events if in_days(item, 30)),
+        "login_success": event_types.get("login_success", 0),
+        "register_success": event_types.get("register_success", 0),
+        "audit_submit": event_types.get("audit_submit", 0),
+        "audit_success": event_types.get("audit_success", 0),
+        "audit_failed": event_types.get("audit_failed", 0),
+        "storage_gb": round(total_original_bytes / (1024 ** 3), 2),
+        "daily": recent_days,
     }
 
 
@@ -3040,6 +3158,92 @@ ADMIN_PAGE = """
       gap: 16px;
       margin-bottom: 20px;
     }
+    .traffic-panel {
+      margin-bottom: 20px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(16px);
+    }
+    .traffic-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--line);
+    }
+    .traffic-head h2 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      letter-spacing: -.02em;
+    }
+    .traffic-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .traffic-card {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+      background: rgba(255, 255, 255, .64);
+    }
+    .traffic-value {
+      display: block;
+      font-size: 28px;
+      font-weight: 900;
+      letter-spacing: -.02em;
+      line-height: 1;
+    }
+    .traffic-label {
+      display: block;
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .traffic-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(260px, .7fr);
+      gap: 18px;
+      padding: 18px;
+    }
+    .traffic-days {
+      display: grid;
+      gap: 8px;
+    }
+    .traffic-day {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr) 112px;
+      gap: 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .traffic-track {
+      height: 9px;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--line) 70%, transparent);
+    }
+    .traffic-fill {
+      width: var(--bar, 0%);
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--gold) 70%, var(--accent)));
+    }
+    .traffic-note {
+      padding: 16px;
+      border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+      color: var(--accent-strong);
+      font-size: 13px;
+      line-height: 1.8;
+    }
     .stat-card {
       padding: 20px 22px;
       border: 1px solid var(--line);
@@ -3621,6 +3825,12 @@ ADMIN_PAGE = """
       .stats {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
+      .traffic-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .traffic-body {
+        grid-template-columns: 1fr;
+      }
       .toolbar {
         grid-template-columns: 1fr 1fr 1fr;
       }
@@ -3658,6 +3868,22 @@ ADMIN_PAGE = """
       }
       .stats {
         grid-template-columns: 1fr;
+      }
+      .traffic-head,
+      .traffic-body {
+        grid-template-columns: 1fr;
+      }
+      .traffic-head {
+        flex-direction: column;
+      }
+      .traffic-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+      .traffic-day {
+        grid-template-columns: 52px minmax(0, 1fr);
+      }
+      .traffic-day span:last-child {
+        grid-column: 2;
       }
       .toolbar {
         grid-template-columns: 1fr;
@@ -3728,6 +3954,53 @@ ADMIN_PAGE = """
       </div>
     </div>
     <div id="admin-notice" class="notice" {% if not message %}hidden{% endif %}>{{ message }}</div>
+    <section class="traffic-panel">
+      <div class="traffic-head">
+        <div>
+          <h2>流量与使用频率</h2>
+          <div class="log-meta">面向广告合作的数据看板：访问、人流、检测量、活跃用户和转化情况。新访问日志上线前的历史 PV 会偏少，检测量和用户量来自已有记录。</div>
+        </div>
+        <div class="traffic-note">
+          {% if traffic_stats["events_enabled"] %}
+            已启用访问事件追踪，后续会持续记录页面访问、注册、登录和检测转化。
+          {% else %}
+            访问事件表暂无数据；当前先展示历史检测和用户数据，部署后会开始积累真实 PV/UV。
+          {% endif %}
+        </div>
+      </div>
+      <div class="traffic-grid">
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["page_views"] }}</span><span class="traffic-label">页面访问 PV</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["unique_ips"] }}</span><span class="traffic-label">独立 IP / 人流</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["registered_users"] }}</span><span class="traffic-label">注册用户</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["active_users"] }}</span><span class="traffic-label">检测用户</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["total_reports"] }}</span><span class="traffic-label">累计检测</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["success_rate"] }}%</span><span class="traffic-label">检测成功率</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["today_reports"] }}</span><span class="traffic-label">近 24 小时检测</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["week_reports"] }}</span><span class="traffic-label">近 7 天检测</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["month_reports"] }}</span><span class="traffic-label">近 30 天检测</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["login_success"] }}</span><span class="traffic-label">登录成功</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["register_success"] }}</span><span class="traffic-label">注册成功</span></div>
+        <div class="traffic-card"><span class="traffic-value">{{ traffic_stats["storage_gb"] }}GB</span><span class="traffic-label">原文归档量</span></div>
+      </div>
+      <div class="traffic-body">
+        <div>
+          <div class="section-label">近 14 天趋势</div>
+          <div class="traffic-days">
+            {% for day in traffic_stats["daily"] %}
+              <div class="traffic-day">
+                <span>{{ day["date"] }}</span>
+                <div class="traffic-track"><div class="traffic-fill" style="--bar: {{ day['bar_percent'] }}%;"></div></div>
+                <span>访问 {{ day["visits"] }} · 检测 {{ day["reports"] }}</span>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="traffic-note">
+          <strong>给广告商可用口径</strong><br>
+          注册用户 {{ traffic_stats["registered_users"] }} 人，累计检测 {{ traffic_stats["total_reports"] }} 次，近 7 天检测 {{ traffic_stats["week_reports"] }} 次，近 30 天检测 {{ traffic_stats["month_reports"] }} 次。独立 IP 当前按检测记录和访问事件合并统计，为 {{ traffic_stats["unique_ips"] }}。
+        </div>
+      </div>
+    </section>
     <section class="stats">
       <div class="stat-card">
         <span class="stat-label">总用户数</span>
@@ -5255,6 +5528,7 @@ ADMIN_REPORTS_PAGE = """
 
 @app.get("/")
 def index() -> str:
+    record_event("page_view", current_user(), {"auth_mode": request.args.get("auth", "")})
     return render_home()
 
 
@@ -5336,6 +5610,7 @@ def register():
             app.logger.warning("Failed to award invite bonus for inviter %s", inviter["id"], exc_info=True)
     clear_email_code()
     session["user_id"] = user["id"]
+    record_event("register_success", user, {"registration_code": consumed_code.get("code", ""), "invited": bool(inviter)})
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
 
@@ -5409,6 +5684,7 @@ def login():
     except Exception:
         app.logger.warning("Failed to update login trace for user %s", user["id"], exc_info=True)
     session["user_id"] = user["id"]
+    record_event("login_success", user)
     return redirect(url_for("index", auth_token=generate_auth_token(user["id"])))
 
 
@@ -5427,6 +5703,8 @@ def admin():
     table_state = admin_table_state(token)
     all_users = attach_invite_stats([enrich_admin_user(item) for item in list_users()])
     stats = summarize_admin_stats(all_users)
+    all_reports = list_reports_for_admin()
+    traffic_stats = summarize_traffic_stats(all_users, all_reports, list_events_for_admin())
     filtered_users = apply_admin_user_filters(all_users, table_state)
     sorted_users = sort_admin_users(filtered_users, table_state["sort"])
     users, pagination = paginate_items(sorted_users, table_state["page"], table_state["per_page"])
@@ -5439,6 +5717,7 @@ def admin():
         admin_user=user,
         users=users,
         stats=stats,
+        traffic_stats=traffic_stats,
         recent_logs=recent_logs,
         registration_codes=registration_codes,
         table_state={**table_state, "page": pagination["page"]},
@@ -5853,6 +6132,7 @@ def audit():
     names = uploaded_word_names(upload.filename)
     _safe_name, download_name = names
     original_filename = upload.filename.strip() or "thesis.docx"
+    record_event("audit_submit", user, {"filename": original_filename})
     try:
         update_user_audit_trace(user["id"])
     except Exception:
@@ -5867,6 +6147,7 @@ def audit():
         try:
             audit_docx_path = prepare_docx_for_audit(upload_path, original_filename, tmp_path)
         except Exception as exc:
+            record_event("audit_failed", user, {"filename": original_filename, "stage": "prepare", "error": str(exc)[:240]})
             return audit_reject(f"{exc}", 400)
 
         original_archive = archive_original_upload(user, upload_path, original_filename)
@@ -5895,6 +6176,7 @@ def audit():
                 )
             except Exception:
                 app.logger.warning("Failed to create failed report record for user %s", user["id"], exc_info=True)
+            record_event("audit_failed", user, {"filename": original_filename, "stage": "audit", "error": error_message[:240], "college": college_info["college_name"]})
             return audit_error_response(exc)
 
         report_bytes = report_path.read_bytes()
@@ -5953,6 +6235,17 @@ def audit():
         increment_submissions(user["id"])
         fresh_user = find_user_by_id(user["id"])
         remaining = remaining_submissions(fresh_user)
+        record_event(
+            "audit_success",
+            user,
+            {
+                "filename": original_filename,
+                "status": report_status,
+                "college": college_info["college_name"],
+                "remaining": remaining,
+                "original_size_bytes": original_archive["original_size_bytes"],
+            },
+        )
 
         response = send_file(io.BytesIO(report_bytes), as_attachment=True, download_name=download_name, mimetype="text/html")
         response.headers["X-Remaining-Submissions"] = str(remaining)
