@@ -9,8 +9,10 @@ import os
 import queue
 import random
 import re
+import shutil
 import smtplib
 import ssl
+import subprocess
 import tempfile
 import time
 from collections import defaultdict
@@ -52,6 +54,7 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "32"))
 MAX_DOCX_ENTRIES = int(os.environ.get("MAX_DOCX_ENTRIES", "1500"))
 MAX_DOCX_UNCOMPRESSED_MB = int(os.environ.get("MAX_DOCX_UNCOMPRESSED_MB", "180"))
 AUDIT_TIMEOUT_SECONDS = int(os.environ.get("AUDIT_TIMEOUT_SECONDS", "105"))
+DOC_CONVERT_TIMEOUT_SECONDS = int(os.environ.get("DOC_CONVERT_TIMEOUT_SECONDS", "60"))
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
@@ -70,6 +73,10 @@ ACCOUNT_STATUS_ACTIVE = "active"
 ACCOUNT_STATUS_FROZEN = "frozen"
 ACCOUNT_STATUS_DISABLED = "disabled"
 CHINA_TZ = timezone(timedelta(hours=8))
+WORD_UPLOAD_EXTENSIONS = {".doc", ".docx"}
+DOCX_MIMETYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOC_MIMETYPE = "application/msword"
+SOFFICE_BINARY = os.environ.get("SOFFICE_BINARY", "").strip() or shutil.which("soffice") or shutil.which("libreoffice")
 UNKNOWN_COLLEGE = "未识别"
 COLLEGE_ALIASES = {
     "信息科学与工程学院": ("信息科学与工程学院", "计算机科学与技术学院", "软件学院", "人工智能学院", "网信学院"),
@@ -159,16 +166,17 @@ LEGACY_ADMIN_EMAILS = {
 }
 
 
-def uploaded_docx_names(filename: str) -> tuple[str, str]:
+def uploaded_word_names(filename: str) -> tuple[str, str]:
     raw_name = (filename or "").strip()
     safe_name = secure_filename(raw_name)
     if not safe_name:
         safe_name = "thesis.docx"
-    elif not safe_name.lower().endswith(".docx"):
+    elif Path(safe_name).suffix.lower() not in WORD_UPLOAD_EXTENSIONS:
         safe_name = f"{safe_name}.docx"
     display_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
-    if display_name.lower().endswith(".docx"):
-        display_stem = display_name[:-5].strip()
+    display_suffix = Path(display_name).suffix.lower()
+    if display_suffix in WORD_UPLOAD_EXTENSIONS:
+        display_stem = display_name[: -len(display_suffix)].strip()
     else:
         display_stem = Path(display_name).stem.strip() if display_name else ""
     display_stem = display_stem or Path(safe_name).stem or "thesis"
@@ -202,6 +210,69 @@ def validate_docx_package(path: Path) -> None:
                 raise ValueError(f"这个 .docx 解压后超过 {MAX_DOCX_UNCOMPRESSED_MB}MB，建议先压缩图片后再上传。")
     except BadZipFile as exc:
         raise ValueError("这个文件后缀是 .docx，但内部不是有效的 Word 文档包，可能是损坏文件、网页改后缀或旧版 .doc 直接改名。请用 Word/WPS 打开原文，选择“另存为”真正的 .docx 后再上传。") from exc
+
+
+def sniff_word_upload_kind(path: Path, filename: str = "") -> str:
+    suffix = Path(filename or "").suffix.lower()
+    header = path.read_bytes()[:8]
+    if header.startswith(b"PK"):
+        return "docx"
+    if header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "doc"
+    if suffix == ".docx":
+        return "docx"
+    if suffix == ".doc":
+        return "doc"
+    return ""
+
+
+def convert_doc_to_docx(source_path: Path, work_dir: Path) -> Path:
+    if not SOFFICE_BINARY:
+        raise ValueError("服务器暂时没有安装 Word 转换组件，无法检测 .doc 文件。请先另存为 .docx 后上传。")
+    converted_dir = work_dir / "converted"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+    conversion_source = source_path
+    if conversion_source.suffix.lower() != ".doc":
+        conversion_source = work_dir / f"{source_path.stem or uuid4().hex}.doc"
+        shutil.copyfile(source_path, conversion_source)
+    command = [
+        SOFFICE_BINARY,
+        "--headless",
+        "--convert-to",
+        "docx",
+        "--outdir",
+        str(converted_dir),
+        str(conversion_source),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=DOC_CONVERT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("这个 .doc 文件转换超时，请在 Word/WPS 中另存为 .docx 后再上传。") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        app.logger.warning("DOC conversion failed: %s", detail)
+        raise ValueError("这个 .doc 文件无法自动转换，请在 Word/WPS 中另存为 .docx 后再上传。")
+    candidates = sorted(converted_dir.glob("*.docx"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise ValueError("这个 .doc 文件转换后没有生成有效 .docx，请在 Word/WPS 中另存为 .docx 后再上传。")
+    validate_docx_package(candidates[0])
+    return candidates[0]
+
+
+def prepare_docx_for_audit(upload_path: Path, original_filename: str, work_dir: Path) -> Path:
+    kind = sniff_word_upload_kind(upload_path, original_filename)
+    if kind == "docx":
+        validate_docx_package(upload_path)
+        return upload_path
+    if kind == "doc":
+        return convert_doc_to_docx(upload_path, work_dir)
+    raise ValueError("当前只支持 .doc 或 .docx 文件。请上传 Word 文档，或在 Word/WPS 中另存为 .docx 后再试。")
 
 
 def compact_docx_text(value: str) -> str:
@@ -292,22 +363,26 @@ def safe_extract_college_from_docx(path: Path) -> dict:
         return {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
 
 
-def archive_original_upload(user: dict, docx_path: Path, original_filename: str) -> dict:
-    original_bytes = docx_path.read_bytes()
+def original_content_type(filename: str) -> str:
+    return DOC_MIMETYPE if Path(filename or "").suffix.lower() == ".doc" else DOCX_MIMETYPE
+
+
+def archive_original_upload(user: dict, upload_path: Path, original_filename: str) -> dict:
+    original_bytes = upload_path.read_bytes()
     storage_path = original_storage_path_for(user, original_filename)
     archive_path = storage_path
     storage_backend = ""
     gcs_path = ""
     try:
-        storage_backend = upload_original_to_storage(storage_path, original_bytes)
+        storage_backend = upload_original_to_storage(storage_path, original_bytes, original_content_type(original_filename))
     except Exception:
         storage_path = ""
-        app.logger.warning("Failed to upload original docx to Supabase for user %s", user["id"], exc_info=True)
+        app.logger.warning("Failed to upload original Word file to Supabase for user %s", user["id"], exc_info=True)
     if gcs_is_configured():
         try:
-            gcs_path = upload_original_to_gcs(user, archive_path, original_bytes)
+            gcs_path = upload_original_to_gcs(user, archive_path, original_bytes, original_content_type(original_filename))
         except Exception:
-            app.logger.warning("Failed to upload original docx to GCS for user %s", user["id"], exc_info=True)
+            app.logger.warning("Failed to upload original Word file to GCS for user %s", user["id"], exc_info=True)
     return {
         "original_storage_backend": storage_backend,
         "original_storage_path": storage_path,
@@ -971,11 +1046,11 @@ def upload_report_to_storage(storage_path: str, report_bytes: bytes) -> str:
     return "supabase"
 
 
-def upload_original_to_storage(storage_path: str, original_bytes: bytes) -> str:
+def upload_original_to_storage(storage_path: str, original_bytes: bytes, content_type: str = DOCX_MIMETYPE) -> str:
     upload_to_supabase_storage(
         storage_path,
         original_bytes,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content_type,
     )
     return "supabase"
 
@@ -986,12 +1061,12 @@ def upload_report_to_gcs(user: dict, storage_path: str, report_bytes: bytes) -> 
     return object_path
 
 
-def upload_original_to_gcs(user: dict, storage_path: str, original_bytes: bytes) -> str:
+def upload_original_to_gcs(user: dict, storage_path: str, original_bytes: bytes, content_type: str = DOCX_MIMETYPE) -> str:
     object_path = gcs_object_path("originals", user, storage_path)
     upload_to_gcs_storage(
         object_path,
         original_bytes,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content_type,
     )
     return object_path
 
@@ -2233,7 +2308,7 @@ PAGE = """
         <h1>UPC本科论文格式检测工具</h1>
         <p class="lead">上传 Word 论文，系统会检查摘要、目录、标题、正文、图表、公式、参考文献和页码，并生成可交互的 HTML 报告。</p>
         <ul class="facts">
-          <li>仅支持 .docx</li>
+          <li>支持 .doc / .docx</li>
           <li>单文件 32MB 内</li>
           <li>检测过程不改原文</li>
         </ul>
@@ -2278,10 +2353,10 @@ PAGE = """
                 <span class="upload-icon">↑</span>
                 <span>
                   <span id="upload-title" class="upload-title">点击选择 Word 论文</span>
-                  <span id="upload-meta" class="upload-meta">支持 .docx，文件选择后会显示名称；生成完成后自动下载 HTML 报告。</span>
+                  <span id="upload-meta" class="upload-meta">支持 .doc / .docx，旧版 .doc 会自动转换后检测；生成完成后自动下载 HTML 报告。</span>
                 </span>
               </label>
-              <input id="docx" name="docx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required>
+              <input id="docx" name="docx" type="file" accept=".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required>
               <button id="submit-button" type="submit">生成检测报告</button>
               <div id="progress-wrap" class="progress-wrap" role="status" aria-live="polite">
                 <div class="progress-head">
@@ -5754,7 +5829,7 @@ def download_original(report_id: str):
         io.BytesIO(original_bytes),
         as_attachment=True,
         download_name=report.get("original_filename") or "thesis.docx",
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        mimetype=original_content_type(report.get("original_filename") or "thesis.docx"),
     )
 
 
@@ -5773,9 +5848,9 @@ def audit():
 
     upload = request.files.get("docx")
     if not upload or not upload.filename:
-        return audit_reject("请先选择一个 .docx 文件。", 400)
+        return audit_reject("请先选择一个 .doc 或 .docx 文件。", 400)
 
-    names = uploaded_docx_names(upload.filename)
+    names = uploaded_word_names(upload.filename)
     _safe_name, download_name = names
     original_filename = upload.filename.strip() or "thesis.docx"
     try:
@@ -5785,21 +5860,21 @@ def audit():
 
     with tempfile.TemporaryDirectory(prefix="thesis-audit-") as tmp:
         tmp_path = Path(tmp)
-        docx_path = tmp_path / f"{uuid4().hex}.docx"
+        upload_path = tmp_path / f"{uuid4().hex}_{secure_filename(original_filename) or 'thesis'}"
         report_path = tmp_path / download_name
-        upload.save(docx_path)
+        upload.save(upload_path)
 
         try:
-            validate_docx_package(docx_path)
+            audit_docx_path = prepare_docx_for_audit(upload_path, original_filename, tmp_path)
         except Exception as exc:
             return audit_reject(f"{exc}", 400)
 
-        original_archive = archive_original_upload(user, docx_path, original_filename)
+        original_archive = archive_original_upload(user, upload_path, original_filename)
         college_info = {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
 
         try:
-            college_info = safe_extract_college_from_docx(docx_path)
-            run_audit_with_timeout(docx_path, report_path)
+            college_info = safe_extract_college_from_docx(audit_docx_path)
+            run_audit_with_timeout(audit_docx_path, report_path)
         except Exception as exc:
             error_message = f"{exc}"
             try:
