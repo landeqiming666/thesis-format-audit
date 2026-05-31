@@ -29,7 +29,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from zipfile import BadZipFile, ZipFile
 
-from thesis_format_audit import run_audit
+from thesis_format_audit import open_docx_document, run_audit
 
 try:
     from dotenv import load_dotenv
@@ -70,6 +70,28 @@ ACCOUNT_STATUS_ACTIVE = "active"
 ACCOUNT_STATUS_FROZEN = "frozen"
 ACCOUNT_STATUS_DISABLED = "disabled"
 CHINA_TZ = timezone(timedelta(hours=8))
+UNKNOWN_COLLEGE = "未识别"
+COLLEGE_ALIASES = {
+    "信息科学与工程学院": ("信息科学与工程学院", "计算机科学与技术学院", "软件学院", "人工智能学院", "网信学院"),
+    "石油工程学院": ("石油工程学院",),
+    "化学化工学院": ("化学化工学院", "化工学院"),
+    "机电工程学院": ("机电工程学院",),
+    "储运与建筑工程学院": ("储运与建筑工程学院", "储运学院", "建筑工程学院"),
+    "地球科学与技术学院": ("地球科学与技术学院", "地学院"),
+    "地球物理学院": ("地球物理学院",),
+    "新能源学院": ("新能源学院",),
+    "材料科学与工程学院": ("材料科学与工程学院", "材料学院"),
+    "海洋与空间信息学院": ("海洋与空间信息学院",),
+    "控制科学与工程学院": ("控制科学与工程学院", "控制学院"),
+    "经济管理学院": ("经济管理学院", "经管学院"),
+    "理学院": ("理学院",),
+    "外国语学院": ("外国语学院",),
+    "文法学院": ("文法学院",),
+    "马克思主义学院": ("马克思主义学院",),
+    "体育教学部": ("体育教学部", "体育学院"),
+}
+COLLEGE_LABEL_PATTERN = re.compile(r"(?:所在)?(?:学院|院系|院（系）|院\(系\)|培养单位|教学单位|系别)\s*[:：]?\s*(.{0,40})")
+COLLEGE_NAME_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9（）()·]{2,30}(?:学院|教学部))")
 RATE_LIMITS = {
     "login": (10, 5 * 60),
     "register": (5, 60 * 60),
@@ -106,7 +128,7 @@ ADMIN_USER_COLUMNS = (
 )
 REPORT_COLUMNS = (
     "id,user_id,user_email,original_filename,report_filename,report_storage_path,status,"
-    "error_message,client_ip,user_agent,original_storage_backend,original_storage_path,"
+    "error_message,college_name,college_source,college_raw_text,client_ip,user_agent,original_storage_backend,original_storage_path,"
     "original_gcs_path,original_size_bytes,original_sha256,report_storage_backend,report_gcs_path,"
     "report_size_bytes,report_sha256,created_at"
 )
@@ -170,6 +192,94 @@ def validate_docx_package(path: Path) -> None:
                 raise ValueError(f"这个 .docx 解压后超过 {MAX_DOCX_UNCOMPRESSED_MB}MB，建议先压缩图片后再上传。")
     except BadZipFile as exc:
         raise ValueError("这个文件后缀是 .docx，但内部不是有效的 Word 文档包，可能是损坏文件、网页改后缀或旧版 .doc 直接改名。请用 Word/WPS 打开原文，选择“另存为”真正的 .docx 后再上传。") from exc
+
+
+def compact_docx_text(value: str) -> str:
+    return re.sub(r"\s+", "", value or "")
+
+
+def readable_docx_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def normalize_college_candidate(value: str) -> str:
+    text = readable_docx_text(value)
+    text = re.sub(r"^(?:所在)?(?:学院|院系|院（系）|院\(系\)|培养单位|教学单位|系别)\s*[:：]?\s*", "", text)
+    text = text.strip("：:;；,，。[]【】()（） \t\r\n")
+    for delimiter in ("专业", "班级", "学生", "姓名", "学号", "题目", "论文", "指导", "日期", "年级", "届"):
+        if delimiter in text:
+            text = text.split(delimiter, 1)[0]
+    return compact_docx_text(text).strip("：:;；,，。[]【】()（）")
+
+
+def identify_college_from_text(value: str) -> str:
+    text = compact_docx_text(value)
+    if not text:
+        return ""
+    for canonical, aliases in COLLEGE_ALIASES.items():
+        if any(compact_docx_text(alias) in text for alias in aliases):
+            return canonical
+    label_match = COLLEGE_LABEL_PATTERN.search(value)
+    if label_match:
+        normalized = normalize_college_candidate(label_match.group(1))
+        if normalized:
+            alias_match = identify_college_from_text(normalized)
+            if alias_match:
+                return alias_match
+            name_match = COLLEGE_NAME_PATTERN.search(normalized)
+            if name_match:
+                return normalize_college_candidate(name_match.group(1))
+    for name in COLLEGE_NAME_PATTERN.findall(value):
+        normalized = normalize_college_candidate(name)
+        if normalized and "大学" not in normalized and len(normalized) <= 24:
+            return normalized
+    return ""
+
+
+def first_docx_cover_texts(path: Path, paragraph_limit: int = 80, table_limit: int = 8) -> list[dict]:
+    texts: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="docx-college-") as tmp:
+        doc, _compatible_path = open_docx_document(path, Path(tmp))
+        for paragraph in doc.paragraphs[:paragraph_limit]:
+            text = readable_docx_text(paragraph.text)
+            if text:
+                texts.append({"text": text, "source": "封面段落"})
+        for table_index, table in enumerate(doc.tables[:table_limit], start=1):
+            for row in table.rows[:24]:
+                cells = [readable_docx_text(cell.text) for cell in row.cells]
+                cells = [cell for cell in cells if cell]
+                if not cells:
+                    continue
+                for cell_index, cell in enumerate(cells):
+                    texts.append({"text": cell, "source": f"封面表格{table_index}"})
+                    if re.fullmatch(r"(?:所在)?(?:学院|院系|院（系）|院\(系\)|培养单位|教学单位|系别)[:：]?", compact_docx_text(cell)):
+                        for next_cell in cells[cell_index + 1:]:
+                            if next_cell:
+                                texts.append({"text": f"学院：{next_cell}", "source": f"封面表格{table_index}"})
+                                break
+                if len(cells) > 1:
+                    texts.append({"text": " ".join(cells), "source": f"封面表格{table_index}"})
+    return texts
+
+
+def extract_college_from_docx(path: Path) -> dict:
+    for item in first_docx_cover_texts(path):
+        college = identify_college_from_text(item["text"])
+        if college:
+            return {
+                "college_name": college,
+                "college_source": item["source"],
+                "college_raw_text": item["text"][:240],
+            }
+    return {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
+
+
+def safe_extract_college_from_docx(path: Path) -> dict:
+    try:
+        return extract_college_from_docx(path)
+    except Exception:
+        app.logger.warning("Failed to extract college from uploaded docx", exc_info=True)
+        return {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
 
 
 def archive_original_upload(user: dict, docx_path: Path, original_filename: str) -> dict:
@@ -761,6 +871,9 @@ def create_report_record(
     original_filename: str,
     report_filename: str,
     status: str,
+    college_name: str = UNKNOWN_COLLEGE,
+    college_source: str = "",
+    college_raw_text: str = "",
     report_storage_path: str = "",
     original_storage_backend: str = "",
     original_storage_path: str = "",
@@ -785,6 +898,9 @@ def create_report_record(
                 "report_storage_path": report_storage_path,
                 "status": status,
                 "error_message": error_message,
+                "college_name": college_name or UNKNOWN_COLLEGE,
+                "college_source": college_source,
+                "college_raw_text": college_raw_text[:240],
                 "client_ip": client_ip(),
                 "user_agent": request_user_agent(),
                 "original_storage_backend": original_storage_backend,
@@ -1033,6 +1149,7 @@ def build_reports_url(auth_token: str, state: dict, endpoint: str, **overrides) 
         "auth_token": auth_token,
         "q": state["q"],
         "status": state["status"],
+        "college": state.get("college", "all"),
         "page": state["page"],
     }
     params.update(overrides)
@@ -1154,9 +1271,41 @@ def summarize_admin_stats(users: list[dict]) -> dict:
     }
 
 
+def summarize_report_colleges(reports: list[dict]) -> dict:
+    counts: defaultdict[str, int] = defaultdict(int)
+    success_counts: defaultdict[str, int] = defaultdict(int)
+    for item in reports:
+        college = item.get("college_name") or UNKNOWN_COLLEGE
+        counts[college] += 1
+        if item.get("status") == "success":
+            success_counts[college] += 1
+    top_count = max(counts.values(), default=0)
+    rows = [
+        {
+            "college": college,
+            "count": count,
+            "success": success_counts[college],
+            "percent": round((count / len(reports)) * 100, 1) if reports else 0,
+            "bar_percent": round((count / top_count) * 100, 1) if top_count else 0,
+        }
+        for college, count in counts.items()
+    ]
+    rows.sort(key=lambda item: (-item["count"], item["college"] == UNKNOWN_COLLEGE, item["college"]))
+    return {
+        "rows": rows,
+        "top": rows[0] if rows else {"college": "暂无", "count": 0, "success": 0, "percent": 0},
+        "unknown": counts.get(UNKNOWN_COLLEGE, 0),
+        "known": len(reports) - counts.get(UNKNOWN_COLLEGE, 0),
+        "options": [item["college"] for item in rows],
+    }
+
+
 def enrich_report_item(item: dict) -> dict:
     enriched = dict(item)
     enriched["created_at_display"] = format_datetime_display(item.get("created_at", ""))
+    enriched["college_name"] = item.get("college_name") or UNKNOWN_COLLEGE
+    enriched["college_source"] = item.get("college_source") or ""
+    enriched["college_raw_text"] = item.get("college_raw_text") or ""
     enriched["original_size_display"] = format_bytes(int(item.get("original_size_bytes") or 0))
     enriched["report_size_display"] = format_bytes(int(item.get("report_size_bytes") or 0))
     enriched["original_sha_short"] = (item.get("original_sha256") or "")[:12]
@@ -1180,6 +1329,7 @@ def report_table_state() -> dict:
     return {
         "q": request.args.get("q", "").strip(),
         "status": (request.args.get("status", "all") or "all").strip().lower(),
+        "college": (request.args.get("college", "all") or "all").strip(),
         "page": parse_positive_int(request.args.get("page"), 1),
     }
 
@@ -1194,6 +1344,9 @@ def apply_report_filters(reports: list[dict], state: dict) -> list[dict]:
                 item.get("user_email", ""),
                 item.get("original_filename", ""),
                 item.get("report_filename", ""),
+                item.get("college_name", ""),
+                item.get("college_source", ""),
+                item.get("college_raw_text", ""),
                 item.get("client_ip", ""),
                 item.get("user_agent", ""),
                 item.get("created_at", ""),
@@ -1202,6 +1355,8 @@ def apply_report_filters(reports: list[dict], state: dict) -> list[dict]:
         if keyword and keyword not in haystack:
             continue
         if status != "all" and item.get("status") != status:
+            continue
+        if state.get("college", "all") != "all" and item.get("college_name", UNKNOWN_COLLEGE) != state["college"]:
             continue
         filtered.append(item)
     return filtered
@@ -4592,7 +4747,7 @@ ADMIN_REPORTS_PAGE = """
     }
     .summary {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
       gap: 16px;
       padding: 18px 22px;
       margin-bottom: 18px;
@@ -4614,7 +4769,7 @@ ADMIN_REPORTS_PAGE = """
     }
     .toolbar form {
       display: grid;
-      grid-template-columns: minmax(240px, 1fr) minmax(180px, 220px) auto auto;
+      grid-template-columns: minmax(240px, 1fr) minmax(160px, 210px) minmax(180px, 240px) auto auto;
       gap: 12px;
       width: 100%;
     }
@@ -4642,6 +4797,82 @@ ADMIN_REPORTS_PAGE = """
     }
     .panel {
       overflow: hidden;
+    }
+    .college-board {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr);
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+    .board-card {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 24px 72px var(--shadow);
+      backdrop-filter: blur(16px);
+      padding: 20px 22px;
+    }
+    .board-title {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .board-title h2 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+    .board-title .meta {
+      text-align: right;
+    }
+    .college-bars {
+      display: grid;
+      gap: 12px;
+    }
+    .college-row {
+      display: grid;
+      grid-template-columns: minmax(150px, 220px) minmax(120px, 1fr) 74px;
+      align-items: center;
+      gap: 12px;
+    }
+    .college-name {
+      color: var(--ink);
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .bar-track {
+      height: 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 46%, transparent);
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      min-width: 4px;
+      background: linear-gradient(90deg, var(--accent), #d29b48);
+    }
+    .college-count {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .insight-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .insight-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--surface-strong) 82%, transparent);
     }
     .pager-links {
       display: flex;
@@ -4726,6 +4957,17 @@ ADMIN_REPORTS_PAGE = """
       .toolbar form {
         grid-template-columns: 1fr;
       }
+      .college-board {
+        grid-template-columns: 1fr;
+      }
+      .college-row {
+        grid-template-columns: 1fr;
+        gap: 7px;
+      }
+      .college-count,
+      .board-title .meta {
+        text-align: left;
+      }
       .summary {
         grid-template-columns: 1fr;
       }
@@ -4760,17 +5002,63 @@ ADMIN_REPORTS_PAGE = """
       <div><span>成功报告</span><strong>{{ stats['success'] }}</strong></div>
       <div><span>检测失败</span><strong>{{ stats['audit_failed'] }}</strong></div>
       <div><span>存档失败</span><strong>{{ stats['storage_failed'] }}</strong></div>
+      <div><span>识别出学院</span><strong>{{ college_stats['known'] }}</strong></div>
+      <div><span>未识别学院</span><strong>{{ college_stats['unknown'] }}</strong></div>
+    </section>
+    <section class="college-board">
+      <div class="board-card">
+        <div class="board-title">
+          <div>
+            <h2>学院分布看板</h2>
+            <div class="meta">按每一次检测记录归类，同一个账号的不同报告会分别统计。</div>
+          </div>
+          <div class="meta">Top：{{ college_stats['top']['college'] }} · {{ college_stats['top']['count'] }} 次</div>
+        </div>
+        {% if college_stats['rows'] %}
+          <div class="college-bars">
+            {% for row in college_stats['rows'][:12] %}
+              <div class="college-row">
+                <div class="college-name" title="{{ row['college'] }}">{{ row['college'] }}</div>
+                <div class="bar-track" aria-label="{{ row['college'] }} {{ row['count'] }} 次">
+                  <div class="bar-fill" style="width: {{ row['bar_percent'] }}%;"></div>
+                </div>
+                <div class="college-count">{{ row['count'] }} 次 · {{ row['percent'] }}%</div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">还没有可统计的检测记录。</div>
+        {% endif %}
+      </div>
+      <div class="board-card">
+        <div class="board-title">
+          <h2>识别说明</h2>
+          <div class="meta">封面优先</div>
+        </div>
+        <div class="insight-list">
+          <div class="insight-item"><span>统计口径</span><strong>按报告</strong></div>
+          <div class="insight-item"><span>优先来源</span><strong>封面/表格</strong></div>
+          <div class="insight-item"><span>筛选结果</span><strong>{{ pagination['total'] }} 条</strong></div>
+          <div class="insight-item"><span>未识别处理</span><strong>单独归类</strong></div>
+        </div>
+      </div>
     </section>
     <section class="toolbar">
       <form method="get" action="{{ url_for('admin_reports') }}">
         <input name="auth_token" type="hidden" value="{{ auth_token }}">
         <input name="page" type="hidden" value="1">
-        <input class="field" name="q" type="search" value="{{ table_state['q'] }}" placeholder="搜索用户邮箱、原文件名、报告名或时间">
+        <input class="field" name="q" type="search" value="{{ table_state['q'] }}" placeholder="搜索用户邮箱、原文件名、报告名、学院或时间">
         <select class="select" name="status">
           <option value="all">全部状态</option>
           <option value="success" {% if table_state['status'] == 'success' %}selected{% endif %}>仅看成功</option>
           <option value="audit_failed" {% if table_state['status'] == 'audit_failed' %}selected{% endif %}>仅看检测失败</option>
           <option value="storage_failed" {% if table_state['status'] == 'storage_failed' %}selected{% endif %}>仅看存档失败</option>
+        </select>
+        <select class="select" name="college">
+          <option value="all">全部学院</option>
+          {% for college in college_stats['options'] %}
+            <option value="{{ college }}" {% if table_state['college'] == college %}selected{% endif %}>{{ college }}</option>
+          {% endfor %}
         </select>
         <button class="link-chip" type="submit">应用筛选</button>
         <a class="link-chip" href="{{ url_for('admin_reports', auth_token=auth_token) }}">重置</a>
@@ -4783,6 +5071,7 @@ ADMIN_REPORTS_PAGE = """
             <tr>
               <th>用户</th>
               <th>原文件名</th>
+              <th>学院</th>
               <th>状态</th>
               <th>生成时间</th>
               <th>来源</th>
@@ -4810,6 +5099,15 @@ ADMIN_REPORTS_PAGE = """
                     报告：{% if item['report_storage_path'] %}Supabase{% else %}未存 Supabase{% endif %}
                     {% if item['report_gcs_path'] %} / GCS{% endif %}
                   </div>
+                </td>
+                <td data-label="学院">
+                  <div>{{ item['college_name'] }}</div>
+                  {% if item['college_source'] %}
+                    <div class="meta">{{ item['college_source'] }}</div>
+                  {% endif %}
+                  {% if item['college_raw_text'] %}
+                    <div class="meta" title="{{ item['college_raw_text'] }}">{{ item['college_raw_text'] }}</div>
+                  {% endif %}
                 </td>
                 <td data-label="状态">
                   <span class="status {% if item['status'] == 'success' %}status-success{% elif item['status'] == 'storage_failed' %}status-storage{% else %}status-failed{% endif %}">
@@ -5332,6 +5630,7 @@ def my_reports():
         return redirect(url_for("index"))
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
     table_state = report_table_state()
+    table_state["college"] = "all"
     reports = [enrich_report_item(item) for item in list_reports_for_user(user["id"])]
     filtered_reports = apply_report_filters(reports, table_state)
     page_reports, pagination = paginate_items(filtered_reports, table_state["page"], 10)
@@ -5368,6 +5667,7 @@ def admin_reports():
     token = request.values.get("auth_token") or generate_auth_token(user["id"])
     table_state = report_table_state()
     reports = [enrich_report_item(item) for item in list_reports_for_admin()]
+    college_stats = summarize_report_colleges(reports)
     filtered_reports = apply_report_filters(reports, table_state)
     page_reports, pagination = paginate_items(filtered_reports, table_state["page"], 20)
     page_numbers = build_page_numbers(pagination["page"], pagination["pages"])
@@ -5382,6 +5682,7 @@ def admin_reports():
         auth_token=token,
         reports=page_reports,
         stats=stats,
+        college_stats=college_stats,
         table_state={**table_state, "page": pagination["page"]},
         pagination=pagination,
         page_numbers=page_numbers,
@@ -5478,9 +5779,11 @@ def audit():
         upload.save(docx_path)
 
         original_archive = archive_original_upload(user, docx_path, original_filename)
+        college_info = {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
 
         try:
             validate_docx_package(docx_path)
+            college_info = safe_extract_college_from_docx(docx_path)
             run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
             error_message = f"{exc}"
@@ -5490,6 +5793,9 @@ def audit():
                     original_filename=original_filename,
                     report_filename=download_name,
                     status="audit_failed",
+                    college_name=college_info["college_name"],
+                    college_source=college_info["college_source"],
+                    college_raw_text=college_info["college_raw_text"],
                     original_storage_backend=original_archive["original_storage_backend"],
                     original_storage_path=original_archive["original_storage_path"],
                     original_gcs_path=original_archive["original_gcs_path"],
@@ -5536,6 +5842,9 @@ def audit():
                 original_filename=original_filename,
                 report_filename=download_name,
                 status=report_status,
+                college_name=college_info["college_name"],
+                college_source=college_info["college_source"],
+                college_raw_text=college_info["college_raw_text"],
                 report_storage_path=storage_path,
                 original_storage_backend=original_archive["original_storage_backend"],
                 original_storage_path=original_archive["original_storage_path"],

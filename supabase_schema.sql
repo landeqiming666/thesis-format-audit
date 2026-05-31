@@ -103,6 +103,9 @@ create table if not exists public.thesis_audit_reports (
   report_storage_path text not null default '',
   status text not null default 'success',
   error_message text not null default '',
+  college_name text not null default '',
+  college_source text not null default '',
+  college_raw_text text not null default '',
   client_ip text not null default '',
   user_agent text not null default '',
   original_storage_backend text not null default '',
@@ -150,8 +153,20 @@ add column if not exists report_size_bytes bigint not null default 0;
 alter table public.thesis_audit_reports
 add column if not exists report_sha256 text not null default '';
 
+alter table public.thesis_audit_reports
+add column if not exists college_name text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists college_source text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists college_raw_text text not null default '';
+
 create index if not exists thesis_audit_reports_user_id_created_at_idx
 on public.thesis_audit_reports(user_id, created_at desc);
+
+create index if not exists thesis_audit_reports_college_created_at_idx
+on public.thesis_audit_reports(college_name, created_at desc);
 
 alter table public.thesis_audit_users enable row level security;
 
