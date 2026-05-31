@@ -2056,6 +2056,26 @@ def table_border_val(table, edge: str) -> Optional[str]:
     return el.get(qn("val"))
 
 
+def table_style_border_val(table, edge: str) -> Optional[str]:
+    style = table.style
+    if style is None:
+        return None
+    for item in iter_style_chain(style):
+        element = getattr(item, "_element", None)
+        if element is None:
+            continue
+        tbl_pr = element.find(qn("tblPr"))
+        if tbl_pr is None:
+            continue
+        borders = tbl_pr.find(qn("tblBorders"))
+        if borders is None:
+            continue
+        el = borders.find(qn(edge))
+        if el is not None:
+            return el.get(qn("val"))
+    return None
+
+
 def border_is_visible(value: Optional[str]) -> bool:
     return value not in (None, "nil", "none")
 
@@ -2155,6 +2175,9 @@ def audit_tables(ctx: AuditContext):
         if table.rows:
             tbl_top = table_border_val(table, "top")
             tbl_bottom = table_border_val(table, "bottom")
+            style_top = table_style_border_val(table, "top")
+            style_inside_h = table_style_border_val(table, "insideH")
+            style_bottom = table_style_border_val(table, "bottom")
             top_vals = [cell_border_val(cell, "top") for cell in table.rows[0].cells]
             mid_vals = [cell_border_val(cell, "bottom") for cell in table.rows[0].cells]
             bottom_vals = [cell_border_val(cell, "bottom") for cell in table.rows[-1].cells]
@@ -2162,10 +2185,21 @@ def audit_tables(ctx: AuditContext):
             for row in table.rows:
                 for cell in row.cells:
                     vertical_vals.extend([cell_border_val(cell, "left"), cell_border_val(cell, "right")])
-            has_top = border_is_visible(tbl_top) or all(border_is_visible(v) for v in top_vals)
-            has_mid = all(border_is_visible(v) for v in mid_vals)
-            has_bottom = border_is_visible(tbl_bottom) or all(border_is_visible(v) for v in bottom_vals)
-            has_vertical = any(border_is_visible(v) for v in vertical_vals)
+            has_top = border_is_visible(tbl_top) or border_is_visible(style_top) or any(border_is_visible(v) for v in top_vals)
+            has_mid = border_is_visible(style_inside_h) or any(border_is_visible(v) for v in mid_vals)
+            has_bottom = border_is_visible(tbl_bottom) or border_is_visible(style_bottom) or any(border_is_visible(v) for v in bottom_vals)
+            # Table Grid styles keep default vertical borders in the style XML even when
+            # the table/cells explicitly suppress them. Only flag vertical lines that
+            # are present on the table itself or on cells, not style defaults alone.
+            has_vertical = any(
+                border_is_visible(v)
+                for v in [
+                    table_border_val(table, "left"),
+                    table_border_val(table, "right"),
+                    table_border_val(table, "insideV"),
+                    *vertical_vals,
+                ]
+            )
             if not has_top:
                 three_line_bad.append((num, "首行上边线缺失"))
             if len(table.rows) > 1 and not has_mid:
@@ -2174,9 +2208,6 @@ def audit_tables(ctx: AuditContext):
                 three_line_bad.append((num, "末行下边线缺失"))
             if has_vertical:
                 three_line_bad.append((num, "检测到竖线，三线表一般不应使用竖线"))
-            style_name = table.style.name if table.style is not None else ""
-            if style_name in ("Table Grid", "网格型") and not has_vertical:
-                three_line_bad.append((num, f"表格样式为{style_name}，需复核是否保留了全框线"))
 
         cell_bad_seen = set()
         for row_idx, row in enumerate(table.rows, 1):
@@ -2600,7 +2631,7 @@ def audit_references(ctx: AuditContext):
             east = effective_run_east_asia(p)
             line_ok = effective_line_spacing(p) in (1.5, None)
             has_cn = has_cjk(text)
-            if size != 12 or (has_cn and east != "宋体") or not line_ok:
+            if size != 12 or (has_cn and east not in (None, "宋体")) or not line_ok:
                 bad_font.append((i + 1, size, east, line_ok, text[:80]))
         for run in p.runs:
             raw = run.text.strip()
@@ -3631,8 +3662,6 @@ def generic_suggestion_points(raw: str, item_name: str) -> list[str]:
         suggestions.append("把页码字号改为五号 10.5pt，英文字体设为 Times New Roman。")
     if "首行上边线缺失" in raw or "表头下方横线缺失" in raw or "末行下边线缺失" in raw:
         suggestions.append("按三线表补齐顶线、表头线和底线，并删除多余竖线。")
-    if "表格样式为Table Grid" in raw:
-        suggestions.append("检查表格是否仍保留全框线；若有全框线，请改成三线表。")
     if "保存地或保存单位缺失" in raw:
         suggestions.append("学位论文类参考文献请补全保存地或保存单位信息。")
     if "正文未检测到图号引用" in raw:
