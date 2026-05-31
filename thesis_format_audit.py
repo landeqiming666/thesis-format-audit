@@ -2290,7 +2290,7 @@ def audit_tables(ctx: AuditContext):
     )
     ctx.add(
         "三线表结构",
-        "PASS" if not three_line_bad else "FAIL",
+        "PASS" if not three_line_bad else "WARN",
         "正文和附录表格",
         "表格一般采用三线表，必要时可加辅助线；本项检查首线、表头线、底线和明显竖线。",
         "异常项：" + html.escape(str(three_line_bad[:25])) if three_line_bad else "未发现明显非三线表边框结构。",
@@ -2298,7 +2298,7 @@ def audit_tables(ctx: AuditContext):
     )
     ctx.add(
         "三线表要求（官方检测兼容）",
-        "PASS" if not three_line_bad else "FAIL",
+        "PASS" if not three_line_bad else "WARN",
         "正文表格",
         "维普会单独提示三线表要求；普通表格应保留顶线、表头线和底线，删除不必要的竖线或全框线。",
         "异常项：" + html.escape(str(three_line_bad[:25])) if three_line_bad else "未发现维普式三线表异常。",
