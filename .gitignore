@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 thesis_format_audit_reports/
 .env
+maintenance_backups/
