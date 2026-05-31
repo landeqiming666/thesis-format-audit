@@ -1066,7 +1066,6 @@ def audit_abstracts(ctx: AuditContext):
             title_line_ok = title_line in (1.5, None)
             title_before_ok = effective_half_line_spacing(tp, "beforeLines")
             title_after_ok = effective_half_line_spacing(tp, "afterLines")
-            title_snap = effective_snap_to_grid(tp)
             title_ok = (
                 title_size == 18
                 and title_latin == "Times New Roman"
@@ -1075,14 +1074,13 @@ def audit_abstracts(ctx: AuditContext):
                 and title_line_ok
                 and title_before_ok
                 and title_after_ok
-                and title_snap
             )
             ctx.add(
                 "英文摘要论文题目",
                 "PASS" if title_ok else "FAIL",
                 f"P{title_idx+1}",
-                "Abstract上方英文题目应为Times New Roman、小二、加粗、居中，1.5倍行距，段前段后0.5行，并勾选网格对齐。",
-                f"text={html.escape(tp.text.strip())}, size={title_size}, latinFont={title_latin}, bold={title_bold}, centered={title_centered}, lineSpacing={title_line}, beforeLines0.5={title_before_ok}, afterLines0.5={title_after_ok}, snapToGrid={title_snap}",
+                "Abstract上方英文题目应为Times New Roman、小二、加粗、居中，1.5倍行距，段前段后0.5行。",
+                f"text={html.escape(tp.text.strip())}, size={title_size}, latinFont={title_latin}, bold={title_bold}, centered={title_centered}, lineSpacing={title_line}, beforeLines0.5={title_before_ok}, afterLines0.5={title_after_ok}",
                 "重要",
             )
         else:
@@ -1097,14 +1095,13 @@ def audit_abstracts(ctx: AuditContext):
         line_ok = line in (1.5, None)
         before_ok = effective_half_line_spacing(p, "beforeLines")
         after_ok = effective_half_line_spacing(p, "afterLines")
-        snap_ok = effective_snap_to_grid(p)
-        ok = size == 16 and latin == "Times New Roman" and bold is True and centered and line_ok and before_ok and after_ok and snap_ok
+        ok = size == 16 and latin == "Times New Roman" and bold is True and centered and line_ok and before_ok and after_ok
         ctx.add(
             "英文摘要标题",
             "PASS" if ok else "FAIL",
             f"P{en_title+1}",
-            "Abstract 应为 Times New Roman 三号加粗居中，1.5倍行距，段前、段后0.5行，并勾选网格对齐。",
-            f"size={size}, latinFont={latin}, bold={bold}, centered={centered}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}, snapToGrid={snap_ok}",
+            "Abstract 应为 Times New Roman 三号加粗居中，1.5倍行距，段前、段后0.5行。",
+            f"size={size}, latinFont={latin}, bold={bold}, centered={centered}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}",
             "重要",
         )
 
@@ -1118,16 +1115,15 @@ def audit_abstracts(ctx: AuditContext):
             indent_ok = effective_first_line_chars(p, 200)
             before_ok = effective_half_line_spacing(p, "beforeLines")
             after_ok = effective_half_line_spacing(p, "afterLines")
-            snap_ok = effective_snap_to_grid(p)
             font_issues = paragraph_font_issues(p, expected_size=12, expected_east="Times New Roman", expected_latin="Times New Roman")
             collect_abstract_font_size(idx + 1, "英文摘要正文", font_issues, p.text.strip())
-            if not line_ok or not indent_ok or not before_ok or not after_ok or not snap_ok or font_issues:
-                bad_format.append((idx + 1, line_ok, indent_ok, before_ok, after_ok, snap_ok, font_issues[:5], p.text.strip()[:50]))
+            if not line_ok or not indent_ok or not before_ok or not after_ok or font_issues:
+                bad_format.append((idx + 1, line_ok, indent_ok, before_ok, after_ok, font_issues[:5], p.text.strip()[:50]))
         ctx.add(
             "英文摘要正文格式",
             "PASS" if not bad_format else "FAIL",
             "英文摘要",
-            "英文摘要正文应为小四号Times New Roman，1.5倍行距，每段首行缩进2字符，段前段后0.5行，并勾选网格对齐。",
+            "英文摘要正文应为小四号Times New Roman，1.5倍行距，每段首行缩进2字符，段前段后0.5行。",
             "异常项：" + html.escape(str(bad_format[:10])) if bad_format else "未发现英文摘要正文格式异常。",
             "重要",
         )
@@ -1150,7 +1146,6 @@ def audit_abstracts(ctx: AuditContext):
         line_ok = line in (1.5, None)
         before_ok = effective_half_line_spacing(p, "beforeLines")
         after_ok = effective_half_line_spacing(p, "afterLines")
-        snap_ok = effective_snap_to_grid(p)
         font_issues = paragraph_font_issues(p, expected_size=12, expected_east="Times New Roman", expected_latin="Times New Roman")
         collect_abstract_font_size(en_kw + 1, "英文关键词", font_issues, text)
         ok = (
@@ -1164,15 +1159,14 @@ def audit_abstracts(ctx: AuditContext):
             and line_ok
             and before_ok
             and after_ok
-            and snap_ok
             and not font_issues
         )
         ctx.add(
             "英文关键词",
             "PASS" if ok else "FAIL",
             f"P{en_kw+1}",
-            "Keywords与Abstract正文之间应空一行，首行缩进2字符；Keywords加粗；Keywords后使用中文冒号，词间用中文分号，末尾不加标点，3-5个，Times New Roman小四，1.5倍行距，段前段后0.5行，并勾选网格对齐。",
-            f"关键词数={count}, 中文冒号={uses_cn_colon}, 中文分号={uses_cn_semicolon}, Keywords加粗={keywords_bold}, 末尾标点={trailing}, blankBefore={blank_before}, firstLine2={indent_ok}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}, snapToGrid={snap_ok}, fontIssues={font_issues[:5]}",
+            "Keywords与Abstract正文之间应空一行，首行缩进2字符；Keywords加粗；Keywords后使用中文冒号，词间用中文分号，末尾不加标点，3-5个，Times New Roman小四，1.5倍行距，段前段后0.5行。",
+            f"关键词数={count}, 中文冒号={uses_cn_colon}, 中文分号={uses_cn_semicolon}, Keywords加粗={keywords_bold}, 末尾标点={trailing}, blankBefore={blank_before}, firstLine2={indent_ok}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}, fontIssues={font_issues[:5]}",
             "重要",
         )
         title_writing_bad = []
@@ -3478,18 +3472,17 @@ def format_problem_tuple(item, item_name: str = "") -> str:
         sample = clean_display_text(values[4], 56)
         return f"{loc} “{sample}”：{'；'.join(issues) if issues else '存在段落格式异常'}。"
 
-    # English abstract tuples: (para, line_ok, indent_ok, before_ok, after_ok, snap_ok, font_issues, sample)
-    if len(values) >= 8 and all(isinstance(v, bool) for v in values[1:6]) and isinstance(values[6], list):
+    # English abstract tuples: (para, line_ok, indent_ok, before_ok, after_ok, font_issues, sample)
+    if len(values) == 7 and all(isinstance(v, bool) for v in values[1:5]) and isinstance(values[5], list):
         issues = [
             bool_issue(values[1], "行距应为 1.5 倍"),
             bool_issue(values[2], "首行缩进应为 2 字符"),
             bool_issue(values[3], "段前应为 0.5 行"),
             bool_issue(values[4], "段后应为 0.5 行"),
-            bool_issue(values[5], "需要勾选“如果定义了文档网格，则对齐到网格”"),
-            *format_font_issue_list(values[6]),
+            *format_font_issue_list(values[5]),
         ]
         issues = [x for x in issues if x]
-        sample = clean_display_text(values[7], 56)
+        sample = clean_display_text(values[6], 56)
         return f"{loc} “{sample}”：{'；'.join(issues) if issues else '存在英文摘要格式异常'}。"
 
     # Body/subitem tuples with indentation and optional bold/font problems.
@@ -3732,8 +3725,6 @@ def human_evidence_points(f: Finding) -> list[str]:
         points.append("需要设置段后 0.5 行。")
     if "firstLine2=False" in raw or "首行缩进" in raw and "False" in raw:
         points.append("需要设置首行缩进 2 字符。")
-    if "snapToGrid=False" in raw:
-        points.append("需要勾选“如果定义了文档网格，则对齐到网格”。")
     if "fontIssues=[]" not in raw and "fontIssues=" in raw:
         points.append("字体存在不符合项，请按要求设置中文字体和英文字体。")
     if "字号" in raw and not any("字号" in p for p in points):
