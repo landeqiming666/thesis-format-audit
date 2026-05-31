@@ -40,10 +40,21 @@ except ImportError:
 
 try:
     from google.cloud import storage as gcs_storage
-    from google.oauth2 import service_account
 except ImportError:
     gcs_storage = None
+
+try:
+    from google.oauth2 import service_account
+except ImportError:
     service_account = None
+
+try:
+    from googleapiclient.discovery import build as google_api_build
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+except ImportError:
+    google_api_build = None
+    MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
 
 if load_dotenv:
     load_dotenv()
@@ -124,6 +135,9 @@ GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 GCS_PREFIX = os.environ.get("GCS_PREFIX", "thesis-audit").strip("/")
 GCS_PROJECT = os.environ.get("GCS_PROJECT", "")
 GCS_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+GOOGLE_DRIVE_CREDENTIALS_JSON = os.environ.get("GOOGLE_DRIVE_CREDENTIALS_JSON", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_DRIVE_PREFIX = os.environ.get("GOOGLE_DRIVE_PREFIX", "thesis-audit").strip("/")
 USER_COLUMNS = (
     "id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,"
     "invite_code,invited_by,register_ip,register_user_agent,last_login_at,last_login_ip,"
@@ -137,12 +151,13 @@ ADMIN_USER_COLUMNS = (
 REPORT_COLUMNS = (
     "id,user_id,user_email,original_filename,report_filename,report_storage_path,status,"
     "error_message,college_name,college_source,college_raw_text,client_ip,user_agent,original_storage_backend,original_storage_path,"
-    "original_gcs_path,original_size_bytes,original_sha256,report_storage_backend,report_gcs_path,"
+    "original_gcs_path,original_drive_file_id,original_drive_path,original_size_bytes,original_sha256,report_storage_backend,report_gcs_path,"
     "report_size_bytes,report_sha256,created_at"
 )
 REGISTRATION_CODE_COLUMNS = "id,code,note,max_uses,used_count,is_active,created_by,created_at"
 EVENT_COLUMNS = "id,event_type,user_id,user_email,path,client_ip,user_agent,metadata,created_at"
 _GCS_CLIENT = None
+_DRIVE_SERVICE = None
 ADMIN_SORT_OPTIONS = {
     "created_desc",
     "created_asc",
@@ -375,6 +390,8 @@ def archive_original_upload(user: dict, upload_path: Path, original_filename: st
     archive_path = storage_path
     storage_backend = ""
     gcs_path = ""
+    drive_file_id = ""
+    drive_path = ""
     try:
         storage_backend = upload_original_to_storage(storage_path, original_bytes, original_content_type(original_filename))
     except Exception:
@@ -385,10 +402,19 @@ def archive_original_upload(user: dict, upload_path: Path, original_filename: st
             gcs_path = upload_original_to_gcs(user, archive_path, original_bytes, original_content_type(original_filename))
         except Exception:
             app.logger.warning("Failed to upload original Word file to GCS for user %s", user["id"], exc_info=True)
+    if drive_is_configured():
+        try:
+            drive_upload = upload_original_to_drive(user, archive_path, original_bytes, original_content_type(original_filename))
+            drive_file_id = drive_upload["file_id"]
+            drive_path = drive_upload["path"]
+        except Exception:
+            app.logger.warning("Failed to upload original Word file to Google Drive for user %s", user["id"], exc_info=True)
     return {
         "original_storage_backend": storage_backend,
         "original_storage_path": storage_path,
         "original_gcs_path": gcs_path,
+        "original_drive_file_id": drive_file_id,
+        "original_drive_path": drive_path,
         "original_size_bytes": len(original_bytes),
         "original_sha256": sha256_hex(original_bytes),
     }
@@ -592,6 +618,17 @@ def gcs_is_configured() -> bool:
     return bool(GCS_BUCKET and gcs_storage is not None)
 
 
+def drive_is_configured() -> bool:
+    return bool(
+        GOOGLE_DRIVE_CREDENTIALS_JSON
+        and GOOGLE_DRIVE_FOLDER_ID
+        and service_account is not None
+        and google_api_build is not None
+        and MediaIoBaseDownload is not None
+        and MediaIoBaseUpload is not None
+    )
+
+
 def get_gcs_client():
     global _GCS_CLIENT
     if not gcs_is_configured():
@@ -607,6 +644,21 @@ def get_gcs_client():
     else:
         _GCS_CLIENT = gcs_storage.Client(project=GCS_PROJECT or None)
     return _GCS_CLIENT
+
+
+def get_drive_service():
+    global _DRIVE_SERVICE
+    if not drive_is_configured():
+        raise RuntimeError("Google Drive archive is not configured.")
+    if _DRIVE_SERVICE is not None:
+        return _DRIVE_SERVICE
+    info = json.loads(GOOGLE_DRIVE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    _DRIVE_SERVICE = google_api_build("drive", "v3", credentials=credentials, cache_discovery=False)
+    return _DRIVE_SERVICE
 
 
 def maybe_single_data(result) -> dict | None:
@@ -965,6 +1017,8 @@ def create_report_record(
     original_storage_backend: str = "",
     original_storage_path: str = "",
     original_gcs_path: str = "",
+    original_drive_file_id: str = "",
+    original_drive_path: str = "",
     original_size_bytes: int = 0,
     original_sha256: str = "",
     report_storage_backend: str = "",
@@ -993,6 +1047,8 @@ def create_report_record(
                 "original_storage_backend": original_storage_backend,
                 "original_storage_path": original_storage_path,
                 "original_gcs_path": original_gcs_path,
+                "original_drive_file_id": original_drive_file_id,
+                "original_drive_path": original_drive_path,
                 "original_size_bytes": original_size_bytes,
                 "original_sha256": original_sha256,
                 "report_storage_backend": report_storage_backend,
@@ -1022,6 +1078,15 @@ def gcs_object_path(kind: str, user: dict, storage_path: str) -> str:
     return "/".join(parts)
 
 
+def drive_object_path(kind: str, user: dict, storage_path: str) -> str:
+    parts = [part for part in [GOOGLE_DRIVE_PREFIX, kind, storage_path] if part]
+    return "/".join(parts)
+
+
+def drive_file_name_for_path(path: str) -> str:
+    return re.sub(r"[\\/]+", "__", path).strip("_") or f"thesis-audit-{uuid4().hex}"
+
+
 def sha256_hex(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -1041,6 +1106,27 @@ def upload_to_gcs_storage(object_path: str, content: bytes, content_type: str) -
     bucket = get_gcs_client().bucket(GCS_BUCKET)
     blob = bucket.blob(object_path)
     blob.upload_from_string(content, content_type=content_type)
+
+
+def upload_to_drive_storage(drive_path: str, content: bytes, content_type: str) -> str:
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=content_type, resumable=False)
+    metadata = {
+        "name": drive_file_name_for_path(drive_path),
+        "parents": [GOOGLE_DRIVE_FOLDER_ID],
+        "description": drive_path,
+    }
+    created = (
+        get_drive_service()
+        .files()
+        .create(
+            body=metadata,
+            media_body=media,
+            fields="id",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return created["id"]
 
 
 def upload_report_to_storage(storage_path: str, report_bytes: bytes) -> str:
@@ -1073,12 +1159,28 @@ def upload_original_to_gcs(user: dict, storage_path: str, original_bytes: bytes,
     return object_path
 
 
+def upload_original_to_drive(user: dict, storage_path: str, original_bytes: bytes, content_type: str = DOCX_MIMETYPE) -> dict:
+    drive_path = drive_object_path("originals", user, storage_path)
+    file_id = upload_to_drive_storage(drive_path, original_bytes, content_type)
+    return {"file_id": file_id, "path": drive_path}
+
+
 def download_from_supabase_storage(storage_path: str) -> bytes:
     return get_supabase().storage.from_(REPORTS_BUCKET).download(storage_path)
 
 
 def download_from_gcs_storage(object_path: str) -> bytes:
     return get_gcs_client().bucket(GCS_BUCKET).blob(object_path).download_as_bytes()
+
+
+def download_from_drive_storage(file_id: str) -> bytes:
+    request_media = get_drive_service().files().get_media(fileId=file_id, supportsAllDrives=True)
+    output = io.BytesIO()
+    downloader = MediaIoBaseDownload(output, request_media)
+    done = False
+    while not done:
+        _status, done = downloader.next_chunk()
+    return output.getvalue()
 
 
 def download_report_from_storage(report: dict) -> bytes:
@@ -1094,6 +1196,8 @@ def download_original_from_storage(report: dict) -> bytes:
         return download_from_supabase_storage(report["original_storage_path"])
     if report.get("original_gcs_path"):
         return download_from_gcs_storage(report["original_gcs_path"])
+    if report.get("original_drive_file_id"):
+        return download_from_drive_storage(report["original_drive_file_id"])
     raise FileNotFoundError("Original storage path is empty.")
 
 
@@ -5455,6 +5559,7 @@ ADMIN_REPORTS_PAGE = """
                   <div class="meta">
                     原文：{% if item['original_storage_path'] %}Supabase{% else %}未存 Supabase{% endif %}
                     {% if item['original_gcs_path'] %} / GCS{% endif %}
+                    {% if item['original_drive_file_id'] %} / Drive{% endif %}
                   </div>
                   <div class="meta">
                     报告：{% if item['report_storage_path'] %}Supabase{% else %}未存 Supabase{% endif %}
@@ -5491,10 +5596,10 @@ ADMIN_REPORTS_PAGE = """
                   {% if item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path']) %}
                     <a class="link-chip" href="{{ url_for('download_report', report_id=item['id'], auth_token=auth_token) }}">下载报告</a>
                   {% endif %}
-                  {% if item['original_storage_path'] or item['original_gcs_path'] %}
+                  {% if item['original_storage_path'] or item['original_gcs_path'] or item['original_drive_file_id'] %}
                     <a class="link-chip" href="{{ url_for('download_original', report_id=item['id'], auth_token=auth_token) }}">下载原文</a>
                   {% endif %}
-                  {% if not ((item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path'])) or item['original_storage_path'] or item['original_gcs_path']) %}
+                  {% if not ((item['status'] == 'success' and (item['report_storage_path'] or item['report_gcs_path'])) or item['original_storage_path'] or item['original_gcs_path'] or item['original_drive_file_id']) %}
                     <span class="meta">暂无可下载文件</span>
                   {% endif %}
                 </td>
@@ -6097,7 +6202,7 @@ def download_original(report_id: str):
         return Response("记录不存在。", status=404, mimetype="text/plain; charset=utf-8")
     if not is_admin(user):
         return Response("只有管理员可以下载原始论文文件。", status=403, mimetype="text/plain; charset=utf-8")
-    if not (report.get("original_storage_path") or report.get("original_gcs_path")):
+    if not (report.get("original_storage_path") or report.get("original_gcs_path") or report.get("original_drive_file_id")):
         return Response("这条记录没有保存原始文件。", status=404, mimetype="text/plain; charset=utf-8")
     try:
         original_bytes = download_original_from_storage(report)
@@ -6170,6 +6275,8 @@ def audit():
                     original_storage_backend=original_archive["original_storage_backend"],
                     original_storage_path=original_archive["original_storage_path"],
                     original_gcs_path=original_archive["original_gcs_path"],
+                    original_drive_file_id=original_archive["original_drive_file_id"],
+                    original_drive_path=original_archive["original_drive_path"],
                     original_size_bytes=original_archive["original_size_bytes"],
                     original_sha256=original_archive["original_sha256"],
                     error_message=error_message,
@@ -6221,6 +6328,8 @@ def audit():
                 original_storage_backend=original_archive["original_storage_backend"],
                 original_storage_path=original_archive["original_storage_path"],
                 original_gcs_path=original_archive["original_gcs_path"],
+                original_drive_file_id=original_archive["original_drive_file_id"],
+                original_drive_path=original_archive["original_drive_path"],
                 original_size_bytes=original_archive["original_size_bytes"],
                 original_sha256=original_archive["original_sha256"],
                 report_storage_backend=report_storage_backend,

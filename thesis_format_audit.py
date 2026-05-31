@@ -1,4 +1,4 @@
-﻿"""
+"""
 本科毕业设计(论文) Word 格式检测脚本
 
 用法：
@@ -210,7 +210,14 @@ def first_text_run(paragraph):
     return None
 
 
+def paragraph_style_name(paragraph) -> str:
+    style = getattr(paragraph, "style", None)
+    return getattr(style, "name", "") or ""
+
+
 def style_east_asia(style) -> Optional[str]:
+    if style is None:
+        return None
     rpr = getattr(style._element, "rPr", None)
     if rpr is not None and rpr.rFonts is not None:
         return rpr.rFonts.get(qn("eastAsia"))
@@ -218,6 +225,8 @@ def style_east_asia(style) -> Optional[str]:
 
 
 def style_size(style) -> Optional[float]:
+    if style is None:
+        return None
     return style.font.size.pt if style.font.size is not None else None
 
 
@@ -453,13 +462,63 @@ def effective_snap_to_grid(paragraph) -> bool:
 
 
 def effective_paragraph_alignment(paragraph):
-    if paragraph.alignment is not None:
-        return paragraph.alignment
+    alignment = safe_paragraph_alignment(paragraph)
+    if alignment is not None:
+        return alignment
     for style in iter_style_chain(paragraph.style):
-        value = style.paragraph_format.alignment
+        value = safe_paragraph_format_alignment(style.paragraph_format)
         if value is not None:
             return value
     return None
+
+
+def raw_paragraph_alignment_value(paragraph) -> Optional[str]:
+    ppr = paragraph._p.pPr
+    if ppr is None:
+        return None
+    jc = ppr.find(qn("jc"))
+    if jc is None:
+        return None
+    return jc.get(qn("val"))
+
+
+def raw_paragraph_format_alignment_value(paragraph_format) -> Optional[str]:
+    ppr = paragraph_format._element.pPr
+    if ppr is None:
+        return None
+    jc = ppr.find(qn("jc"))
+    if jc is None:
+        return None
+    return jc.get(qn("val"))
+
+
+def normalize_alignment_value(raw: Optional[str]):
+    if raw in (None, ""):
+        return None
+    normalized = raw.lower()
+    if normalized in ("left", "start"):
+        return WD_ALIGN_PARAGRAPH.LEFT
+    if normalized in ("right", "end"):
+        return WD_ALIGN_PARAGRAPH.RIGHT
+    if normalized == "center":
+        return WD_ALIGN_PARAGRAPH.CENTER
+    if normalized in ("both", "distribute", "thai_distribute", "thaiDistribute"):
+        return WD_ALIGN_PARAGRAPH.JUSTIFY
+    return None
+
+
+def safe_paragraph_alignment(paragraph):
+    try:
+        return paragraph.alignment
+    except Exception:
+        return normalize_alignment_value(raw_paragraph_alignment_value(paragraph))
+
+
+def safe_paragraph_format_alignment(paragraph_format):
+    try:
+        return paragraph_format.alignment
+    except Exception:
+        return normalize_alignment_value(raw_paragraph_format_alignment_value(paragraph_format))
 
 
 def paragraph_font_issues(paragraph, expected_size: float = 12, expected_east: str = "宋体", expected_latin: str = "Times New Roman"):
@@ -615,7 +674,7 @@ def is_probable_body_paragraph(paragraph) -> bool:
     text = paragraph.text.strip()
     if not text or has_drawing(paragraph):
         return False
-    style = paragraph.style.name
+    style = paragraph_style_name(paragraph)
     if style.startswith("Heading") or style.startswith("toc") or style in ("Caption",):
         return False
     if re.match(r"^(图|表)\d+[-－]\d+", text):
@@ -639,7 +698,7 @@ def is_body_or_caption_paragraph(paragraph) -> bool:
     text = paragraph.text.strip()
     if not text or has_drawing(paragraph):
         return False
-    style = paragraph.style.name
+    style = paragraph_style_name(paragraph)
     if style.startswith(("Heading", "toc", "目录", "Bibliography")):
         return False
     if re.match(r"^\[\d+\]", text):
@@ -849,7 +908,7 @@ def paragraph_has_pageref_field(paragraph) -> bool:
 
 
 def find_first_chapter_index(doc: Document) -> Optional[int]:
-    return find_first(doc, lambda p: p.style.name.startswith("Heading") and re.match(r"^第\s*(?:1|一)\s*章", p.text.strip()))
+    return find_first(doc, lambda p: paragraph_style_name(p).startswith("Heading") and re.match(r"^第\s*(?:1|一)\s*章", p.text.strip()))
 
 
 def visible_word_count(text: str) -> tuple[int, int, int, int]:
@@ -1245,7 +1304,7 @@ def audit_toc(ctx: AuditContext):
             "PASS" if title_ok else "FAIL",
             f"P{toc_start+1}",
             "目录页“目  录”应为一级标题，三号黑体居中，中间空两个空格，1.5倍行距，段前、段后0.5行。",
-            f"text={html.escape(toc_title.text.strip())}, style={toc_title.style.name}, size={title_size}, eastAsia={title_east}, centered={title_centered}, lineSpacing={title_line}, beforeLines0.5={title_before_ok}, afterLines0.5={title_after_ok}",
+            f"text={html.escape(toc_title.text.strip())}, style={paragraph_style_name(toc_title)}, size={title_size}, eastAsia={title_east}, centered={title_centered}, lineSpacing={title_line}, beforeLines0.5={title_before_ok}, afterLines0.5={title_after_ok}",
             "重要",
         )
     else:
@@ -1335,7 +1394,7 @@ def audit_toc(ctx: AuditContext):
         if not text:
             continue
         norm = normalize_title_for_compare(text)
-        if p.style.name in ("Heading 1", "Heading 2", "Heading 3") or clean_text(text) in tail_titles:
+        if paragraph_style_name(p) in ("Heading 1", "Heading 2", "Heading 3") or clean_text(text) in tail_titles:
             body_titles.append((i + 1, text, norm))
     body_title_norms = {norm for _, _, norm in body_titles if norm}
     toc_title_norms = {norm for _, _, norm in toc_entries if norm}
@@ -1366,9 +1425,10 @@ def audit_toc(ctx: AuditContext):
             continue
         pf = p.paragraph_format
         style = p.style
-        level = 1 if style.name in ("toc 1", "TOC 1") else 2 if style.name in ("toc 2", "TOC 2") else 3 if style.name in ("toc 3", "TOC 3") else None
+        style_name = paragraph_style_name(p)
+        level = 1 if style_name in ("toc 1", "TOC 1") else 2 if style_name in ("toc 2", "TOC 2") else 3 if style_name in ("toc 3", "TOC 3") else None
         if level is None:
-            bad.append((i + 1, "样式不是toc 1/2/3", style.name, t[:60]))
+            bad.append((i + 1, "样式不是toc 1/2/3", style_name or "无样式", t[:60]))
             continue
         expected_left = {1: 0, 2: 420, 3: 840}[level]
         ppr = p._p.pPr
@@ -1409,11 +1469,11 @@ def audit_headings(ctx: AuditContext):
             continue
         s_size = style_size(style)
         s_east = style_east_asia(style)
-        paras = [(i + 1, p.text.strip()) for i, p in enumerate(doc.paragraphs) if p.style.name == style_name]
+        paras = [(i + 1, p.text.strip()) for i, p in enumerate(doc.paragraphs) if paragraph_style_name(p) == style_name]
         direct_bad = []
         effective_bad = []
         for i, p in enumerate(doc.paragraphs):
-            if p.style.name == style_name:
+            if paragraph_style_name(p) == style_name:
                 r = first_text_run(p)
                 if r is None:
                     continue
@@ -1442,7 +1502,7 @@ def audit_headings(ctx: AuditContext):
     h1_blank_bad = []
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
-        if p.style.name != "Heading 1" or not text:
+        if paragraph_style_name(p) != "Heading 1" or not text:
             continue
         is_chapter = re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", text)
         if is_chapter and not re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章 {2}\S", text):
@@ -1493,7 +1553,7 @@ def audit_headings(ctx: AuditContext):
 
     first_chapter = next(
         ((i + 1, p.text.strip()) for i, p in enumerate(doc.paragraphs)
-         if p.style.name == "Heading 1" and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip())),
+         if paragraph_style_name(p) == "Heading 1" and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip())),
         None,
     )
     intro_warn = []
@@ -1524,7 +1584,7 @@ def audit_headings(ctx: AuditContext):
     vip_heading_number_bad = []
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
-        if p.style.name != "Heading 2" or not text:
+        if paragraph_style_name(p) != "Heading 2" or not text:
             continue
         if re.match(r"^\d+\.\d+", text) and not re.match(r"^\d+\.\d+ {1}\S", text):
             h2_bad.append((i + 1, "序数后应空一格", text))
@@ -1558,7 +1618,7 @@ def audit_headings(ctx: AuditContext):
     h3_bad = []
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
-        if p.style.name != "Heading 3" or not text:
+        if paragraph_style_name(p) != "Heading 3" or not text:
             continue
         if re.match(r"^\d+\.\d+\.\d+", text) and not re.match(r"^\d+\.\d+\.\d+ {1}\S", text):
             h3_bad.append((i + 1, "序数后应空一格", text))
@@ -1591,7 +1651,7 @@ def audit_headings(ctx: AuditContext):
 
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
-        if p.style.name == "Heading 1" and re.match(r"^第\s*\d+\s*章", text):
+        if paragraph_style_name(p) == "Heading 1" and re.match(r"^第\s*\d+\s*章", text):
             chapter = chapter_number_from_text(text)
             if chapter is not None and not re.match(rf"^第\s*{chapter_number_to_chinese(chapter)}\s*章", text):
                 vip_heading_number_bad.append((i + 1, f"章节序号建议写作第{chapter_number_to_chinese(chapter)}章", text))
@@ -1613,13 +1673,13 @@ def audit_headings(ctx: AuditContext):
         text = p.text.strip()
         if not text:
             continue
-        if p.style.name == "Heading 1":
+        if paragraph_style_name(p) == "Heading 1":
             chapter = chapter_number_from_text(text)
             if chapter is not None:
                 current_chapter = chapter
                 h1_nums.append(chapter)
             continue
-        if p.style.name == "Heading 2":
+        if paragraph_style_name(p) == "Heading 2":
             m = re.match(r"^(\d+)\.(\d+)\b", text)
             if not m:
                 heading_order_bad.append((i + 1, "二级标题缺少形如1.1的编号", text))
@@ -1628,7 +1688,7 @@ def audit_headings(ctx: AuditContext):
             h2_by_chapter[chapter].append(section)
             if current_chapter is not None and chapter != current_chapter:
                 heading_order_bad.append((i + 1, f"二级标题章号{chapter}与当前第{current_chapter}章不一致", text))
-        if p.style.name == "Heading 3":
+        if paragraph_style_name(p) == "Heading 3":
             m = re.match(r"^(\d+)\.(\d+)\.(\d+)\b", text)
             if not m:
                 heading_order_bad.append((i + 1, "三级标题缺少形如1.1.1的编号", text))
@@ -1682,7 +1742,7 @@ def audit_body_and_numbering(ctx: AuditContext):
         if refs_start is not None and i >= refs_start:
             continue
         text = p.text.strip()
-        if not text or i < body_start or p.style.name.startswith(("Heading", "toc", "目录", "Bibliography")):
+        if not text or i < body_start or paragraph_style_name(p).startswith(("Heading", "toc", "目录", "Bibliography")):
             continue
         if cap_pat.match(text) and len(text) < 70 and "。" not in text and "，" not in text:
             continue
@@ -1811,7 +1871,7 @@ def audit_chinese_punctuation(ctx: AuditContext):
         if refs_start is not None and i >= refs_start:
             continue
         text = p.text.strip()
-        if not text or p.style.name.startswith(("Heading", "toc", "目录", "Bibliography")):
+        if not text or paragraph_style_name(p).startswith(("Heading", "toc", "目录", "Bibliography")):
             continue
         if not has_cjk(text):
             continue
@@ -1933,7 +1993,7 @@ def audit_figures_tables(ctx: AuditContext):
             continue
         if text_here:
             continue
-        if p.style.name.startswith(("Heading", "toc")):
+        if paragraph_style_name(p).startswith(("Heading", "toc")):
             continue
         next_idx = None
         for j in range(idx + 1, min(len(doc.paragraphs), idx + 8)):
@@ -1941,7 +2001,7 @@ def audit_figures_tables(ctx: AuditContext):
                 next_idx = j
                 break
         next_text = doc.paragraphs[next_idx].text.strip() if next_idx is not None else ""
-        next_style = doc.paragraphs[next_idx].style.name if next_idx is not None else ""
+        next_style = paragraph_style_name(doc.paragraphs[next_idx]) if next_idx is not None else ""
         if next_style.startswith(("Heading", "toc")) or re.match(r"^(第\s*\d+\s*章|\d+\.\d+)", next_text):
             continue
         if next_idx is None or not fig_cap_pat.match(next_text) or not is_centered(doc.paragraphs[next_idx]):
@@ -2480,11 +2540,11 @@ def audit_formulas(ctx: AuditContext):
         if not re.fullmatch(r"\((?:\d+-\d+|A-\d+)\)", num):
             bad.append((ti, num, "公式编号应为(章号-序号)或附录(A-序号)"))
 
-        left_center = all(p.alignment == WD_ALIGN_PARAGRAPH.CENTER for p in left.paragraphs)
+        left_center = all(effective_paragraph_alignment(p) == WD_ALIGN_PARAGRAPH.CENTER for p in left.paragraphs)
         right_ok = True
         right_font_bad = []
         for p in right.paragraphs:
-            if p.text.strip() and p.alignment != WD_ALIGN_PARAGRAPH.RIGHT:
+            if p.text.strip() and effective_paragraph_alignment(p) != WD_ALIGN_PARAGRAPH.RIGHT:
                 right_ok = False
             for r in p.runs:
                 if not r.text:
@@ -2718,7 +2778,7 @@ def audit_references(ctx: AuditContext):
     citation_bad = []
     cite_pat = re.compile(r"\[(\d+(?:\s*[-,，]\s*\d+)*)\]")
     for pi, p in enumerate(doc.paragraphs[:refs_start], 1):
-        if p.style.name.startswith(("toc", "Heading")):
+        if paragraph_style_name(p).startswith(("toc", "Heading")):
             continue
         for r in p.runs:
             if not r.text:
@@ -2829,7 +2889,7 @@ def audit_document_structure(ctx: AuditContext):
         ("英文摘要", en_abs),
         ("英文关键词", en_kw),
         ("中文目录", toc_idx),
-        ("正文", first_index(lambda _i, p: p.style.name == "Heading 1" and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip()))),
+        ("正文", first_index(lambda _i, p: paragraph_style_name(p) == "Heading 1" and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip()))),
         ("致谢", first_index(lambda _i, p: clean_text(p.text) == "致谢")),
         ("参考文献", first_index(lambda _i, p: clean_text(p.text) == "参考文献")),
     ]
@@ -2909,8 +2969,8 @@ def audit_appendix(ctx: AuditContext):
     east = run_east_asia(r) if r else None
     app_bad = []
     p_app = doc.paragraphs[app]
-    if p_app.style.name != "Heading 1":
-        app_bad.append(f"样式为{p_app.style.name}，应为Heading 1")
+    if paragraph_style_name(p_app) != "Heading 1":
+        app_bad.append(f"样式为{paragraph_style_name(p_app)}，应为Heading 1")
     if not is_centered(p_app):
         app_bad.append("未居中")
     if size is not None and abs(size - 16) > 0.2:
@@ -2924,11 +2984,11 @@ def audit_appendix(ctx: AuditContext):
         "PASS" if not app_bad else "FAIL",
         f"P{app+1}",
         "附录应作为一级标题，中间空两格，并单独起页。",
-        "异常项：" + html.escape(str(app_bad)) if app_bad else f"style={p_app.style.name}, size={size}, eastAsia={east}，段前分页已设置。",
+        "异常项：" + html.escape(str(app_bad)) if app_bad else f"style={paragraph_style_name(p_app)}, size={size}, eastAsia={east}，段前分页已设置。",
         "重要",
     )
 
-    subheads = [p.text.strip() for p in doc.paragraphs[app + 1 :] if p.style.name.startswith("Heading 2") and p.text.strip().startswith("附录")]
+    subheads = [p.text.strip() for p in doc.paragraphs[app + 1 :] if paragraph_style_name(p).startswith("Heading 2") and p.text.strip().startswith("附录")]
     sub_bad = []
     for text in subheads:
         if not re.match(r"^附录 [A-Z]\s+.+", text):
@@ -2977,8 +3037,8 @@ def audit_acknowledgement(ctx: AuditContext):
     text = ack.text.strip()
     if text != "致  谢":
         bad.append(f"标题应写作“致  谢”，当前为“{text}”")
-    if not ack.style.name.startswith("Heading 1"):
-        bad.append(f"致谢应使用一级标题样式，当前样式为{ack.style.name}")
+    if not paragraph_style_name(ack).startswith("Heading 1"):
+        bad.append(f"致谢应使用一级标题样式，当前样式为{paragraph_style_name(ack)}")
     if not is_centered(ack):
         bad.append("致谢标题未居中")
     east = effective_run_east_asia(ack)
@@ -3006,7 +3066,7 @@ def audit_headers_footers_structural(ctx: AuditContext):
     chapter_titles = {
         clean_text(p.text)
         for p in doc.paragraphs
-        if p.style.name.startswith("Heading 1") and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip())
+        if paragraph_style_name(p).startswith("Heading 1") and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", p.text.strip())
     }
     header_bad = []
     header_content_bad = []

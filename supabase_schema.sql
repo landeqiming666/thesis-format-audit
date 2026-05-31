@@ -111,6 +111,8 @@ create table if not exists public.thesis_audit_reports (
   original_storage_backend text not null default '',
   original_storage_path text not null default '',
   original_gcs_path text not null default '',
+  original_drive_file_id text not null default '',
+  original_drive_path text not null default '',
   original_size_bytes bigint not null default 0,
   original_sha256 text not null default '',
   report_storage_backend text not null default '',
@@ -134,6 +136,12 @@ add column if not exists original_storage_path text not null default '';
 
 alter table public.thesis_audit_reports
 add column if not exists original_gcs_path text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_drive_file_id text not null default '';
+
+alter table public.thesis_audit_reports
+add column if not exists original_drive_path text not null default '';
 
 alter table public.thesis_audit_reports
 add column if not exists original_size_bytes bigint not null default 0;
