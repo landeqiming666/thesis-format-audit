@@ -159,20 +159,30 @@ LEGACY_ADMIN_EMAILS = {
 }
 
 
-def uploaded_docx_names(filename: str) -> tuple[str, str] | None:
+def uploaded_docx_names(filename: str) -> tuple[str, str]:
     raw_name = (filename or "").strip()
-    if not raw_name.lower().endswith(".docx"):
-        return None
     safe_name = secure_filename(raw_name)
     if not safe_name:
         safe_name = "thesis.docx"
     elif not safe_name.lower().endswith(".docx"):
-        # Werkzeug may strip non-ASCII filenames down to "docx"; keep the
-        # original extension decision but use a safe server-side name.
         safe_name = f"{safe_name}.docx"
     display_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
-    display_stem = display_name[:-5].strip() or Path(safe_name).stem or "thesis"
+    if display_name.lower().endswith(".docx"):
+        display_stem = display_name[:-5].strip()
+    else:
+        display_stem = Path(display_name).stem.strip() if display_name else ""
+    display_stem = display_stem or Path(safe_name).stem or "thesis"
     return safe_name, f"{display_stem}_format_audit_report.html"
+
+
+def wants_fetch_response() -> bool:
+    return request.headers.get("X-Requested-With") == "fetch" or "application/json" in request.headers.get("Accept", "")
+
+
+def audit_reject(message: str, status: int):
+    if wants_fetch_response():
+        return Response(message, status=status, mimetype="text/plain; charset=utf-8")
+    return render_home(error=message), status
 
 
 def validate_docx_package(path: Path) -> None:
@@ -2792,7 +2802,10 @@ PAGE = """
         const response = await fetch(form.action, {
           method: 'POST',
           body: new FormData(form),
-          credentials: 'same-origin'
+          credentials: 'same-origin',
+          headers: {
+            'X-Requested-With': 'fetch'
+          }
         });
         if (!response.ok) {
           const message = await response.text();
@@ -5752,19 +5765,17 @@ def audit():
         return limited
     user = current_user()
     if user is None:
-        return render_home(error="请先注册或登录后再生成报告。"), 401
+        return audit_reject("请先注册或登录后再生成报告。", 401)
     if not is_account_active(user):
-        return render_home(error=account_block_message(user)), 403
+        return audit_reject(account_block_message(user), 403)
     if remaining_submissions(user) <= 0:
-        return render_home(error="这个账号的检测额度已经用完。"), 403
+        return audit_reject("这个账号的检测额度已经用完。", 403)
 
     upload = request.files.get("docx")
     if not upload or not upload.filename:
-        return render_home(error="请先选择一个 .docx 文件。"), 400
+        return audit_reject("请先选择一个 .docx 文件。", 400)
 
     names = uploaded_docx_names(upload.filename)
-    if names is None:
-        return render_home(error="当前只支持 .docx 文件。"), 400
     _safe_name, download_name = names
     original_filename = upload.filename.strip() or "thesis.docx"
     try:
@@ -5778,11 +5789,15 @@ def audit():
         report_path = tmp_path / download_name
         upload.save(docx_path)
 
+        try:
+            validate_docx_package(docx_path)
+        except Exception as exc:
+            return audit_reject(f"{exc}", 400)
+
         original_archive = archive_original_upload(user, docx_path, original_filename)
         college_info = {"college_name": UNKNOWN_COLLEGE, "college_source": "", "college_raw_text": ""}
 
         try:
-            validate_docx_package(docx_path)
             college_info = safe_extract_college_from_docx(docx_path)
             run_audit_with_timeout(docx_path, report_path)
         except Exception as exc:
