@@ -1165,6 +1165,131 @@ def upload_original_to_drive(user: dict, storage_path: str, original_bytes: byte
     return {"file_id": file_id, "path": drive_path}
 
 
+def delete_supabase_storage_objects(paths: list[str]) -> dict:
+    unique_paths = sorted({path.strip() for path in paths if path and path.strip()})
+    if not unique_paths:
+        return {"selected": 0, "deleted": 0, "failed": []}
+
+    deleted = 0
+    failed = []
+    bucket = get_supabase().storage.from_(REPORTS_BUCKET)
+    for index in range(0, len(unique_paths), 100):
+        batch = unique_paths[index : index + 100]
+        try:
+            bucket.remove(batch)
+            deleted += len(batch)
+        except Exception as exc:
+            failed.append({"paths": batch, "error": str(exc)})
+    return {"selected": len(unique_paths), "deleted": deleted, "failed": failed}
+
+
+def delete_gcs_storage_objects(paths: list[str]) -> dict:
+    unique_paths = sorted({path.strip() for path in paths if path and path.strip()})
+    if not unique_paths:
+        return {"selected": 0, "deleted": 0, "failed": []}
+    if not gcs_is_configured():
+        return {"selected": len(unique_paths), "deleted": 0, "failed": [{"paths": unique_paths, "error": "GCS is not configured"}]}
+
+    deleted = 0
+    failed = []
+    bucket = get_gcs_client().bucket(GCS_BUCKET)
+    for path in unique_paths:
+        try:
+            bucket.blob(path).delete()
+            deleted += 1
+        except Exception as exc:
+            failed.append({"paths": [path], "error": str(exc)})
+    return {"selected": len(unique_paths), "deleted": deleted, "failed": failed}
+
+
+def delete_drive_storage_objects(file_ids: list[str]) -> dict:
+    unique_file_ids = sorted({file_id.strip() for file_id in file_ids if file_id and file_id.strip()})
+    if not unique_file_ids:
+        return {"selected": 0, "deleted": 0, "failed": []}
+    if not drive_is_configured():
+        return {"selected": len(unique_file_ids), "deleted": 0, "failed": [{"file_ids": unique_file_ids, "error": "Google Drive archive is not configured"}]}
+
+    deleted = 0
+    failed = []
+    service = get_drive_service()
+    for file_id in unique_file_ids:
+        try:
+            service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+            deleted += 1
+        except Exception as exc:
+            failed.append({"file_ids": [file_id], "error": str(exc)})
+    return {"selected": len(unique_file_ids), "deleted": deleted, "failed": failed}
+
+
+def original_archive_delete_targets(reports: list[dict]) -> dict:
+    return {
+        "supabase_paths": sorted({(report.get("original_storage_path") or "").strip() for report in reports if (report.get("original_storage_path") or "").strip()}),
+        "gcs_paths": sorted({(report.get("original_gcs_path") or "").strip() for report in reports if (report.get("original_gcs_path") or "").strip()}),
+        "drive_file_ids": sorted({(report.get("original_drive_file_id") or "").strip() for report in reports if (report.get("original_drive_file_id") or "").strip()}),
+    }
+
+
+def clear_original_archive_fields(report_ids: list[str]) -> int:
+    unique_ids = sorted({report_id for report_id in report_ids if report_id})
+    if not unique_ids:
+        return 0
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .update(
+            {
+                "original_storage_backend": "",
+                "original_storage_path": "",
+                "original_gcs_path": "",
+                "original_drive_file_id": "",
+                "original_drive_path": "",
+                "original_size_bytes": 0,
+                "original_sha256": "",
+            }
+        )
+        .in_("id", unique_ids)
+        .execute()
+    )
+    return len(result.data or [])
+
+
+def delete_original_archives_for_reports(reports: list[dict], clear_rows: bool = True) -> dict:
+    targets = original_archive_delete_targets(reports)
+    result = {
+        "reports": len(reports),
+        "supabase": delete_supabase_storage_objects(targets["supabase_paths"]),
+        "gcs": {"selected": len(targets["gcs_paths"]), "deleted": 0, "failed": []},
+        "drive": {"selected": len(targets["drive_file_ids"]), "deleted": 0, "failed": []},
+        "rows_cleared": 0,
+    }
+    if targets["gcs_paths"]:
+        result["gcs"] = delete_gcs_storage_objects(targets["gcs_paths"])
+    if targets["drive_file_ids"]:
+        result["drive"] = delete_drive_storage_objects(targets["drive_file_ids"])
+    if clear_rows:
+        result["rows_cleared"] = clear_original_archive_fields([report["id"] for report in reports if report.get("id")])
+    return result
+
+
+def prune_previous_original_archives(user_id: str, keep_report_id: str) -> dict:
+    reports = list_reports_for_user(user_id)
+    stale_reports = [
+        report
+        for report in reports
+        if report.get("id") != keep_report_id
+        and (
+            report.get("original_storage_path")
+            or report.get("original_gcs_path")
+            or report.get("original_drive_file_id")
+            or int(report.get("original_size_bytes") or 0) > 0
+            or report.get("original_sha256")
+        )
+    ]
+    if not stale_reports:
+        return {"reports": 0, "supabase": {"selected": 0, "deleted": 0, "failed": []}, "gcs": {"selected": 0, "deleted": 0, "failed": []}, "drive": {"selected": 0, "deleted": 0, "failed": []}, "rows_cleared": 0}
+    return delete_original_archives_for_reports(stale_reports, clear_rows=True)
+
+
 def download_from_supabase_storage(storage_path: str) -> bytes:
     return get_supabase().storage.from_(REPORTS_BUCKET).download(storage_path)
 
@@ -6264,7 +6389,7 @@ def audit():
         except Exception as exc:
             error_message = f"{exc}"
             try:
-                create_report_record(
+                failed_report = create_report_record(
                     user=user,
                     original_filename=original_filename,
                     report_filename=download_name,
@@ -6281,6 +6406,12 @@ def audit():
                     original_sha256=original_archive["original_sha256"],
                     error_message=error_message,
                 )
+                try:
+                    cleanup_result = prune_previous_original_archives(user["id"], failed_report["id"])
+                    if cleanup_result.get("reports"):
+                        app.logger.info("Pruned previous original archives for user %s after failed audit: %s", user["id"], cleanup_result)
+                except Exception:
+                    app.logger.warning("Failed to prune previous original archives for user %s", user["id"], exc_info=True)
             except Exception:
                 app.logger.warning("Failed to create failed report record for user %s", user["id"], exc_info=True)
             record_event("audit_failed", user, {"filename": original_filename, "stage": "audit", "error": error_message[:240], "college": college_info["college_name"]})
@@ -6316,7 +6447,7 @@ def audit():
                     report_error_message = f"GCS 归档失败：{exc}"
 
         try:
-            create_report_record(
+            report_record = create_report_record(
                 user=user,
                 original_filename=original_filename,
                 report_filename=download_name,
@@ -6338,6 +6469,12 @@ def audit():
                 report_sha256=report_sha256,
                 error_message=report_error_message,
             )
+            try:
+                cleanup_result = prune_previous_original_archives(user["id"], report_record["id"])
+                if cleanup_result.get("reports"):
+                    app.logger.info("Pruned previous original archives for user %s after successful audit: %s", user["id"], cleanup_result)
+            except Exception:
+                app.logger.warning("Failed to prune previous original archives for user %s", user["id"], exc_info=True)
         except Exception:
             app.logger.warning("Failed to create report record for user %s", user["id"], exc_info=True)
 
