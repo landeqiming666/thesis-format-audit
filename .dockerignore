@@ -1,4 +1,5 @@
 .git
+.codex-tasks
 .venv
 .env
 .env.*
@@ -9,3 +10,4 @@ __pycache__
 *_format_audit_report.html
 .DS_Store
 /tmp
+upc-thesis-audit-video
