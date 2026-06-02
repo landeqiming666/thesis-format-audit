@@ -3593,7 +3593,7 @@ def audit_acknowledgement(ctx: AuditContext):
             ack = paragraph
             break
     if ack is None:
-        ctx.add("致谢页格式", "FAIL", "致谢", "未找到致谢标题。", severity="重要")
+        ctx.add("致谢页格式", "WARN", "致谢", "未找到致谢标题；如学院模板要求致谢，请补充并人工复核。", severity="一般")
         return
 
     bad = []
@@ -3615,11 +3615,11 @@ def audit_acknowledgement(ctx: AuditContext):
 
     ctx.add(
         "致谢页格式",
-        "PASS" if not bad else "FAIL",
+        "PASS" if not bad else "WARN",
         f"P{ack_idx + 1}",
-        "致谢应作为一级标题，中间空两格，并单独起页。",
+        "致谢建议作为一级标题，中间空两格，并单独起页；本项作为提醒，不作为强制未通过。",
         "异常项：" + html.escape(str(bad)) if bad else "致谢标题格式和段前分页设置符合要求。",
-        "重要",
+        "一般",
     )
 
 
