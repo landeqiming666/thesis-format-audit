@@ -1037,6 +1037,39 @@ def looks_like_foreign_reference(text: str) -> bool:
     return letters >= 20 and letters > cjk * 2
 
 
+def reference_author_looks_missing(text: str) -> bool:
+    body = re.sub(r"^\[\d+\]\s*", "", text or "").strip()
+    if not body:
+        return True
+    type_match = re.search(r"\[[A-Z]+(?:/OL)?\]", body)
+    title_prefix = body[: type_match.start() if type_match else len(body)]
+    # GB/T references put the responsibility statement before the title.
+    # For English names such as "Y.W. Shi, B.Y. Chen" the first dot is not a title separator.
+    if re.match(r"(?i)^[A-Z](?:\.[A-Z])+\.?\s+[A-Z][A-Za-z-]+", title_prefix):
+        return False
+    if re.match(r"(?i)^[A-Z][A-Za-z-]+(?:\s+[A-Z]\.)?(?:\s*,\s*[A-Z][A-Za-z-]+|,\s*et\s+al|\s+et\s+al)", title_prefix):
+        return False
+    author_part = re.split(r"(?<![A-Z])\.(?![A-Z])", title_prefix, maxsplit=1, flags=re.I)[0].strip()
+    author_part = re.sub(r"^\s*[\[\(【（].*?[\]\)】）]\s*", "", author_part).strip()
+    if not author_part or author_part.startswith("[") or len(author_part) <= 1:
+        return True
+    if has_cjk(author_part):
+        return not re.search(r"[\u3400-\u9fff]{2,}", author_part)
+    return not re.search(r"[A-Za-z]{2,}", author_part)
+
+
+def reference_journal_pages_present(type_tail: str) -> bool:
+    if not type_tail:
+        return False
+    # Accept common GB/T forms: 2020,12(3):45-50, 2020,(3):45-50, 2020:45-50.
+    return bool(
+        re.search(
+            r"(?:\d+\s*)?(?:\(\s*\d+\s*\)\s*)?[:：]\s*\d+\s*[-—－]\s*\d+",
+            type_tail,
+        )
+    )
+
+
 def audit_basic(ctx: AuditContext):
     doc = ctx.doc
     if not doc.paragraphs:
@@ -2072,8 +2105,10 @@ def audit_chinese_punctuation(ctx: AuditContext):
             continue
         if not has_cjk(text):
             continue
-        for m in re.finditer(r"(?<=[\u3400-\u9fff]),(?=[\u3400-\u9fff])|(?<=[\u3400-\u9fff]),(?=\s*[\u3400-\u9fff])", text):
-            hits.append((i + 1, "半角英文逗号", text[max(0, m.start() - 30): min(len(text), m.end() + 30)]))
+        for m in re.finditer(r"(?<=[\u3400-\u9fff])[,;](?=[\u3400-\u9fff])|(?<=[\u3400-\u9fff])[,;](?=\s*[\u3400-\u9fff])", text):
+            mark = m.group(0)
+            label = "半角英文分号" if mark == ";" else "半角英文逗号"
+            hits.append((i + 1, label, mark, text[max(0, m.start() - 30): min(len(text), m.end() + 30)]))
             break
         if len(hits) >= 20:
             break
@@ -2082,23 +2117,32 @@ def audit_chinese_punctuation(ctx: AuditContext):
         "PASS" if not hits else "WARN",
         "正文",
         "中文正文中逗号等标点应使用全角中文标点，例如用“，”代替英文半角“,”。",
-        "异常片段：" + html.escape(str(hits[:20])) if hits else "未发现中文正文中常见半角逗号问题。",
+        "异常片段：" + html.escape(str(hits[:20])) if hits else "未发现中文正文中常见半角标点问题。",
         "一般",
     )
+    vip_punctuation_bad = [
+        (
+            line,
+            f"使用了半角英文标点符号“{mark}(英文)”",
+            f"应使用全角中文标点符号“{'；' if mark == ';' else '，'}(中文)”",
+            sample,
+        )
+        for line, _label, mark, sample in hits[:20]
+    ]
     ctx.add(
         "标点符号问题（官方检测兼容）",
         "PASS" if not hits else "WARN",
         "正文",
-        "维普会单独提示标点符号问题；中文上下文中的半角英文逗号“,”应改为全角中文逗号“，”。",
-        "异常项：" + html.escape(str([(line, "使用了半角英文标点符号“,(英文)”", "应使用全角中文标点符号“，(中文)”", sample) for line, _, sample in hits[:20]])) if hits else "未发现维普式标点符号异常。",
+        "维普会单独提示标点符号问题；中文上下文中的半角英文逗号“,”、分号“;”应改为全角中文标点。",
+        "异常项：" + html.escape(str(vip_punctuation_bad)) if hits else "未发现维普式标点符号异常。",
         "一般",
     )
     ctx.add(
         "正文文本内容-提醒-标点符号问题（官方检测兼容）",
         "PASS" if not hits else "WARN",
         "正文文本内容",
-        "维普会按“正文文本内容-提醒-标点符号问题”提示中文语境中的半角英文标点；中文上下文中的英文逗号应改为中文逗号。",
-        "异常项：" + html.escape(str([(line, "使用了半角英文标点符号“,(英文)”", "应使用全角中文标点符号“，(中文)”", sample) for line, _, sample in hits[:20]])) if hits else "未发现维普式正文文本标点符号提醒。",
+        "维普会按“正文文本内容-提醒-标点符号问题”提示中文语境中的半角英文标点；中文上下文中的英文标点应改为中文标点。",
+        "异常项：" + html.escape(str(vip_punctuation_bad)) if hits else "未发现维普式正文文本标点符号提醒。",
         "一般",
     )
 
@@ -2599,6 +2643,19 @@ def audit_tables(ctx: AuditContext):
         ),
         "重要",
     )
+    vip_missing_table_captions = [
+        (item[0], "表标题缺失或者表标题字数过长", "请补充完整表标题或精简表标题字数", item[2] if len(item) > 2 else "")
+        for item in caption_bad
+        if len(item) >= 2 and "未检测到规范表题" in str(item[1])
+    ]
+    ctx.add(
+        "表标题缺失（官方检测兼容）",
+        "PASS" if not vip_missing_table_captions else "FAIL",
+        "内容书写规范问题-表标题缺失",
+        "维普会按“内容书写规范问题-表标题缺失”提示表格缺少规范表标题或表标题过长；表格上方应写完整表号和表题。",
+        "异常项：" + html.escape(str(vip_missing_table_captions[:25])) if vip_missing_table_captions else "未发现维普式表标题缺失异常。",
+        "重要",
+    )
     ctx.add(
         "表格编号连续性",
         "PASS" if not number_bad and not dot_table_bad else "FAIL",
@@ -2923,7 +2980,12 @@ def audit_references(ctx: AuditContext):
     bad_gbt = []
     bad_type = []
     standard_type_bad = []
+    ref_number_format_bad = []
     missing_pub_place = []
+    missing_author = []
+    missing_access_date = []
+    missing_access_url = []
+    missing_journal_pages = []
     vip_ref_font_bad = []
     vip_ref_size_bad = []
     vip_ref_font_seen = set()
@@ -2957,12 +3019,26 @@ def audit_references(ctx: AuditContext):
                     bad_type.append((i + 1, str(len(auto_number_refs)), text[:120]))
                 if "GB/T " in text and "[S]" not in text:
                     standard_type_bad.append((i + 1, str(len(auto_number_refs)), text[:120]))
+            else:
+                ref_number_format_bad.append((i + 1, "缺少序号或格式有误", "参考文献序号应置于方括号中，如“[1]”", text[:120]))
         if ref_no:
             ref_language_counts["foreign" if looks_like_foreign_reference(text) else "chinese"] += 1
+            if reference_author_looks_missing(text):
+                missing_author.append((i + 1, ref_no, "缺少作者", text[:140]))
         if ref_no and re.search(r"\[(?:D|M)\]", text):
             tail = re.split(r"\[(?:D|M)\]", text, maxsplit=1)[-1]
             if not re.search(r"[\.:：][^,，。]{2,}[:：][^,，。]{2,}[,，]\s*\d{4}", tail):
                 missing_pub_place.append((i + 1, ref_no, "保存地或保存单位缺失", text[:140]))
+        if ref_no and re.search(r"\[(?:M|D|S|C|J/OL|EB/OL|OL)\]", text):
+            if re.search(r"\[(?:J/OL|EB/OL|OL)\]", text) or "http" in text.lower() or "doi" in text.lower():
+                if not re.search(r"\[\d{4}-\d{1,2}-\d{1,2}\]", text):
+                    missing_access_date.append((i + 1, ref_no, "引用日期缺失", text[:140]))
+                if not re.search(r"https?://|doi\.org|DOI[:：]", text, re.I):
+                    missing_access_url.append((i + 1, ref_no, "获取或访问路径缺失", text[:140]))
+        if ref_no and re.search(r"\[J(?:/OL)?\]", text):
+            type_tail = re.split(r"\[J(?:/OL)?\]", text, maxsplit=1)[-1]
+            if not reference_journal_pages_present(type_tail):
+                missing_journal_pages.append((i + 1, ref_no, "页码缺失", text[:140]))
         if re.search(r"Gb/t|gb/t|Gb/T", text):
             bad_gbt.append((i + 1, text[:120]))
         r = first_text_run(p)
@@ -3000,12 +3076,33 @@ def audit_references(ctx: AuditContext):
                 break
     if not ref_nums:
         ctx.add("参考文献编号", "FAIL", "参考文献", "未识别到参考文献编号。", severity="严重")
+        missing = []
     else:
         missing = [n for n in range(1, max(ref_nums) + 1) if n not in set(ref_nums)]
         evidence = f"数量={len(ref_nums)}，缺号={missing[:20]}"
         if auto_number_refs:
             evidence += "；检测到Word自动编号参考文献：" + html.escape(str(auto_number_refs[:20]))
         ctx.add("参考文献编号", "PASS" if not missing else "FAIL", "参考文献", "参考文献编号应连续。", evidence, "重要")
+    ref_number_sort_bad = [
+        ("当前编号与前文编号不连续", f"当前序号应为{n}", n)
+        for n in missing[:20]
+    ]
+    ctx.add(
+        "序号问题（官方检测兼容）",
+        "PASS" if not ref_number_format_bad else "WARN",
+        "参考文献格式及引用规范问题-序号问题",
+        "维普会按“参考文献格式及引用规范问题-序号问题”提示参考文献缺少序号或序号格式有误；序号应写作“[1]”。",
+        "异常项：" + html.escape(str(ref_number_format_bad[:20])) if ref_number_format_bad else "未发现维普式参考文献序号格式异常。",
+        "一般",
+    )
+    ctx.add(
+        "序号排序问题（官方检测兼容）",
+        "PASS" if not ref_number_sort_bad else "WARN",
+        "参考文献格式及引用规范问题-序号问题",
+        "维普会按“序号排序问题”提示参考文献编号不连续；参考文献序号应从[1]开始连续递增。",
+        "异常项：" + html.escape(str(ref_number_sort_bad)) if ref_number_sort_bad else "未发现维普式参考文献序号排序异常。",
+        "一般",
+    )
     if ref_nums:
         ref_count_ok = len(ref_nums) >= 10
         ctx.add(
@@ -3039,6 +3136,18 @@ def audit_references(ctx: AuditContext):
     uncited = sorted(set(ref_nums) - set(cites))
     no_ref = sorted(set(cites) - set(ref_nums))
     ctx.add("参考文献引用", "PASS" if not uncited and not no_ref else "FAIL", "参考文献", "所有参考文献应在正文中引用。", f"未引用={uncited}; 引用无文献={no_ref}", "重要")
+    vip_inner_citation_bad = [
+        (n, "未找到对应参考文献", "正文内的引用标记（如 [1]）需以上标形式标注，必须与文后的参考文献序号一一对应")
+        for n in no_ref[:30]
+    ]
+    ctx.add(
+        "文内引用问题（官方检测兼容）",
+        "PASS" if not vip_inner_citation_bad else "WARN",
+        "参考文献格式及引用规范问题-引用规范问题",
+        "维普会按“文内引用问题”提示正文引用标号找不到对应参考文献；正文引用必须与文后参考文献序号一一对应。",
+        "异常项：" + html.escape(str(vip_inner_citation_bad)) if vip_inner_citation_bad else "未发现维普式文内引用对应关系异常。",
+        "一般",
+    )
     first_order = []
     seen_cites = set()
     for n in cites:
@@ -3120,6 +3229,46 @@ def audit_references(ctx: AuditContext):
         "参考文献内容",
         "维普会按“参考文献内容-提醒-保存地或保存单位问题”提示学位论文或专著著录信息不完整；请补全保存地/保存单位或出版地/出版社。",
         "异常项：" + html.escape(str(missing_pub_place[:20])) if missing_pub_place else "未发现维普式参考文献保存地或保存单位提醒。",
+        "一般",
+    )
+    ctx.add(
+        "出版地或出版者问题（官方检测兼容）",
+        "PASS" if not missing_pub_place else "FAIL",
+        "参考文献格式及引用规范问题-参考文献元素问题",
+        "维普会按“出版地或出版者问题”提示专著、学位论文等参考文献缺少出版地、出版者、保存地或保存单位。",
+        "异常项：" + html.escape(str([(line, no, "出版地或出版者缺失", sample) for line, no, _issue, sample in missing_pub_place[:20]])) if missing_pub_place else "未发现维普式出版地或出版者异常。",
+        "重要",
+    )
+    ctx.add(
+        "作者问题（官方检测兼容）",
+        "PASS" if not missing_author else "WARN",
+        "参考文献格式及引用规范问题-参考文献元素问题",
+        "维普会按“作者问题”提示参考文献缺少作者；请在题名前补全责任者。",
+        "异常项：" + html.escape(str(missing_author[:20])) if missing_author else "未发现维普式参考文献作者缺失异常。",
+        "一般",
+    )
+    ctx.add(
+        "引用日期问题（官方检测兼容）",
+        "PASS" if not missing_access_date else "WARN",
+        "参考文献格式及引用规范问题-参考文献元素问题",
+        "维普会按“引用日期问题”提示联机文献缺少引用日期；电子或在线文献应补充形如“[2026-06-02]”的引用日期。",
+        "异常项：" + html.escape(str(missing_access_date[:30])) if missing_access_date else "未发现维普式引用日期缺失异常。",
+        "一般",
+    )
+    ctx.add(
+        "获取或访问路径问题（官方检测兼容）",
+        "PASS" if not missing_access_url else "WARN",
+        "参考文献格式及引用规范问题-参考文献元素问题",
+        "维普会按“获取或访问路径问题”提示在线文献缺少 URL、DOI 或访问路径。",
+        "异常项：" + html.escape(str(missing_access_url[:30])) if missing_access_url else "未发现维普式获取或访问路径缺失异常。",
+        "一般",
+    )
+    ctx.add(
+        "期刊文献页码问题（官方检测兼容）",
+        "PASS" if not missing_journal_pages else "WARN",
+        "参考文献格式及引用规范问题-参考文献元素问题",
+        "维普会按“期刊文献页码问题”提示期刊参考文献缺少页码；期刊文献通常应包含卷(期):起止页码。",
+        "异常项：" + html.escape(str(missing_journal_pages[:20])) if missing_journal_pages else "未发现维普式期刊文献页码缺失异常。",
         "一般",
     )
     ref_type_bad = bad_type + standard_type_bad
@@ -3206,6 +3355,29 @@ def audit_document_structure(ctx: AuditContext):
     appendix_idx = first_index(lambda _i, p: clean_text(p.text) == "附录")
     if appendix_idx is not None:
         found.append(("附录", appendix_idx))
+
+    blank_page_candidates = []
+    last_page_break_line = None
+    has_content_since_break = True
+    for i, paragraph in enumerate(doc.paragraphs, 1):
+        text = paragraph.text.strip()
+        xml = paragraph._p.xml
+        has_page_break = 'w:type="page"' in xml or "lastRenderedPageBreak" in xml
+        if text:
+            has_content_since_break = True
+        if has_page_break:
+            if last_page_break_line is not None and not has_content_since_break:
+                blank_page_candidates.append((last_page_break_line, i, "连续分页符之间未检测到正文内容"))
+            last_page_break_line = i
+            has_content_since_break = False
+    ctx.add(
+        "空白页问题（官方检测兼容）",
+        "PASS" if not blank_page_candidates else "WARN",
+        "页面布局设置问题-分页与分节问题",
+        "维普会按“页面布局设置问题-分页与分节问题-空白页问题”提示论文中存在空白页；应删除多余分页符或空白分节。",
+        "异常项：" + html.escape(str(blank_page_candidates[:20])) if blank_page_candidates else "未发现维普式疑似空白页异常。",
+        "一般",
+    )
 
     missing = [name for name, pos in found if pos is None]
     present = [(name, pos + 1) for name, pos in found if pos is not None]
