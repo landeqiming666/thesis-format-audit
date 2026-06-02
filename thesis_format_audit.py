@@ -875,11 +875,70 @@ def docx_pageref_count(path: Path) -> int:
     return document_xml(path).count("PAGEREF")
 
 
+def rels_target_to_member(rels_name: str, target: str) -> Optional[str]:
+    if not target or target.startswith(("#", "/", "\\")):
+        return None
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
+        return None
+
+    if rels_name == "_rels/.rels":
+        base_dir = ""
+    else:
+        rels_path = Path(rels_name)
+        rels_parent = rels_path.parent
+        if rels_parent.name == "_rels":
+            base_dir = rels_parent.parent.as_posix()
+        else:
+            base_dir = rels_parent.as_posix()
+        if base_dir == ".":
+            base_dir = ""
+
+    member = Path(base_dir, target.replace("\\", "/")).as_posix()
+    parts = []
+    for part in member.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def remove_broken_internal_relationships(rels_name: str, rels_xml: bytes, package_names: set[str]) -> tuple[bytes, bool]:
+    try:
+        root = ET.fromstring(rels_xml)
+    except ET.ParseError:
+        return rels_xml, False
+
+    changed = False
+    for rel in list(root):
+        target = rel.get("Target", "").strip()
+        mode = (rel.get("TargetMode") or "").lower()
+        if mode == "external":
+            continue
+
+        member = rels_target_to_member(rels_name, target)
+        target_token = target.replace("\\", "/").strip("/").lower()
+        is_null_target = target_token in {"null", "../null"} or target_token.endswith("/null")
+        is_missing_target = bool(member) and member not in package_names
+        if is_null_target or is_missing_target:
+            root.remove(rel)
+            changed = True
+
+    if not changed:
+        return rels_xml, False
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), True
+
+
 def make_python_docx_compatible_copy(path: Path, work_dir: Path) -> Path:
-    """Convert Strict OOXML relationship types in a temp copy for python-docx."""
+    """Create a temp copy that avoids common OOXML issues python-docx cannot open."""
     try:
         with zipfile.ZipFile(path) as src:
             names = src.namelist()
+            name_set = set(names)
             xml_names = [
                 name for name in names
                 if name.endswith((".xml", ".rels")) and not name.startswith("word/media/")
@@ -888,13 +947,21 @@ def make_python_docx_compatible_copy(path: Path, work_dir: Path) -> Path:
                 any(strict in src.read(name).decode("utf-8", errors="ignore") for strict in STRICT_TO_TRANSITIONAL_URIS)
                 for name in xml_names
             )
+            broken_rels: dict[str, bytes] = {}
+            for name in names:
+                if not name.endswith(".rels"):
+                    continue
+                cleaned, changed = remove_broken_internal_relationships(name, src.read(name), name_set)
+                if changed:
+                    broken_rels[name] = cleaned
+            needs_rewrite = needs_rewrite or bool(broken_rels)
             if not needs_rewrite:
                 return path
 
             fixed = work_dir / f"{path.stem}_compatible.docx"
             with zipfile.ZipFile(fixed, "w", compression=zipfile.ZIP_DEFLATED) as dst:
                 for info in src.infolist():
-                    data = src.read(info.filename)
+                    data = broken_rels.get(info.filename) or src.read(info.filename)
                     if info.filename in xml_names:
                         for strict, transitional in STRICT_TO_TRANSITIONAL_URIS.items():
                             data = data.replace(strict.encode("utf-8"), transitional.encode("utf-8"))
