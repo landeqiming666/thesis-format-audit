@@ -618,12 +618,13 @@ def caption_segment_issues(paragraph, segment_text: str, runs: list, expected_si
         bad_sizes = [s for s in bad_sizes if not any(abs(s - ok) <= 0.2 for ok in (10.5, 12))]
     if bad_sizes:
         shown = "/".join(f"{s:g}" for s in bad_sizes[:3])
-        issues.append(f"当前字号{shown}pt，应为小四12pt")
+        target = "五号10.5pt" if abs(expected_size - 10.5) <= 0.2 else f"{expected_size:g}pt"
+        issues.append(f"当前字号{shown}pt，应为{target}")
     bad_east = [f for f in east_values if f != "宋体"]
     if has_cjk(segment_text) and bad_east:
         issues.append(f"当前中文字体{'/'.join(bad_east[:3])}，应为宋体")
         near_five = [s for s in size_values if abs(s - 10.5) <= 0.2]
-        if not strict_size and near_five:
+        if not strict_size and near_five and abs(expected_size - 10.5) > 0.2:
             issues.append("当前字号五号，按维普图题文字规范应为小四12pt")
     bad_latin = [f for f in latin_values if f != "Times New Roman"]
     if has_latin_or_digit(segment_text) and bad_latin:
@@ -1633,8 +1634,9 @@ def audit_toc(ctx: AuditContext):
             bad.append((i + 1, "行距", line, t[:60]))
         if abs(left - expected_left) > 30:
             bad.append((i + 1, "缩进", left, f"应为{expected_left}", t[:60]))
-        if (sample_size if sample_size is not None else size) != 12:
-            bad.append((i + 1, "字号", sample_size if sample_size is not None else size, t[:60]))
+        actual_size = sample_size if sample_size is not None else size
+        if actual_size is not None and actual_size != 12:
+            bad.append((i + 1, "字号", actual_size, t[:60]))
         if (sample_east if sample_east is not None else east) not in ("宋体", None):
             bad.append((i + 1, "字体", sample_east if sample_east is not None else east, t[:60]))
     ctx.add(
@@ -2156,7 +2158,7 @@ def audit_chinese_punctuation(ctx: AuditContext):
 
 def audit_figures_tables(ctx: AuditContext):
     doc = ctx.doc
-    official_figure_caption_size = 12
+    official_figure_caption_size = 10.5
     fig_cap_pat = re.compile(r"^图(\d+)-(\d+)\s+(.+)$")
     dot_fig_cap_pat = re.compile(r"^图(\d+)\.(\d+)\s+(.+)$")
     dot_table_cap_pat = re.compile(r"^表(\d+)\.(\d+)\s+(.+)$")
@@ -2212,7 +2214,7 @@ def audit_figures_tables(ctx: AuditContext):
                 segment_text,
                 segment_runs,
                 official_figure_caption_size,
-                strict_size=segment_name == "文献标注",
+                strict_size=segment_name != "文献标注",
             )
             if segment_bad:
                 figure_caption_bad.append((
@@ -2277,6 +2279,8 @@ def audit_figures_tables(ctx: AuditContext):
         next_style = paragraph_style_name(doc.paragraphs[next_idx]) if next_idx is not None else ""
         if next_style.startswith(("Heading", "toc")) or re.match(r"^(第\s*\d+\s*章|\d+\.\d+)", next_text):
             continue
+        if len(next_text) > 45 or re.search(r"[。；;，,]", next_text):
+            continue
         if next_idx is None or not fig_cap_pat.match(next_text) or not is_centered(doc.paragraphs[next_idx]):
             image_caption_bad.append((idx + 1, "图片下方未检测到规范图题", next_idx + 1 if next_idx is not None else None, next_text[:80]))
 
@@ -2299,7 +2303,7 @@ def audit_figures_tables(ctx: AuditContext):
         "正文插图题注",
         "PASS" if not figure_caption_bad and not image_caption_bad and figure_captions else "FAIL",
         "正文插图",
-        "所有插图应在图位下方设置图号和图题，图号与图题之间空一格，图题居中；按官方检测结果，图题文字按小四宋体复核。",
+        "所有插图应在图位下方设置图号和图题，图号与图题之间空一格，图题居中，图题文字按五号宋体复核。",
         (
             f"检测正文图片 {max(len(doc.inline_shapes) - 1, 0)} 张，规范图题 {len(figure_captions)} 个。"
             + ("<br>图题格式异常：" + html.escape(str(figure_caption_bad[:20])) if figure_caption_bad else "")
@@ -2383,7 +2387,7 @@ def audit_figures_tables(ctx: AuditContext):
         "正文中文图标题-字号问题（官方检测兼容）",
         "PASS" if not vip_figure_caption_size_bad else "FAIL",
         "正文中文图标题",
-        "维普会单独提示中文图标题字号问题；按官方检测结果图题文字应为小四号。",
+        "维普会单独提示中文图标题字号问题；图题文字应为五号 10.5 pt。",
         "异常项：" + html.escape(str(vip_figure_caption_size_bad[:20])) if vip_figure_caption_size_bad else "未发现维普式中文图标题字号异常。",
         "重要",
     )
@@ -4334,9 +4338,9 @@ def human_evidence_points(f: Finding) -> list[str]:
     if "lineSpacing=None" in raw or "lineSpacing=False" in raw or "line=False" in raw:
         points.append("需要把行距设置为 1.5 倍。")
     if "beforeLines0.5=False" in raw:
-        points.append("需要设置段前 0.5 行。")
+        points.append("当前段前间距不是 0.5 行。")
     if "afterLines0.5=False" in raw:
-        points.append("需要设置段后 0.5 行。")
+        points.append("当前段后间距不是 0.5 行。")
     if "firstLine2=False" in raw or "首行缩进" in raw and "False" in raw:
         points.append("需要设置首行缩进 2 字符。")
     if "fontIssues=[]" not in raw and "fontIssues=" in raw:
@@ -4346,7 +4350,9 @@ def human_evidence_points(f: Finding) -> list[str]:
 
     keyword_count = re.search(r"关键词数=(\d+)", raw)
     if keyword_count:
-        points.append(f"检测到关键词 {keyword_count.group(1)} 个。")
+        count = int(keyword_count.group(1))
+        if count < 3 or count > 5:
+            points.append(f"检测到关键词 {count} 个，通常应为 3-5 个。")
     if "中文冒号=False" in raw:
         points.append("“关键词”和内容之间应使用中文冒号“：”。")
     if "中文分号=False" in raw:
