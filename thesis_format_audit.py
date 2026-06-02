@@ -632,6 +632,14 @@ def caption_segment_issues(paragraph, segment_text: str, runs: list, expected_si
     return issues
 
 
+def math_plain_text(paragraph) -> str:
+    texts = []
+    for node in paragraph._p.xpath(".//m:t"):
+        if node.text:
+            texts.append(node.text)
+    return "".join(texts)
+
+
 def vip_figure_label_issues(paragraph, segment_text: str, runs: list) -> list[str]:
     issues = []
     target_runs = runs or [r for r in paragraph.runs if r.text and r.text.strip()]
@@ -1113,6 +1121,9 @@ def audit_abstracts(ctx: AuditContext):
     vip_en_abstract_font_bad = []
     vip_cn_abstract_size_bad = []
     vip_en_abstract_size_bad = []
+    cn_keyword_count = None
+    en_keyword_count = None
+    keyword_count_mismatch = []
 
     def collect_abstract_font_size(line_no: int, part: str, issues: list[str], sample: str):
         for issue in issues:
@@ -1216,6 +1227,7 @@ def audit_abstracts(ctx: AuditContext):
         text = p.text.strip()
         kws = text.split("：", 1)[1] if "：" in text else text.split(":", 1)[1] if ":" in text else ""
         count = len([x for x in re.split(r"[；;]", kws) if x.strip()])
+        cn_keyword_count = count
         uses_cn_colon = "关键词：" in text
         uses_cn_semicolon = "；" in kws and ";" not in kws
         trailing = text.endswith(("。", ".", "；", ";"))
@@ -1337,6 +1349,7 @@ def audit_abstracts(ctx: AuditContext):
         text = p.text.strip()
         content = text.split(":", 1)[1] if ":" in text else text.split("：", 1)[1] if "：" in text else ""
         count = len([x for x in re.split(r"[;；]", content) if x.strip()])
+        en_keyword_count = count
         uses_cn_colon = text.startswith("Keywords：")
         uses_cn_semicolon = "；" in content and ";" not in content
         keywords_bold = leading_label_bold(p, "Keywords")
@@ -1409,6 +1422,16 @@ def audit_abstracts(ctx: AuditContext):
             "异常项：" + html.escape(str(separator_bad)) if separator_bad else "未发现维普式英文关键词内容分隔符异常。",
             "重要",
         )
+    if cn_keyword_count is not None and en_keyword_count is not None and cn_keyword_count != en_keyword_count:
+        keyword_count_mismatch.append(("中英文关键词数量不一致", f"中文{cn_keyword_count}个", f"英文{en_keyword_count}个", "中英文关键词数量应相等"))
+    ctx.add(
+        "英文关键词数量对应问题（官方检测兼容）",
+        "PASS" if not keyword_count_mismatch else "FAIL",
+        "英文关键词",
+        "维普会按“数量对应问题”提示中英文关键词数量不一致；中文关键词和英文关键词应一一对应。",
+        "异常项：" + html.escape(str(keyword_count_mismatch)) if keyword_count_mismatch else "未发现维普式中英文关键词数量不一致问题。",
+        "重要",
+    )
     ctx.add(
         "摘要字体问题（官方检测兼容）",
         "PASS" if not vip_abstract_font_bad else "FAIL",
@@ -2831,15 +2854,23 @@ def audit_formulas(ctx: AuditContext):
     formula_size_bad = []
     math_font_seen = set()
     missing_formula_nums = []
+    formula_number_writing_bad = []
+    formula_num_pat = re.compile(r"[\(（](?:\d+-\d+|A-\d+)[\)）]")
+    formula_num_ascii_pat = re.compile(r"\((?:\d+-\d+|A-\d+)\)")
+    formula_num_fullwidth_pat = re.compile(r"（(?:\d+-\d+|A-\d+)）")
     chapter_counts: dict[str, list[int]] = {}
     appendix_nums = []
     for pi, p in enumerate(doc.paragraphs, 1):
         text = p.text.strip()
         has_math = bool(p._p.xpath(".//m:oMath")) or bool(p._p.xpath(".//m:oMathPara"))
+        math_text = math_plain_text(p) if has_math else ""
+        for source, label in ((text, text[:90]), (math_text, "公式对象")):
+            for num in formula_num_ascii_pat.findall(source):
+                formula_number_writing_bad.append((pi, num, f"{num}(英文括号)", "（1-1）(中文括号)", label))
         standalone_math = has_math and not text
         if not standalone_math:
             continue
-        has_num = bool(re.search(r"\((?:\d+-\d+|A-\d+)\)", text))
+        has_num = bool(formula_num_pat.search(text))
         if not has_num:
             snippet = text[:80] if text else "公式对象"
             missing_formula_nums.append((pi, snippet))
@@ -2872,13 +2903,15 @@ def audit_formulas(ctx: AuditContext):
         right = table.rows[0].cells[1]
         has_math_obj = any(p._p.xpath(".//m:oMath") or p._p.xpath(".//m:oMathPara") for p in left.paragraphs)
         num = " ".join(p.text.strip() for p in right.paragraphs if p.text.strip())
-        if not has_math_obj and not re.fullmatch(r"\((?:\d+-\d+|A-\d+)\)", num):
+        if formula_num_ascii_pat.fullmatch(num):
+            formula_number_writing_bad.append((ti, num, f"{num}(英文括号)", "（1-1）(中文括号)", "公式编号"))
+        if not has_math_obj and not formula_num_pat.fullmatch(num):
             continue
         formula_infos.append((ti, num))
         if not has_math_obj:
             bad.append((ti, num, "左侧未识别到公式对象"))
-        if not re.fullmatch(r"\((?:\d+-\d+|A-\d+)\)", num):
-            bad.append((ti, num, "公式编号应为(章号-序号)或附录(A-序号)"))
+        if not formula_num_pat.fullmatch(num):
+            bad.append((ti, num, "公式编号应为(章号-序号)、（章号-序号）或附录(A-序号)"))
 
         left_center = all(effective_paragraph_alignment(p) == WD_ALIGN_PARAGRAPH.CENTER for p in left.paragraphs)
         right_ok = True
@@ -2904,10 +2937,10 @@ def audit_formulas(ctx: AuditContext):
         if right_font_bad:
             bad.append((ti, num, "编号字体字号异常", right_font_bad[:3]))
 
-        m = re.fullmatch(r"\((\d+)-(\d+)\)", num)
+        m = re.fullmatch(r"[\(（](\d+)-(\d+)[\)）]", num)
         if m:
             chapter_counts.setdefault(m.group(1), []).append(int(m.group(2)))
-        am = re.fullmatch(r"\(A-(\d+)\)", num)
+        am = re.fullmatch(r"[\(（]A-(\d+)[\)）]", num)
         if am:
             appendix_nums.append(int(am.group(1)))
 
@@ -2934,6 +2967,14 @@ def audit_formulas(ctx: AuditContext):
         bad.append(("疑似公式缺少编号或编号分行", missing_formula_nums[:30], "公式编号需与公式同行呈现"))
     if math_font_bad:
         bad.append(("公式/数学对象字体", math_font_bad[:30], "数学对象中的字母、数字或上标数字不符合官方Times New Roman检测要求"))
+    deduped_formula_number_writing_bad = []
+    seen_formula_number_writing = set()
+    for item in formula_number_writing_bad:
+        key = (item[0], item[1], item[4])
+        if key in seen_formula_number_writing:
+            continue
+        seen_formula_number_writing.add(key)
+        deduped_formula_number_writing_bad.append(item)
 
     ctx.add(
         "正文公式格式",
@@ -2958,6 +2999,14 @@ def audit_formulas(ctx: AuditContext):
         "维普会按“正文公式-提醒-公式编号缺失”提示公式未编号或编号与公式分行；公式需标注编号，且编号与公式应在同一行呈现。",
         "异常项：" + html.escape(str([(pi, snippet, "当前公式编号缺失或编号与公式分行排版", "公式需标注编号，且编号与公式应在同一行呈现") for pi, snippet in missing_formula_nums[:30]])) if missing_formula_nums else "未发现维普式正文公式编号缺失提醒。",
         "一般" if missing_formula_nums else "重要",
+    )
+    ctx.add(
+        "公式编号写法问题（官方检测兼容）",
+        "PASS" if not deduped_formula_number_writing_bad else "FAIL",
+        "正文公式",
+        "维普可能把半角公式编号“(1-1)”提示为公式编号写法问题；如需贴近维普报告，可将编号改为中文全角括号“（1-1）”。",
+        "异常项：" + html.escape(str(deduped_formula_number_writing_bad[:30])) if deduped_formula_number_writing_bad else "未发现维普式公式编号括号写法问题。",
+        "重要",
     )
     ctx.add(
         "公式字体问题（官方检测兼容）",
@@ -3036,10 +3085,11 @@ def audit_references(ctx: AuditContext):
             ref_language_counts["foreign" if looks_like_foreign_reference(text) else "chinese"] += 1
             if reference_author_looks_missing(text):
                 missing_author.append((i + 1, ref_no, "缺少作者", text[:140]))
-        if ref_no and re.search(r"\[(?:D|M)\]", text):
-            tail = re.split(r"\[(?:D|M)\]", text, maxsplit=1)[-1]
+        if ref_no and re.search(r"\[(?:D|M|C)\]", text):
+            tail = re.split(r"\[(?:D|M|C)\]", text, maxsplit=1)[-1]
             if not re.search(r"[\.:：][^,，。]{2,}[:：][^,，。]{2,}[,，]\s*\d{4}", tail):
-                missing_pub_place.append((i + 1, ref_no, "保存地或保存单位缺失", text[:140]))
+                issue = "出版地或出版者缺失" if "[C]" in text else "保存地或保存单位缺失"
+                missing_pub_place.append((i + 1, ref_no, issue, text[:140]))
         if ref_no and re.search(r"\[(?:M|D|S|C|J/OL|EB/OL|OL)\]", text):
             if re.search(r"\[(?:J/OL|EB/OL|OL)\]", text) or "http" in text.lower() or "doi" in text.lower():
                 if not re.search(r"\[\d{4}-\d{1,2}-\d{1,2}\]", text):
@@ -3222,15 +3272,15 @@ def audit_references(ctx: AuditContext):
         "参考文献著录信息",
         "PASS" if not missing_pub_place else "WARN",
         "参考文献",
-        "学位论文[D]、专著[M]等参考文献应按GB/T 7714—2015补全保存地、保存单位或出版地、出版社等著录信息。",
-        "提醒项：" + html.escape(str(missing_pub_place[:20])) if missing_pub_place else "未发现学位论文或专著明显缺少保存地/出版地信息。",
+        "学位论文[D]、专著[M]、会议论文[C]等参考文献应按GB/T 7714—2015补全保存地、保存单位、出版地或出版者等著录信息。",
+        "提醒项：" + html.escape(str(missing_pub_place[:20])) if missing_pub_place else "未发现学位论文、专著或会议论文明显缺少保存地/出版地信息。",
         "一般",
     )
     ctx.add(
         "保存地或保存单位问题（官方检测兼容）",
         "PASS" if not missing_pub_place else "WARN",
         "参考文献",
-        "维普会单独提示学位论文或专著的保存地、保存单位问题；请按 GB/T 7714—2015 补全保存地/保存单位或出版地/出版社。",
+        "维普会单独提示学位论文、专著或会议论文的保存地、保存单位、出版地或出版者问题；请按 GB/T 7714—2015 补全。",
         "异常项：" + html.escape(str(missing_pub_place[:20])) if missing_pub_place else "未发现维普式保存地或保存单位问题。",
         "一般",
     )
@@ -3238,7 +3288,7 @@ def audit_references(ctx: AuditContext):
         "参考文献内容-提醒-保存地或保存单位问题（官方检测兼容）",
         "PASS" if not missing_pub_place else "WARN",
         "参考文献内容",
-        "维普会按“参考文献内容-提醒-保存地或保存单位问题”提示学位论文或专著著录信息不完整；请补全保存地/保存单位或出版地/出版社。",
+        "维普会按“参考文献内容-提醒-保存地或保存单位问题”提示著录信息不完整；请补全保存地/保存单位、出版地或出版者。",
         "异常项：" + html.escape(str(missing_pub_place[:20])) if missing_pub_place else "未发现维普式参考文献保存地或保存单位提醒。",
         "一般",
     )
@@ -3246,7 +3296,7 @@ def audit_references(ctx: AuditContext):
         "出版地或出版者问题（官方检测兼容）",
         "PASS" if not missing_pub_place else "FAIL",
         "参考文献格式及引用规范问题-参考文献元素问题",
-        "维普会按“出版地或出版者问题”提示专著、学位论文等参考文献缺少出版地、出版者、保存地或保存单位。",
+        "维普会按“出版地或出版者问题”提示专著、学位论文、会议论文等参考文献缺少出版地、出版者、保存地或保存单位。",
         "异常项：" + html.escape(str([(line, no, "出版地或出版者缺失", sample) for line, no, _issue, sample in missing_pub_place[:20]])) if missing_pub_place else "未发现维普式出版地或出版者异常。",
         "重要",
     )
