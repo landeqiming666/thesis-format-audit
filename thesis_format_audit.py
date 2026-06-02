@@ -1047,12 +1047,15 @@ def reference_author_looks_missing(text: str) -> bool:
     # For English names such as "Y.W. Shi, B.Y. Chen" the first dot is not a title separator.
     if re.match(r"(?i)^[A-Z](?:\.[A-Z])+\.?\s+[A-Z][A-Za-z-]+", title_prefix):
         return False
-    if re.match(r"(?i)^[A-Z][A-Za-z-]+(?:\s+[A-Z]\.)?(?:\s*,\s*[A-Z][A-Za-z-]+|,\s*et\s+al|\s+et\s+al)", title_prefix):
+    initials = r"(?:\s+[A-Z]\.?){0,5}"
+    if re.match(rf"(?i)^[A-Z][A-Za-z-]+{initials}(?:\s*[,，]\s*[A-Z][A-Za-z-]+|[,，]\s*et\s+al|\s+et\s+al|[,，]\s*等)", title_prefix):
         return False
     author_part = re.split(r"(?<![A-Z])\.(?![A-Z])", title_prefix, maxsplit=1, flags=re.I)[0].strip()
     author_part = re.sub(r"^\s*[\[\(【（].*?[\]\)】）]\s*", "", author_part).strip()
     if not author_part or author_part.startswith("[") or len(author_part) <= 1:
         return True
+    if re.search(rf"(?i)[A-Z][A-Za-z-]+{initials}(?:\s*[,，]\s*[A-Z][A-Za-z-]+|[,，]\s*等|[,，]\s*et\s+al|\s+et\s+al)", author_part):
+        return False
     if has_cjk(author_part):
         return not re.search(r"[\u3400-\u9fff]{2,}", author_part)
     return not re.search(r"[A-Za-z]{2,}", author_part)
@@ -1910,6 +1913,8 @@ def audit_headings(ctx: AuditContext):
                 h1_nums.append(chapter)
             continue
         if paragraph_style_name(p) == "Heading 2":
+            if re.match(r"^附录\s+[A-Z]\b", text):
+                continue
             m = re.match(r"^(\d+)\.(\d+)\b", text)
             if not m:
                 heading_order_bad.append((i + 1, "二级标题缺少形如1.1的编号", text))
@@ -1919,6 +1924,8 @@ def audit_headings(ctx: AuditContext):
             if current_chapter is not None and chapter != current_chapter:
                 heading_order_bad.append((i + 1, f"二级标题章号{chapter}与当前第{current_chapter}章不一致", text))
         if paragraph_style_name(p) == "Heading 3":
+            if re.match(r"^附录\s+[A-Z]\b", text):
+                continue
             m = re.match(r"^(\d+)\.(\d+)\.(\d+)\b", text)
             if not m:
                 heading_order_bad.append((i + 1, "三级标题缺少形如1.1.1的编号", text))
@@ -2880,12 +2887,12 @@ def audit_formulas(ctx: AuditContext):
                     continue
                 size = run_size(r)
                 latin = run_latin_font(r)
-                if size != 10.5 or latin != "Times New Roman":
+                if (size is not None and size != 10.5) or (latin is not None and latin != "Times New Roman"):
                     right_font_bad.append((size, latin, r.text))
-                if size != 10.5:
-                    formula_size_bad.append((ti, num, f"字号{size or '未识别'}", "5号 10.5 pt", r.text[:40]))
-                if latin != "Times New Roman":
-                    formula_font_bad.append((ti, num, f"字体{latin or '未识别'}", "Times New Roman", r.text[:40]))
+                if size is not None and size != 10.5:
+                    formula_size_bad.append((ti, num, f"字号{size}", "5号 10.5 pt", r.text[:40]))
+                if latin is not None and latin != "Times New Roman":
+                    formula_font_bad.append((ti, num, f"字体{latin}", "Times New Roman", r.text[:40]))
         if not left_center:
             bad.append((ti, num, "公式未居中"))
         if not right_ok:
@@ -3179,7 +3186,7 @@ def audit_references(ctx: AuditContext):
                 size = run_size(r)
                 latin = run_latin_font(r)
                 superscript = r.font.superscript is True
-                if size != 12 or latin != "Times New Roman" or not superscript:
+                if (size is not None and size != 12) or (latin is not None and latin != "Times New Roman") or not superscript:
                     citation_bad.append((pi, m.group(0), size, latin, superscript, p.text.strip()[:70]))
     ctx.add(
         "参考文献引用格式",
