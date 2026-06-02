@@ -729,6 +729,30 @@ def chapter_number_from_text(text: str) -> Optional[int]:
     return digits.get(value)
 
 
+def expected_numeric_chapter_title(chapter: int, title: str = "引言") -> str:
+    return f"第{chapter}章  {title}"
+
+
+def expected_numeric_chapter_heading_for_text(text: str) -> str:
+    stripped = text.strip()
+    chapter = chapter_number_from_text(stripped) or 1
+    title = re.sub(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", "", stripped).strip() or "标题"
+    return expected_numeric_chapter_title(chapter, title)
+
+
+def numeric_chapter_heading_issue(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if not re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", stripped):
+        return None
+    if re.match(r"^第\s*\d+\s*章 {2}\S", stripped):
+        return None
+    if re.match(r"^第\s*[一二三四五六七八九十]+\s*章", stripped):
+        chapter = chapter_number_from_text(stripped)
+        expected = f"第{chapter}章" if chapter is not None else "第1章"
+        return f"章节序号应使用阿拉伯数字写作{expected}"
+    return "章号与章名之间不是两个空格"
+
+
 def paragraph_has_numbering(paragraph) -> bool:
     ppr = paragraph._p.pPr
     return ppr is not None and ppr.find(qn("numPr")) is not None
@@ -1567,8 +1591,9 @@ def audit_headings(ctx: AuditContext):
         if paragraph_style_name(p) != "Heading 1" or not text:
             continue
         is_chapter = re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", text)
-        if is_chapter and not re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章 {2}\S", text):
-            h1_bad.append((i + 1, "章号与章名之间不是两个空格", text))
+        heading_issue = numeric_chapter_heading_issue(text)
+        if heading_issue:
+            h1_bad.append((i + 1, heading_issue, text))
         if text in ("致谢", "致  谢") and text != "致  谢":
             h1_bad.append((i + 1, "致谢中间应空两个空格", text))
         if text in ("附录", "附  录") and text != "附  录":
@@ -1637,34 +1662,42 @@ def audit_headings(ctx: AuditContext):
         None,
     )
     intro_warn = []
-    if first_chapter and clean_text(first_chapter[1]) != "第一章引言":
-        intro_warn.append((first_chapter[0], first_chapter[1], "学校维普官方批注示例要求写作“第一章  引言”"))
+    expected_intro_title = expected_numeric_chapter_title(1, "引言")
+    if first_chapter and clean_text(first_chapter[1]) != clean_text(expected_intro_title):
+        intro_warn.append((first_chapter[0], first_chapter[1], f"学校模板要求写作“{expected_intro_title}”"))
     ctx.add(
         "引言标题写法（官方检测兼容）",
         "PASS" if not intro_warn else "FAIL",
         "正文引言标题",
-        "学校官方维普检测对引言标题可能按“第一章  引言”判定；若学校最终以维普结果为准，请按该写法修改。",
-        "提醒项：" + html.escape(str(intro_warn)) if intro_warn else "未发现与官方维普引言标题写法不一致的问题。",
+        f"正文第一章标题应按学校模板写作“{expected_intro_title}”，章号使用阿拉伯数字，章号和标题之间空两个半角空格。",
+        "提醒项：" + html.escape(str(intro_warn)) if intro_warn else "未发现引言标题写法不一致的问题。",
         "重要",
     )
 
     vip_heading_writing_bad = []
-    if first_chapter and clean_text(first_chapter[1]) != "第一章引言":
-        vip_heading_writing_bad.append((first_chapter[0], first_chapter[1], "第一章（2个半角空格）引言"))
+    for i, p in enumerate(doc.paragraphs):
+        text = p.text.strip()
+        if paragraph_style_name(p) != "Heading 1":
+            continue
+        if not re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", text):
+            continue
+        expected_title = expected_numeric_chapter_heading_for_text(text)
+        if clean_text(text) != clean_text(expected_title):
+            vip_heading_writing_bad.append((i + 1, text, expected_title))
     ctx.add(
         "正文标题写法错误（官方检测兼容）",
         "PASS" if not vip_heading_writing_bad else "FAIL",
         "正文标题",
-        "维普会单独提示正文引言标题写法；学校模板兼容写法建议使用“第一章  引言”。",
+        "维普会单独提示正文一级标题写法；所有章标题都应使用阿拉伯数字章号，并在章号与标题之间空两个半角空格，例如“第1章  引言”“第2章  实验方法”。",
         "异常项：" + html.escape(str(vip_heading_writing_bad)) if vip_heading_writing_bad else "未发现维普式正文标题写法异常。",
         "重要",
     )
     ctx.add(
         "正文引言标题-标题写法错误（官方检测兼容）",
-        "PASS" if not vip_heading_writing_bad else "FAIL",
+        "PASS" if not intro_warn else "FAIL",
         "正文引言标题",
-        "维普会把引言标题写法单独标为“正文引言标题-标题写法错误”；规范示例为“第一章  引言”。",
-        "异常项：" + html.escape(str(vip_heading_writing_bad)) if vip_heading_writing_bad else "未发现维普式引言标题写法异常。",
+        f"维普会把引言标题写法单独标为“正文引言标题-标题写法错误”；规范示例为“{expected_intro_title}”。",
+        "异常项：" + html.escape(str(intro_warn)) if intro_warn else "未发现维普式引言标题写法异常。",
         "重要",
     )
 
@@ -1739,24 +1772,24 @@ def audit_headings(ctx: AuditContext):
 
     for i, p in enumerate(doc.paragraphs):
         text = p.text.strip()
-        if paragraph_style_name(p) == "Heading 1" and re.match(r"^第\s*\d+\s*章", text):
-            chapter = chapter_number_from_text(text)
-            if chapter is not None and not re.match(rf"^第\s*{chapter_number_to_chinese(chapter)}\s*章", text):
-                vip_heading_number_bad.append((i + 1, f"章节序号建议写作第{chapter_number_to_chinese(chapter)}章", text))
+        if paragraph_style_name(p) == "Heading 1":
+            heading_issue = numeric_chapter_heading_issue(text)
+            if heading_issue:
+                vip_heading_number_bad.append((i + 1, heading_issue, text))
     ctx.add(
         "正文标题序号写法错误（官方检测兼容）",
         "PASS" if not vip_heading_number_bad else "FAIL",
         "正文标题",
-        "维普会单独提示标题序号写法；一级标题建议使用中文章序“第一章”，二、三级标题序号后应空一格。",
+        "维普会单独提示标题序号写法；一级标题章序应使用阿拉伯数字写作“第1章、第2章”，二、三级标题序号后应空一格。",
         "异常项：" + html.escape(str(vip_heading_number_bad[:30])) if vip_heading_number_bad else "未发现维普式标题序号写法异常。",
         "重要",
     )
-    vip_h1_number_bad = [item for item in vip_heading_number_bad if len(item) >= 3 and re.match(r"^第\s*\d+\s*章", str(item[2]))]
+    vip_h1_number_bad = [item for item in vip_heading_number_bad if len(item) >= 3 and re.match(r"^第\s*(?:\d+|[一二三四五六七八九十]+)\s*章", str(item[2]))]
     ctx.add(
         "正文一级标题-标题序号写法错误（官方检测兼容）",
         "PASS" if not vip_h1_number_bad else "FAIL",
         "正文一级标题",
-        "维普会把一级标题章序异常单独标为“正文一级标题-标题序号写法错误”；一级标题章序建议写作“第一章、第二章”。",
+        "维普会把一级标题章序异常单独标为“正文一级标题-标题序号写法错误”；一级标题章序应写作“第1章、第2章”。",
         "异常项：" + html.escape(str(vip_h1_number_bad[:30])) if vip_h1_number_bad else "未发现维普式一级标题序号写法异常。",
         "重要",
     )
