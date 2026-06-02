@@ -3,7 +3,7 @@ create table if not exists public.thesis_audit_users (
   email text not null unique,
   password_hash text not null,
   submissions_used integer not null default 0,
-  submission_quota integer not null default 5,
+  submission_quota integer not null default 100,
   account_status text not null default 'active',
   is_admin boolean not null default false,
   invite_code text,
@@ -20,7 +20,7 @@ create table if not exists public.thesis_audit_users (
 );
 
 alter table public.thesis_audit_users
-add column if not exists submission_quota integer not null default 5;
+add column if not exists submission_quota integer not null default 100;
 
 alter table public.thesis_audit_users
 add column if not exists account_status text not null default 'active';

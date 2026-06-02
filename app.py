@@ -73,7 +73,7 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-MAX_SUBMISSIONS = 5
+MAX_SUBMISSIONS = 100
 AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 MAX_TRACKED_USER_AGENT_LENGTH = 320
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
