@@ -2856,7 +2856,6 @@ def audit_formulas(ctx: AuditContext):
     missing_formula_nums = []
     formula_number_writing_bad = []
     formula_num_pat = re.compile(r"[\(（](?:\d+-\d+|A-\d+)[\)）]")
-    formula_num_ascii_pat = re.compile(r"\((?:\d+-\d+|A-\d+)\)")
     formula_num_fullwidth_pat = re.compile(r"（(?:\d+-\d+|A-\d+)）")
     chapter_counts: dict[str, list[int]] = {}
     appendix_nums = []
@@ -2865,8 +2864,9 @@ def audit_formulas(ctx: AuditContext):
         has_math = bool(p._p.xpath(".//m:oMath")) or bool(p._p.xpath(".//m:oMathPara"))
         math_text = math_plain_text(p) if has_math else ""
         for source, label in ((text, text[:90]), (math_text, "公式对象")):
-            for num in formula_num_ascii_pat.findall(source):
-                formula_number_writing_bad.append((pi, num, f"{num}(英文括号)", "（1-1）(中文括号)", label))
+            for num in formula_num_fullwidth_pat.findall(source):
+                expected = num.replace("（", "(").replace("）", ")")
+                formula_number_writing_bad.append((pi, num, f"{num}(中文括号)", f"{expected}(英文括号)", label))
         standalone_math = has_math and not text
         if not standalone_math:
             continue
@@ -2903,8 +2903,9 @@ def audit_formulas(ctx: AuditContext):
         right = table.rows[0].cells[1]
         has_math_obj = any(p._p.xpath(".//m:oMath") or p._p.xpath(".//m:oMathPara") for p in left.paragraphs)
         num = " ".join(p.text.strip() for p in right.paragraphs if p.text.strip())
-        if formula_num_ascii_pat.fullmatch(num):
-            formula_number_writing_bad.append((ti, num, f"{num}(英文括号)", "（1-1）(中文括号)", "公式编号"))
+        if formula_num_fullwidth_pat.fullmatch(num):
+            expected = num.replace("（", "(").replace("）", ")")
+            formula_number_writing_bad.append((ti, num, f"{num}(中文括号)", f"{expected}(英文括号)", "公式编号"))
         if not has_math_obj and not formula_num_pat.fullmatch(num):
             continue
         formula_infos.append((ti, num))
@@ -3004,7 +3005,7 @@ def audit_formulas(ctx: AuditContext):
         "公式编号写法问题（官方检测兼容）",
         "PASS" if not deduped_formula_number_writing_bad else "FAIL",
         "正文公式",
-        "维普可能把半角公式编号“(1-1)”提示为公式编号写法问题；如需贴近维普报告，可将编号改为中文全角括号“（1-1）”。",
+        "维普会把中文全角公式编号“（1-1）”提示为公式编号写法问题；如需贴近维普报告，应将编号改为英文半角括号“(1-1)”。",
         "异常项：" + html.escape(str(deduped_formula_number_writing_bad[:30])) if deduped_formula_number_writing_bad else "未发现维普式公式编号括号写法问题。",
         "重要",
     )
