@@ -1125,6 +1125,12 @@ def audit_abstracts(ctx: AuditContext):
     en_keyword_count = None
     keyword_count_mismatch = []
 
+    def advisory_status(ok: bool) -> str:
+        return "PASS" if ok else "WARN"
+
+    def advisory_status_for(items) -> str:
+        return "PASS" if not items else "WARN"
+
     def collect_abstract_font_size(line_no: int, part: str, issues: list[str], sample: str):
         for issue in issues:
             if issue.startswith("字号"):
@@ -1262,7 +1268,7 @@ def audit_abstracts(ctx: AuditContext):
         )
 
     if en_title is None:
-        ctx.add("英文摘要标题", "FAIL", "英文摘要", "未找到 Abstract 标题。", severity="严重")
+        ctx.add("英文摘要标题", "WARN", "英文摘要", "未找到 Abstract 标题，请按学院模板人工复核。", severity="一般")
     else:
         title_idx = None
         for idx in range(en_title - 1, max(-1, en_title - 8), -1):
@@ -1290,14 +1296,14 @@ def audit_abstracts(ctx: AuditContext):
             )
             ctx.add(
                 "英文摘要论文题目",
-                "PASS" if title_ok else "FAIL",
+                advisory_status(title_ok),
                 f"P{title_idx+1}",
-                "Abstract上方英文题目应为Times New Roman、小二、加粗、居中，1.5倍行距，段前段后0.5行。",
+                "Abstract上方英文题目建议为Times New Roman、小二、加粗、居中，1.5倍行距，段前段后0.5行；此项仅作提醒。",
                 f"text={html.escape(tp.text.strip())}, size={title_size}, latinFont={title_latin}, bold={title_bold}, centered={title_centered}, lineSpacing={title_line}, beforeLines0.5={title_before_ok}, afterLines0.5={title_after_ok}",
-                "重要",
+                "一般",
             )
         else:
-            ctx.add("英文摘要论文题目", "FAIL", "英文摘要", "未在 Abstract 上方定位到英文论文题目。", severity="重要")
+            ctx.add("英文摘要论文题目", "WARN", "英文摘要", "未在 Abstract 上方定位到英文论文题目，请按学院模板人工复核。", severity="一般")
 
         p = doc.paragraphs[en_title]
         size = effective_run_size(p)
@@ -1311,11 +1317,11 @@ def audit_abstracts(ctx: AuditContext):
         ok = size == 16 and latin == "Times New Roman" and bold is True and centered and line_ok and before_ok and after_ok
         ctx.add(
             "英文摘要标题",
-            "PASS" if ok else "FAIL",
+            advisory_status(ok),
             f"P{en_title+1}",
-            "Abstract 应为 Times New Roman 三号加粗居中，1.5倍行距，段前、段后0.5行。",
+            "Abstract 建议为 Times New Roman 三号加粗居中，1.5倍行距，段前、段后0.5行；此项仅作提醒。",
             f"size={size}, latinFont={latin}, bold={bold}, centered={centered}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}",
-            "重要",
+            "一般",
         )
 
     if en_title is not None and en_kw is not None and en_kw > en_title:
@@ -1334,11 +1340,11 @@ def audit_abstracts(ctx: AuditContext):
                 bad_format.append((idx + 1, line_ok, indent_ok, before_ok, after_ok, font_issues[:5], p.text.strip()[:50]))
         ctx.add(
             "英文摘要正文格式",
-            "PASS" if not bad_format else "FAIL",
+            advisory_status_for(bad_format),
             "英文摘要",
-            "英文摘要正文应为小四号Times New Roman，1.5倍行距，每段首行缩进2字符，段前段后0.5行。",
+            "英文摘要正文建议为小四号Times New Roman，1.5倍行距，每段首行缩进2字符，段前段后0.5行；此项仅作提醒。",
             "异常项：" + html.escape(str(bad_format[:10])) if bad_format else "未发现英文摘要正文格式异常。",
-            "重要",
+            "一般",
         )
         en = " ".join(p.text.strip() for p in doc.paragraphs[en_title + 1 : en_kw] if p.text.strip())
         words = len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?|\d+(?:\.\d+)?", en))
@@ -1377,11 +1383,11 @@ def audit_abstracts(ctx: AuditContext):
         )
         ctx.add(
             "英文关键词",
-            "PASS" if ok else "FAIL",
+            advisory_status(ok),
             f"P{en_kw+1}",
-            "Keywords与Abstract正文之间应空一行，首行缩进2字符；Keywords加粗；Keywords后使用中文冒号，词间用中文分号，末尾不加标点，3-5个，Times New Roman小四，1.5倍行距，段前段后0.5行。",
+            "Keywords与Abstract正文之间建议空一行，首行缩进2字符；Keywords加粗；Keywords后使用中文冒号，词间用中文分号，末尾不加标点，3-5个，Times New Roman小四，1.5倍行距，段前段后0.5行；此项仅作提醒。",
             f"关键词数={count}, 中文冒号={uses_cn_colon}, 中文分号={uses_cn_semicolon}, Keywords加粗={keywords_bold}, 末尾标点={trailing}, blankBefore={blank_before}, firstLine2={indent_ok}, lineSpacing={line}, beforeLines0.5={before_ok}, afterLines0.5={after_ok}, fontIssues={font_issues[:5]}",
-            "重要",
+            "一般",
         )
         title_writing_bad = []
         separator_bad = []
@@ -1392,53 +1398,53 @@ def audit_abstracts(ctx: AuditContext):
             separator_bad.append((en_kw + 1, "分隔符有误", "；(中文)", text[:120]))
         ctx.add(
             "英文关键词标题写法错误（官方检测兼容）",
-            "PASS" if not title_writing_bad else "FAIL",
+            advisory_status_for(title_writing_bad),
             f"P{en_kw+1}",
-            "维普会单独提示英文关键词标题写法；Keywords 后应使用中文冒号“：”，不要写成半角冒号加空格。",
+            "维普可能单独提示英文关键词标题写法；Keywords 后建议使用中文冒号“：”，不要写成半角冒号加空格。此项仅作提醒。",
             "异常项：" + html.escape(str(title_writing_bad)) if title_writing_bad else "未发现 Keywords 标题写法异常。",
-            "重要",
+            "一般",
         )
         ctx.add(
             "英文关键词内容-标题写法错误（官方检测兼容）",
-            "PASS" if not title_writing_bad else "FAIL",
+            advisory_status_for(title_writing_bad),
             f"P{en_kw+1}",
-            "维普会按“英文关键词内容-标题写法错误”提示 Keywords 标题写法；Keywords 后应使用中文冒号“：”。",
+            "维普可能按“英文关键词内容-标题写法错误”提示 Keywords 标题写法；Keywords 后建议使用中文冒号“：”。此项仅作提醒。",
             "异常项：" + html.escape(str(title_writing_bad)) if title_writing_bad else "未发现维普式英文关键词内容标题写法异常。",
-            "重要",
+            "一般",
         )
         ctx.add(
             "英文关键词分隔符问题（官方检测兼容）",
-            "PASS" if not separator_bad else "FAIL",
+            advisory_status_for(separator_bad),
             f"P{en_kw+1}",
-            "维普会单独提示英文关键词分隔符问题；英文关键词之间也应使用中文分号“；”。",
+            "维普可能单独提示英文关键词分隔符问题；英文关键词之间建议使用中文分号“；”。此项仅作提醒。",
             "异常项：" + html.escape(str(separator_bad)) if separator_bad else "未发现英文关键词分隔符异常。",
-            "重要",
+            "一般",
         )
         ctx.add(
             "英文关键词内容-分隔符问题（官方检测兼容）",
-            "PASS" if not separator_bad else "FAIL",
+            advisory_status_for(separator_bad),
             f"P{en_kw+1}",
-            "维普会按“英文关键词内容-分隔符问题”提示分隔符异常；英文关键词之间应使用中文分号“；”。",
+            "维普可能按“英文关键词内容-分隔符问题”提示分隔符异常；英文关键词之间建议使用中文分号“；”。此项仅作提醒。",
             "异常项：" + html.escape(str(separator_bad)) if separator_bad else "未发现维普式英文关键词内容分隔符异常。",
-            "重要",
+            "一般",
         )
     if cn_keyword_count is not None and en_keyword_count is not None and cn_keyword_count != en_keyword_count:
         keyword_count_mismatch.append(("中英文关键词数量不一致", f"中文{cn_keyword_count}个", f"英文{en_keyword_count}个", "中英文关键词数量应相等"))
     ctx.add(
         "英文关键词数量对应问题（官方检测兼容）",
-        "PASS" if not keyword_count_mismatch else "FAIL",
+        advisory_status_for(keyword_count_mismatch),
         "英文关键词",
-        "维普会按“数量对应问题”提示中英文关键词数量不一致；中文关键词和英文关键词应一一对应。",
+        "维普可能按“数量对应问题”提示中英文关键词数量不一致；中文关键词和英文关键词建议一一对应。此项仅作提醒。",
         "异常项：" + html.escape(str(keyword_count_mismatch)) if keyword_count_mismatch else "未发现维普式中英文关键词数量不一致问题。",
-        "重要",
+        "一般",
     )
     ctx.add(
         "摘要字体问题（官方检测兼容）",
-        "PASS" if not vip_abstract_font_bad else "FAIL",
+        "PASS" if not vip_abstract_font_bad else ("FAIL" if vip_cn_abstract_font_bad else "WARN"),
         "摘要",
         "维普会在摘要片段中单独提示字体问题；中文摘要中文应为宋体，英文摘要、英文和数字应为 Times New Roman。",
         "异常项：" + html.escape(str(vip_abstract_font_bad[:20])) if vip_abstract_font_bad else "未发现维普式摘要字体异常。",
-        "重要",
+        "重要" if vip_cn_abstract_font_bad else "一般",
     )
     ctx.add(
         "中文摘要内容-字体问题（官方检测兼容）",
@@ -1450,19 +1456,19 @@ def audit_abstracts(ctx: AuditContext):
     )
     ctx.add(
         "英文摘要内容-字体问题（官方检测兼容）",
-        "PASS" if not vip_en_abstract_font_bad else "FAIL",
+        advisory_status_for(vip_en_abstract_font_bad),
         "英文摘要内容",
-        "维普会单独提示英文摘要内容字体问题；英文摘要内容应使用 Times New Roman。",
+        "维普可能单独提示英文摘要内容字体问题；英文摘要内容建议使用 Times New Roman。此项仅作提醒。",
         "异常项：" + html.escape(str(vip_en_abstract_font_bad[:20])) if vip_en_abstract_font_bad else "未发现维普式英文摘要内容字体异常。",
-        "重要",
+        "一般",
     )
     ctx.add(
         "摘要字号问题（官方检测兼容）",
-        "PASS" if not vip_abstract_size_bad else "FAIL",
+        "PASS" if not vip_abstract_size_bad else ("FAIL" if vip_cn_abstract_size_bad else "WARN"),
         "摘要",
         "维普会在摘要片段中单独提示字号问题；摘要正文和关键词应为小四号 12 pt。",
         "异常项：" + html.escape(str(vip_abstract_size_bad[:20])) if vip_abstract_size_bad else "未发现维普式摘要字号异常。",
-        "重要",
+        "重要" if vip_cn_abstract_size_bad else "一般",
     )
     ctx.add(
         "中文摘要内容-字号问题（官方检测兼容）",
@@ -1474,11 +1480,11 @@ def audit_abstracts(ctx: AuditContext):
     )
     ctx.add(
         "英文摘要内容-字号问题（官方检测兼容）",
-        "PASS" if not vip_en_abstract_size_bad else "FAIL",
+        advisory_status_for(vip_en_abstract_size_bad),
         "英文摘要内容",
-        "维普会单独提示英文摘要内容字号问题；英文摘要内容应为小四号。",
+        "维普可能单独提示英文摘要内容字号问题；英文摘要内容建议为小四号。此项仅作提醒。",
         "异常项：" + html.escape(str(vip_en_abstract_size_bad[:20])) if vip_en_abstract_size_bad else "未发现维普式英文摘要内容字号异常。",
-        "重要",
+        "一般",
     )
 
 
@@ -2729,11 +2735,11 @@ def audit_tables(ctx: AuditContext):
     )
     ctx.add(
         "表格内容字体字号",
-        "PASS" if not table_text_bad else "FAIL",
+        "PASS" if not table_text_bad else "WARN",
         "正文和附录表格",
-        "表格内文字应与论文模板保持一致，中文一般使用宋体，英文和数字使用 Times New Roman，字号不应明显偏离五号/小四。",
+        "表格内文字建议与论文模板保持一致，中文一般使用宋体，英文和数字使用 Times New Roman，字号不应明显偏离五号/小四；Word 表格样式容易继承导致误检，此项仅作提醒。",
         "异常项：" + html.escape(str(table_text_bad[:30])) if table_text_bad else "未发现表格内容中明确的字体或字号异常。",
-        "重要",
+        "一般",
     )
 
     cont_labels = []
@@ -3441,7 +3447,10 @@ def audit_document_structure(ctx: AuditContext):
         "一般",
     )
 
+    english_structure_names = {"英文标题", "英文摘要", "英文关键词"}
     missing = [name for name, pos in found if pos is None]
+    hard_missing = [name for name in missing if name not in english_structure_names]
+    advisory_missing = [name for name in missing if name in english_structure_names]
     present = [(name, pos + 1) for name, pos in found if pos is not None]
     order_bad = []
     last_pos = -1
@@ -3449,57 +3458,73 @@ def audit_document_structure(ctx: AuditContext):
         if pos < last_pos:
             order_bad.append((name, pos, "位置早于前一结构要素"))
         last_pos = max(last_pos, pos)
+    hard_order_bad = [item for item in order_bad if item[0] not in english_structure_names]
+    advisory_order_bad = [item for item in order_bad if item[0] in english_structure_names]
 
-    status = "PASS" if not missing and not order_bad else "FAIL"
+    structure_status = "FAIL" if hard_missing or hard_order_bad else ("WARN" if advisory_missing or advisory_order_bad else "PASS")
+    structure_severity = "严重" if structure_status == "FAIL" else ("一般" if structure_status == "WARN" else "重要")
     ctx.add(
         "结构缺失",
-        "PASS" if not missing else "FAIL",
+        "PASS" if not missing else ("FAIL" if hard_missing else "WARN"),
         "全文结构",
-        "论文应包含维普模板要求的必备结构要素；附录为非必有结构。",
-        "缺失=" + html.escape(str(missing)) if missing else "未发现必备结构缺失。",
-        "严重" if missing else "重要",
+        "论文应包含维普模板要求的必备结构要素；英文标题、英文摘要、英文关键词因学院模板差异较大，仅作提醒；附录为非必有结构。",
+        (
+            "缺失=" + html.escape(str(missing))
+            + (f"<br>其中英文结构仅提醒={html.escape(str(advisory_missing))}" if advisory_missing else "")
+            if missing
+            else "未发现必备结构缺失。"
+        ),
+        "严重" if hard_missing else ("一般" if advisory_missing else "重要"),
     )
     ctx.add(
         "结构完整性问题（官方检测兼容）",
-        "PASS" if not missing else "FAIL",
+        "PASS" if not missing else ("FAIL" if hard_missing else "WARN"),
         "全文结构",
-        "维普统计报告会单独提示结构完整性问题；论文应包含封面、诚信声明、版权声明、中文标题、中文摘要、中文关键词、英文标题、英文摘要、英文关键词、中文目录、正文、致谢、参考文献。",
-        "异常项：" + html.escape(str(missing)) if missing else "未发现维普式结构完整性异常。",
-        "严重" if missing else "重要",
+        "维普统计报告可能提示结构完整性问题；论文应包含封面、诚信声明、版权声明、中文标题、中文摘要、中文关键词、英文标题、英文摘要、英文关键词、中文目录、正文、致谢、参考文献，其中英文结构项仅作提醒。",
+        (
+            "异常项：" + html.escape(str(missing))
+            + (f"<br>英文结构仅提醒={html.escape(str(advisory_missing))}" if advisory_missing else "")
+            if missing
+            else "未发现维普式结构完整性异常。"
+        ),
+        "严重" if hard_missing else ("一般" if advisory_missing else "重要"),
     )
     ctx.add(
         "结构顺序",
-        "PASS" if not missing and not order_bad else "FAIL",
+        structure_status,
         "全文结构",
-        "论文结构顺序应为：封面-诚信声明-版权声明-中文标题-中文摘要-中文关键词-英文标题-英文摘要-英文关键词-中文目录-正文-致谢-参考文献-附录（非必有）。",
+        "论文结构顺序建议为：封面-诚信声明-版权声明-中文标题-中文摘要-中文关键词-英文标题-英文摘要-英文关键词-中文目录-正文-致谢-参考文献-附录（非必有）；英文结构顺序仅作提醒。",
         (
             f"当前结构={html.escape(str(present))}"
             + (f"<br>缺失导致顺序不完整={html.escape(str(missing))}" if missing else "")
             + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else "")
+            + (f"<br>英文结构仅提醒={html.escape(str(advisory_missing + advisory_order_bad))}" if advisory_missing or advisory_order_bad else "")
         ),
-        "严重" if missing or order_bad else "重要",
+        structure_severity,
     )
     ctx.add(
         "结构顺序问题（官方检测兼容）",
-        "PASS" if not missing and not order_bad else "FAIL",
+        structure_status,
         "全文结构",
-        "维普统计报告会单独提示结构顺序问题；规范结构顺序是：封面-诚信声明-版权声明-中文标题-中文摘要-中文关键词-英文标题-英文摘要-英文关键词-中文目录-正文-致谢-参考文献-附录（非必有）。",
+        "维普统计报告可能提示结构顺序问题；规范结构顺序是：封面-诚信声明-版权声明-中文标题-中文摘要-中文关键词-英文标题-英文摘要-英文关键词-中文目录-正文-致谢-参考文献-附录（非必有），其中英文结构顺序仅作提醒。",
         (
             f"当前结构={html.escape(str(present))}"
             + (f"<br>缺失导致顺序不完整={html.escape(str(missing))}" if missing else "")
             + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else "")
+            + (f"<br>英文结构仅提醒={html.escape(str(advisory_missing + advisory_order_bad))}" if advisory_missing or advisory_order_bad else "")
         ),
-        "严重" if missing or order_bad else "重要",
+        structure_severity,
     )
     ctx.add(
         "结构要素与顺序",
-        status,
+        structure_status,
         "全文结构",
-        "论文结构应依次包含封面、诚信声明、版权声明、中文标题、中文摘要、中文关键词、英文标题、英文摘要、英文关键词、中文目录、正文、致谢、参考文献；附录非必有。",
+        "论文结构建议依次包含封面、诚信声明、版权声明、中文标题、中文摘要、中文关键词、英文标题、英文摘要、英文关键词、中文目录、正文、致谢、参考文献；英文结构项仅作提醒，附录非必有。",
         f"已识别结构={html.escape(str(present))}"
         + (f"<br>缺失={html.escape(str(missing))}" if missing else "")
-        + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else ""),
-        "严重" if missing or order_bad else "重要",
+        + (f"<br>顺序异常={html.escape(str(order_bad))}" if order_bad else "")
+        + (f"<br>英文结构仅提醒={html.escape(str(advisory_missing + advisory_order_bad))}" if advisory_missing or advisory_order_bad else ""),
+        structure_severity,
     )
 
 
