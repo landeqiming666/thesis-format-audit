@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -728,15 +729,29 @@ def find_user_by_email(email: str) -> dict | None:
 
 
 def normalize_invite_code(code: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
+    return re.sub(r"[^A-Za-z0-9]", "", unicodedata.normalize("NFKC", code or "")).upper()
 
 
 def normalize_registration_code(code: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
+    return re.sub(r"[^A-Za-z0-9]", "", unicodedata.normalize("NFKC", code or "")).upper()
 
 
 def registration_code_error_message() -> str:
     return "QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。"
+
+
+def registration_code_unavailable_message(code: str, item: dict | None) -> str:
+    normalized = normalize_registration_code(code)
+    if not normalized:
+        return "请填写 QQ 群注册码。注册码可从官方 QQ 群 537124215 的群公告获取。"
+    if item is None:
+        return f"注册码 {normalized} 不存在。请检查是否复制完整，或加入官方 QQ 群 537124215 从群公告获取最新注册码。"
+    if not item.get("is_active"):
+        return f"注册码 {normalized} 已停用。请加入官方 QQ 群 537124215，从群公告获取最新注册码。"
+    remaining = registration_code_remaining(item)
+    if remaining <= 0:
+        return f"注册码 {normalized} 使用次数已满。请加入官方 QQ 群 537124215，从群公告获取新的注册码。"
+    return f"注册码 {normalized} 当前可用，剩余 {remaining} 次；如果仍无法注册，请重新复制群公告中的完整注册码。"
 
 
 def generate_invite_code() -> str:
@@ -861,7 +876,7 @@ def create_registration_code(actor: dict, max_uses: int, note: str = "") -> dict
 def consume_registration_code(code: str) -> dict:
     normalized = normalize_registration_code(code)
     if not normalized:
-        raise ValueError(registration_code_error_message())
+        raise ValueError(registration_code_unavailable_message(code, None))
     result = get_supabase().rpc(
         "consume_thesis_audit_registration_code",
         {"target_code": normalized},
@@ -871,7 +886,7 @@ def consume_registration_code(code: str) -> dict:
         return data
     if isinstance(data, list) and data:
         return data[0]
-    raise ValueError(registration_code_error_message())
+    raise ValueError(registration_code_unavailable_message(normalized, find_registration_code(normalized)))
 
 
 def refund_registration_code_use(consumed_code: dict | None) -> None:
@@ -6108,7 +6123,7 @@ def register():
     access_code_record = find_registration_code(registration_code)
     if not registration_code_is_available(access_code_record):
         refresh_captcha()
-        return render_home(auth_error=registration_code_error_message(), auth_mode="register", auth_values=auth_values), 400
+        return render_home(auth_error=registration_code_unavailable_message(registration_code, access_code_record), auth_mode="register", auth_values=auth_values), 400
     if find_user_by_email(email) is not None:
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
