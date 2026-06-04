@@ -31,6 +31,39 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from zipfile import BadZipFile, ZipFile
 
+from config import (
+    ADMIN_LOG_TABLE,
+    AUDIT_TIMEOUT_SECONDS,
+    AUTH_TOKEN_MAX_AGE,
+    DOC_CONVERT_TIMEOUT_SECONDS,
+    EMAIL_FROM_NAME,
+    EVENTS_TABLE,
+    GCS_BUCKET,
+    GCS_CREDENTIALS_JSON,
+    GCS_PREFIX,
+    GCS_PROJECT,
+    GITHUB_REPO_URL,
+    GMAIL_SMTP_APP_PASSWORD,
+    GMAIL_SMTP_HOST,
+    GMAIL_SMTP_PORT,
+    GMAIL_SMTP_USER,
+    GOOGLE_DRIVE_CREDENTIALS_JSON,
+    GOOGLE_DRIVE_FOLDER_ID,
+    GOOGLE_DRIVE_PREFIX,
+    LEGACY_ADMIN_EMAILS,
+    MAX_DOCX_ENTRIES,
+    MAX_DOCX_UNCOMPRESSED_MB,
+    MAX_STORED_REPORTS_PER_USER,
+    MAX_SUBMISSIONS,
+    MAX_UPLOAD_MB,
+    REGISTRATION_CODES_TABLE,
+    REPORTS_BUCKET,
+    REPORTS_TABLE,
+    SUPER_ADMIN_EMAILS,
+    SUPABASE_SERVICE_ROLE_KEY,
+    SUPABASE_TABLE,
+    SUPABASE_URL,
+)
 from thesis_format_audit import open_docx_document, run_audit
 
 try:
@@ -61,20 +94,12 @@ if load_dotenv:
 
 
 app = Flask(__name__)
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "32"))
-MAX_DOCX_ENTRIES = int(os.environ.get("MAX_DOCX_ENTRIES", "1500"))
-MAX_DOCX_UNCOMPRESSED_MB = int(os.environ.get("MAX_DOCX_UNCOMPRESSED_MB", "180"))
-AUDIT_TIMEOUT_SECONDS = int(os.environ.get("AUDIT_TIMEOUT_SECONDS", "105"))
-DOC_CONVERT_TIMEOUT_SECONDS = int(os.environ.get("DOC_CONVERT_TIMEOUT_SECONDS", "60"))
-
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_SECURE"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-MAX_SUBMISSIONS = 100
-AUTH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 MAX_TRACKED_USER_AGENT_LENGTH = 320
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 EMAIL_CODE_LENGTH = 6
@@ -118,28 +143,6 @@ RATE_LIMITS = {
     "admin": (30, 5 * 60),
 }
 RATE_BUCKETS: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-SUPABASE_TABLE = "thesis_audit_users"
-ADMIN_LOG_TABLE = "thesis_audit_admin_logs"
-REPORTS_TABLE = "thesis_audit_reports"
-REGISTRATION_CODES_TABLE = "thesis_audit_registration_codes"
-EVENTS_TABLE = "thesis_audit_events"
-REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
-MAX_STORED_REPORTS_PER_USER = int(os.environ.get("MAX_STORED_REPORTS_PER_USER", "5"))
-GITHUB_REPO_URL = os.environ.get("GITHUB_REPO_URL", "https://github.com/landeqiming666/thesis-format-audit").strip()
-GMAIL_SMTP_HOST = os.environ.get("GMAIL_SMTP_HOST", "smtp.gmail.com")
-GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT", "465"))
-GMAIL_SMTP_USER = os.environ.get("GMAIL_SMTP_USER", "").strip()
-GMAIL_SMTP_APP_PASSWORD = os.environ.get("GMAIL_SMTP_APP_PASSWORD", "").strip()
-EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "UPC论文格式检测工具").strip()
-GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
-GCS_PREFIX = os.environ.get("GCS_PREFIX", "thesis-audit").strip("/")
-GCS_PROJECT = os.environ.get("GCS_PROJECT", "")
-GCS_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
-GOOGLE_DRIVE_CREDENTIALS_JSON = os.environ.get("GOOGLE_DRIVE_CREDENTIALS_JSON", "").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-GOOGLE_DRIVE_PREFIX = os.environ.get("GOOGLE_DRIVE_PREFIX", "thesis-audit").strip("/")
 USER_COLUMNS = (
     "id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,"
     "invite_code,invited_by,register_ip,register_user_agent,last_login_at,last_login_ip,"
@@ -173,18 +176,6 @@ ADMIN_SORT_OPTIONS = {
     "email_desc",
 }
 ADMIN_PER_PAGE_OPTIONS = {10, 20, 50, 100}
-SUPER_ADMIN_EMAILS = {
-    email.strip().lower()
-    for email in os.environ.get("SUPER_ADMIN_EMAILS", "2818242447@qq.com").split(",")
-    if email.strip()
-}
-LEGACY_ADMIN_EMAILS = {
-    email.strip().lower()
-    for email in os.environ.get("ADMIN_EMAILS", "").split(",")
-    if email.strip()
-}
-
-
 def uploaded_word_names(filename: str) -> tuple[str, str]:
     raw_name = (filename or "").strip()
     safe_name = secure_filename(raw_name)
@@ -699,6 +690,10 @@ def normalize_registration_code(code: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
 
 
+def registration_code_error_message() -> str:
+    return "QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。"
+
+
 def generate_invite_code() -> str:
     return uuid4().hex[:10].upper()
 
@@ -821,15 +816,42 @@ def create_registration_code(actor: dict, max_uses: int, note: str = "") -> dict
 def consume_registration_code(code: str) -> dict:
     normalized = normalize_registration_code(code)
     if not normalized:
-        raise ValueError("QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。")
+        raise ValueError(registration_code_error_message())
     result = get_supabase().rpc(
         "consume_thesis_audit_registration_code",
         {"target_code": normalized},
     ).execute()
-    data = result.data or []
-    if not data:
-        raise ValueError("QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。")
-    return data[0]
+    data = result.data
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list) and data:
+        return data[0]
+    raise ValueError(registration_code_error_message())
+
+
+def refund_registration_code_use(consumed_code: dict | None) -> None:
+    if not consumed_code:
+        return
+    code_id = consumed_code.get("id")
+    try:
+        used_count = int(consumed_code.get("used_count") or 0)
+    except (TypeError, ValueError):
+        used_count = 0
+    if not code_id or used_count <= 0:
+        return
+    try:
+        result = (
+            get_supabase()
+            .table(REGISTRATION_CODES_TABLE)
+            .update({"used_count": used_count - 1})
+            .eq("id", code_id)
+            .eq("used_count", used_count)
+            .execute()
+        )
+        if not result.data:
+            app.logger.warning("Registration code refund skipped because usage count changed for code id %s", code_id)
+    except Exception:
+        app.logger.warning("Failed to refund registration code use for code id %s", code_id, exc_info=True)
 
 
 def update_registration_code_status(code_id: str, is_active: bool) -> dict:
@@ -1304,6 +1326,25 @@ def clear_original_archive_fields(report_ids: list[str]) -> int:
     return clear_report_archive_fields(report_ids, clear_original=True, clear_report=False)
 
 
+def clear_supabase_original_archive_fields(report_ids: list[str]) -> int:
+    unique_ids = sorted({report_id for report_id in report_ids if report_id})
+    if not unique_ids:
+        return 0
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .update(
+            {
+                "original_storage_backend": "",
+                "original_storage_path": "",
+            }
+        )
+        .in_("id", unique_ids)
+        .execute()
+    )
+    return len(result.data or [])
+
+
 def delete_original_archives_for_reports(reports: list[dict], clear_rows: bool = True) -> dict:
     targets = original_archive_delete_targets(reports)
     result = {
@@ -1772,7 +1813,11 @@ def summarize_traffic_stats(users: list[dict], reports: list[dict], events: list
         )
 
     success_rate = round(len(success_reports) * 100 / len(reports), 1) if reports else 0
-    total_original_bytes = sum(int(item.get("original_size_bytes") or 0) for item in reports)
+    total_original_bytes = sum(
+        int(item.get("original_size_bytes") or 0)
+        for item in reports
+        if item.get("original_storage_path")
+    )
     return {
         "events_enabled": bool(events),
         "page_views": event_types.get("page_view", 0),
@@ -2710,6 +2755,65 @@ PAGE = """
       color: var(--muted);
       font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
     }
+    .modal-star-card {
+      display: none;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      margin-top: 14px;
+      padding: 18px;
+      border: 2px solid color-mix(in srgb, #d4a62a 58%, var(--line));
+      background:
+        radial-gradient(circle at 100% 0%, rgba(212, 166, 42, .24), transparent 12rem),
+        linear-gradient(135deg, color-mix(in srgb, #fff3c6 68%, var(--surface-strong)), var(--surface-strong) 72%);
+      box-shadow: 0 16px 42px rgba(129, 92, 16, .14);
+    }
+    [data-theme="dark"] .modal-star-card {
+      background:
+        radial-gradient(circle at 100% 0%, rgba(212, 166, 42, .2), transparent 12rem),
+        linear-gradient(135deg, rgba(86, 66, 22, .62), var(--surface-strong) 72%);
+    }
+    .modal-star-card.active {
+      display: grid;
+    }
+    .modal-star-kicker {
+      color: #8a6519;
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    [data-theme="dark"] .modal-star-kicker {
+      color: #f1cb64;
+    }
+    .modal-star-title {
+      margin-top: 5px;
+      color: var(--ink);
+      font: 950 22px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    .modal-star-link {
+      width: auto;
+      min-width: 132px;
+      margin: 0;
+      padding: 14px 18px;
+      border: 0;
+      background: #1f2937;
+      color: #fff;
+      text-decoration: none;
+      text-align: center;
+      font: 900 15px/1 "PingFang SC", "Noto Sans SC", sans-serif;
+      box-shadow: 0 12px 30px rgba(31, 41, 55, .22);
+    }
+    .modal-star-link:hover {
+      transform: translateY(-1px);
+      background: #111827;
+    }
+    .modal-star-note {
+      grid-column: 1 / -1;
+      margin: -4px 0 0;
+      color: var(--muted);
+      font: 13px/1.7 "PingFang SC", "Noto Sans SC", sans-serif;
+    }
     .modal-actions {
       display: flex;
       justify-content: flex-end;
@@ -2769,6 +2873,8 @@ PAGE = """
       .modal-group-card { grid-template-columns: 1fr; }
       .modal-group-number { font-size: 32px; }
       .modal-group-copy { width: 100%; }
+      .modal-star-card { grid-template-columns: 1fr; }
+      .modal-star-link { width: 100%; }
       .modal-actions { flex-direction: column; }
       .modal-actions button { width: 100%; }
       h1 { font-size: clamp(46px, 16vw, 68px); }
@@ -2943,6 +3049,14 @@ PAGE = """
         <button id="modal-group-copy" class="copy-button modal-group-copy" type="button">复制群号</button>
         <div id="modal-group-note" class="modal-group-note">进群后可领取额外检测机会，也可以反馈检测问题。</div>
       </div>
+      <div id="modal-star-card" class="modal-star-card">
+        <div>
+          <div class="modal-star-kicker">Open Source</div>
+          <div class="modal-star-title">如果报告帮到你，给项目点个 Star 吧</div>
+        </div>
+        <a id="modal-star-link" class="modal-star-link" href="{{ github_repo_url }}" target="_blank" rel="noopener noreferrer">去 GitHub Star</a>
+        <div class="modal-star-note">Star 会让更多同学看到这个工具，也方便我们继续维护检测规则。</div>
+      </div>
       <div class="modal-actions">
         <button id="modal-secondary" class="ghost-button" type="button" hidden>关闭</button>
         <button id="modal-primary" type="button">我知道了</button>
@@ -3002,6 +3116,7 @@ PAGE = """
     const modalGroupCard = document.getElementById('modal-group-card');
     const modalGroupCopy = document.getElementById('modal-group-copy');
     const modalGroupNote = document.getElementById('modal-group-note');
+    const modalStarCard = document.getElementById('modal-star-card');
     let modalPrimaryHandler = null;
     let modalSecondaryHandler = null;
 
@@ -3051,6 +3166,7 @@ PAGE = """
       primaryText = '我知道了',
       secondaryText = '',
       showGroup = false,
+      showStar = false,
       groupNote = '进群后可领取额外检测机会，也可以反馈检测问题。',
       onPrimary = null,
       onSecondary = null
@@ -3061,6 +3177,9 @@ PAGE = """
       modalPrimary.textContent = primaryText;
       if (modalGroupCard) {
         modalGroupCard.classList.toggle('active', Boolean(showGroup));
+      }
+      if (modalStarCard) {
+        modalStarCard.classList.toggle('active', Boolean(showStar));
       }
       if (modalGroupNote) {
         modalGroupNote.textContent = groupNote;
@@ -3090,6 +3209,25 @@ PAGE = """
       helper.remove();
     };
 
+    const openGithubStar = () => {
+      window.open('{{ github_repo_url }}', '_blank', 'noopener,noreferrer');
+    };
+
+    const copyGroupFromModal = async () => {
+      try {
+        await copyText(GROUP_NUMBER);
+        showModal({
+          title: '群号已复制',
+          body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
+        });
+      } catch (_error) {
+        showModal({
+          title: '复制失败',
+          body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
+        });
+      }
+    };
+
     const showQuotaExhaustedModal = source => {
       const body = source === 'download'
         ? '本次报告已经下载成功，但你的检测额度也已经用完。下面是补充检测机会的官方联系入口。'
@@ -3098,48 +3236,26 @@ PAGE = """
         title: '检测额度已用完',
         body,
         showGroup: true,
+        showStar: true,
         groupNote: '复制群号后打开 QQ 搜索加入，进群可领取新的检测机会。',
-        primaryText: '复制群号',
-        secondaryText: '稍后再说',
-        onPrimary: async () => {
-          try {
-            await copyText(GROUP_NUMBER);
-            showModal({
-              title: '群号已复制',
-              body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
-            });
-          } catch (_error) {
-            showModal({
-              title: '复制失败',
-              body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
-            });
-          }
-        }
+        primaryText: '去 GitHub Star',
+        secondaryText: '复制群号',
+        onPrimary: openGithubStar,
+        onSecondary: copyGroupFromModal
       });
     };
 
     const showPostAuditReminderModal = () => {
       showModal({
         title: '下载成功',
-        body: '检测报告已经下载成功，请到浏览器下载列表或下载文件夹中找到该 HTML 文件，并用浏览器打开查看结果。',
+        body: '检测报告已经下载成功。打开下载的 HTML 文件查看结果；如果这个工具帮到你，欢迎顺手点一个 Star。',
         showGroup: true,
+        showStar: true,
         groupNote: '遇到使用问题或想领取更多检测机会，可以复制群号加入官方 QQ 群。',
-        primaryText: '复制群号',
-        secondaryText: '我知道了',
-        onPrimary: async () => {
-          try {
-            await copyText(GROUP_NUMBER);
-            showModal({
-              title: '群号已复制',
-              body: `QQ群号 ${GROUP_NUMBER} 已复制到剪贴板，打开 QQ 搜索群号即可申请加入。`
-            });
-          } catch (_error) {
-            showModal({
-              title: '复制失败',
-              body: `浏览器暂时无法自动复制，请手动复制群号 ${GROUP_NUMBER}。`
-            });
-          }
-        }
+        primaryText: '去 GitHub Star',
+        secondaryText: '复制群号',
+        onPrimary: openGithubStar,
+        onSecondary: copyGroupFromModal
       });
     };
 
