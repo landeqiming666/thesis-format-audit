@@ -126,6 +126,8 @@ REPORTS_TABLE = "thesis_audit_reports"
 REGISTRATION_CODES_TABLE = "thesis_audit_registration_codes"
 EVENTS_TABLE = "thesis_audit_events"
 REPORTS_BUCKET = os.environ.get("REPORTS_BUCKET", "thesis-audit-reports")
+MAX_STORED_REPORTS_PER_USER = int(os.environ.get("MAX_STORED_REPORTS_PER_USER", "5"))
+GITHUB_REPO_URL = os.environ.get("GITHUB_REPO_URL", "https://github.com/landeqiming666/thesis-format-audit").strip()
 GMAIL_SMTP_HOST = os.environ.get("GMAIL_SMTP_HOST", "smtp.gmail.com")
 GMAIL_SMTP_PORT = int(os.environ.get("GMAIL_SMTP_PORT", "465"))
 GMAIL_SMTP_USER = os.environ.get("GMAIL_SMTP_USER", "").strip()
@@ -1229,14 +1231,43 @@ def original_archive_delete_targets(reports: list[dict]) -> dict:
     }
 
 
-def clear_original_archive_fields(report_ids: list[str]) -> int:
+def report_archive_delete_targets(reports: list[dict]) -> dict:
+    return {
+        "supabase_paths": sorted({(report.get("report_storage_path") or "").strip() for report in reports if (report.get("report_storage_path") or "").strip()}),
+        "gcs_paths": sorted({(report.get("report_gcs_path") or "").strip() for report in reports if (report.get("report_gcs_path") or "").strip()}),
+    }
+
+
+def report_has_original_archive(report: dict) -> bool:
+    return bool(
+        report.get("original_storage_path")
+        or report.get("original_gcs_path")
+        or report.get("original_drive_file_id")
+        or int(report.get("original_size_bytes") or 0) > 0
+        or report.get("original_sha256")
+    )
+
+
+def report_has_report_archive(report: dict) -> bool:
+    return bool(
+        report.get("report_storage_path")
+        or report.get("report_gcs_path")
+        or int(report.get("report_size_bytes") or 0) > 0
+        or report.get("report_sha256")
+    )
+
+
+def report_has_any_archive(report: dict) -> bool:
+    return report_has_original_archive(report) or report_has_report_archive(report)
+
+
+def clear_report_archive_fields(report_ids: list[str], *, clear_original: bool = True, clear_report: bool = True) -> int:
     unique_ids = sorted({report_id for report_id in report_ids if report_id})
     if not unique_ids:
         return 0
-    result = (
-        get_supabase()
-        .table(REPORTS_TABLE)
-        .update(
+    payload = {}
+    if clear_original:
+        payload.update(
             {
                 "original_storage_backend": "",
                 "original_storage_path": "",
@@ -1247,10 +1278,30 @@ def clear_original_archive_fields(report_ids: list[str]) -> int:
                 "original_sha256": "",
             }
         )
+    if clear_report:
+        payload.update(
+            {
+                "report_storage_backend": "",
+                "report_storage_path": "",
+                "report_gcs_path": "",
+                "report_size_bytes": 0,
+                "report_sha256": "",
+            }
+        )
+    if not payload:
+        return 0
+    result = (
+        get_supabase()
+        .table(REPORTS_TABLE)
+        .update(payload)
         .in_("id", unique_ids)
         .execute()
     )
     return len(result.data or [])
+
+
+def clear_original_archive_fields(report_ids: list[str]) -> int:
+    return clear_report_archive_fields(report_ids, clear_original=True, clear_report=False)
 
 
 def delete_original_archives_for_reports(reports: list[dict], clear_rows: bool = True) -> dict:
@@ -1271,20 +1322,64 @@ def delete_original_archives_for_reports(reports: list[dict], clear_rows: bool =
     return result
 
 
+def delete_report_archives_for_reports(reports: list[dict], clear_rows: bool = True) -> dict:
+    targets = report_archive_delete_targets(reports)
+    result = {
+        "reports": len(reports),
+        "supabase": delete_supabase_storage_objects(targets["supabase_paths"]),
+        "gcs": {"selected": len(targets["gcs_paths"]), "deleted": 0, "failed": []},
+        "rows_cleared": 0,
+    }
+    if targets["gcs_paths"]:
+        result["gcs"] = delete_gcs_storage_objects(targets["gcs_paths"])
+    if clear_rows:
+        result["rows_cleared"] = clear_report_archive_fields([report["id"] for report in reports if report.get("id")], clear_original=False, clear_report=True)
+    return result
+
+
+def delete_archives_for_reports(reports: list[dict], clear_rows: bool = True) -> dict:
+    original_targets = original_archive_delete_targets(reports)
+    report_targets = report_archive_delete_targets(reports)
+    supabase_paths = original_targets["supabase_paths"] + report_targets["supabase_paths"]
+    result = {
+        "reports": len(reports),
+        "supabase": delete_supabase_storage_objects(supabase_paths),
+        "gcs_originals": {"selected": len(original_targets["gcs_paths"]), "deleted": 0, "failed": []},
+        "gcs_reports": {"selected": len(report_targets["gcs_paths"]), "deleted": 0, "failed": []},
+        "drive": {"selected": len(original_targets["drive_file_ids"]), "deleted": 0, "failed": []},
+        "rows_cleared": 0,
+    }
+    if original_targets["gcs_paths"]:
+        result["gcs_originals"] = delete_gcs_storage_objects(original_targets["gcs_paths"])
+    if report_targets["gcs_paths"]:
+        result["gcs_reports"] = delete_gcs_storage_objects(report_targets["gcs_paths"])
+    if original_targets["drive_file_ids"]:
+        result["drive"] = delete_drive_storage_objects(original_targets["drive_file_ids"])
+    if clear_rows:
+        result["rows_cleared"] = clear_report_archive_fields([report["id"] for report in reports if report.get("id")], clear_original=True, clear_report=True)
+    return result
+
+
+def prune_user_archives(user_id: str, keep_latest: int = MAX_STORED_REPORTS_PER_USER) -> dict:
+    reports = list_reports_for_user(user_id)
+    keep_count = max(1, int(keep_latest or 1))
+    sorted_reports = sorted(reports, key=lambda item: item.get("created_at") or "", reverse=True)
+    stale_reports = [report for report in sorted_reports[keep_count:] if report_has_any_archive(report)]
+    if not stale_reports:
+        return {
+            "reports": 0,
+            "supabase": {"selected": 0, "deleted": 0, "failed": []},
+            "gcs_originals": {"selected": 0, "deleted": 0, "failed": []},
+            "gcs_reports": {"selected": 0, "deleted": 0, "failed": []},
+            "drive": {"selected": 0, "deleted": 0, "failed": []},
+            "rows_cleared": 0,
+        }
+    return delete_archives_for_reports(stale_reports, clear_rows=True)
+
+
 def prune_previous_original_archives(user_id: str, keep_report_id: str) -> dict:
     reports = list_reports_for_user(user_id)
-    stale_reports = [
-        report
-        for report in reports
-        if report.get("id") != keep_report_id
-        and (
-            report.get("original_storage_path")
-            or report.get("original_gcs_path")
-            or report.get("original_drive_file_id")
-            or int(report.get("original_size_bytes") or 0) > 0
-            or report.get("original_sha256")
-        )
-    ]
+    stale_reports = [report for report in reports if report.get("id") != keep_report_id and report_has_original_archive(report)]
     if not stale_reports:
         return {"reports": 0, "supabase": {"selected": 0, "deleted": 0, "failed": []}, "gcs": {"selected": 0, "deleted": 0, "failed": []}, "drive": {"selected": 0, "deleted": 0, "failed": []}, "rows_cleared": 0}
     return delete_original_archives_for_reports(stale_reports, clear_rows=True)
@@ -1899,6 +1994,7 @@ def render_home(
         email_code_sent=email_code_remaining_seconds() > 0,
         email_code_remaining_seconds=email_code_remaining_seconds(),
         email_code_resend_seconds=EMAIL_CODE_RESEND_SECONDS,
+        github_repo_url=GITHUB_REPO_URL,
         error=error,
         auth_error=auth_error,
     )
@@ -2041,6 +2137,44 @@ PAGE = """
     .theme-toggle:hover {
       background: var(--surface-strong);
       color: var(--accent-strong);
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .star-link,
+    .hero-star-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border: 1px solid color-mix(in srgb, var(--accent) 44%, var(--line));
+      background: var(--surface);
+      color: var(--accent-strong);
+      text-decoration: none;
+      font: 800 13px/1.2 "PingFang SC", "Noto Sans SC", sans-serif;
+      transition: transform .18s ease, background .18s ease, border-color .18s ease;
+    }
+    .star-link {
+      padding: 10px 13px;
+    }
+    .hero-star-link {
+      width: fit-content;
+      margin-top: 24px;
+      padding: 14px 16px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 62%, transparent), transparent 70%),
+        var(--surface-strong);
+      box-shadow: 0 18px 48px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    .star-link:hover,
+    .hero-star-link:hover {
+      transform: translateY(-1px);
+      border-color: var(--accent);
+      background: var(--surface-strong);
     }
     .shell {
       display: grid;
@@ -2618,6 +2752,7 @@ PAGE = """
     @media (max-width: 820px) {
       main { padding: 24px 0; }
       .topbar { margin-bottom: 30px; }
+      .top-actions { justify-content: flex-start; }
       .shell { grid-template-columns: 1fr; min-height: auto; }
       .panel { padding: 22px; }
       .auth-grid { grid-template-columns: 1fr; }
@@ -2647,13 +2782,17 @@ PAGE = """
         <span class="brand-mark">审</span>
         <span>UPC本科论文格式检测工具</span>
       </div>
-      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换夜间模式">夜间模式</button>
+      <div class="top-actions">
+        <a class="star-link" href="{{ github_repo_url }}" target="_blank" rel="noopener noreferrer">GitHub · Star 支持</a>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换夜间模式">夜间模式</button>
+      </div>
     </header>
     <section class="shell">
       <div>
         <div class="mark"></div>
         <h1>UPC本科论文格式检测工具</h1>
         <p class="lead">上传 Word 论文，系统会检查摘要、目录、标题、正文、图表、公式、参考文献和页码，并生成可交互的 HTML 报告。</p>
+        <a class="hero-star-link" href="{{ github_repo_url }}" target="_blank" rel="noopener noreferrer">如果这个工具帮到你，欢迎去 GitHub 点一个 Star</a>
         <ul class="facts">
           <li>支持 .doc / .docx</li>
           <li>单文件 32MB 内</li>
@@ -5175,7 +5314,7 @@ MY_REPORTS_PAGE = """
     <section class="topbar">
       <div>
         <h1>我的检测记录</h1>
-        <p class="copy">你可以在这里查看历史检测结果，并重新下载已经生成成功的 HTML 报告。</p>
+        <p class="copy">你可以在这里查看历史检测结果。每个账号仅保留最近 5 份可重新下载的 HTML 报告，更早记录仍可用于回看检测时间和状态。</p>
       </div>
       <div class="top-links">
         <a class="link-chip" href="{{ url_for('index', auth_token=auth_token) }}">返回检测页</a>
@@ -6407,11 +6546,11 @@ def audit():
                     error_message=error_message,
                 )
                 try:
-                    cleanup_result = prune_previous_original_archives(user["id"], failed_report["id"])
+                    cleanup_result = prune_user_archives(user["id"])
                     if cleanup_result.get("reports"):
-                        app.logger.info("Pruned previous original archives for user %s after failed audit: %s", user["id"], cleanup_result)
+                        app.logger.info("Pruned stale report archives for user %s after failed audit: %s", user["id"], cleanup_result)
                 except Exception:
-                    app.logger.warning("Failed to prune previous original archives for user %s", user["id"], exc_info=True)
+                    app.logger.warning("Failed to prune stale report archives for user %s", user["id"], exc_info=True)
             except Exception:
                 app.logger.warning("Failed to create failed report record for user %s", user["id"], exc_info=True)
             record_event("audit_failed", user, {"filename": original_filename, "stage": "audit", "error": error_message[:240], "college": college_info["college_name"]})
@@ -6470,11 +6609,11 @@ def audit():
                 error_message=report_error_message,
             )
             try:
-                cleanup_result = prune_previous_original_archives(user["id"], report_record["id"])
+                cleanup_result = prune_user_archives(user["id"])
                 if cleanup_result.get("reports"):
-                    app.logger.info("Pruned previous original archives for user %s after successful audit: %s", user["id"], cleanup_result)
+                    app.logger.info("Pruned stale report archives for user %s after successful audit: %s", user["id"], cleanup_result)
             except Exception:
-                app.logger.warning("Failed to prune previous original archives for user %s", user["id"], exc_info=True)
+                app.logger.warning("Failed to prune stale report archives for user %s", user["id"], exc_info=True)
         except Exception:
             app.logger.warning("Failed to create report record for user %s", user["id"], exc_info=True)
 
