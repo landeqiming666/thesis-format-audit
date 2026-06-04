@@ -20,7 +20,7 @@ https://www.python.org/downloads/macos/
 
 1. 解压 `thesis-format-audit-mac.zip`。
 2. 进入解压后的文件夹。
-3. 双击 `run_mac.command`。
+3. 双击 `scripts/run_mac.command`。
 4. 按窗口提示，把要检测的 `.docx` 文件拖入窗口。
 5. 按回车。
 6. 检测完成后会自动打开 HTML 报告。
@@ -38,8 +38,8 @@ https://www.python.org/downloads/macos/
 可以打开“终端”，进入工具文件夹后运行：
 
 ```bash
-chmod +x run_mac.command run_mac_terminal.sh
-./run_mac.command
+chmod +x scripts/run_mac.command scripts/run_mac_terminal.sh
+./scripts/run_mac.command
 ```
 
 ## 终端命令用法
@@ -47,13 +47,13 @@ chmod +x run_mac.command run_mac_terminal.sh
 也可以直接指定文件路径运行：
 
 ```bash
-./run_mac_terminal.sh "/path/to/论文.docx"
+./scripts/run_mac_terminal.sh "/path/to/论文.docx"
 ```
 
 指定输出报告路径：
 
 ```bash
-./run_mac_terminal.sh "/path/to/论文.docx" "/path/to/report.html"
+./scripts/run_mac_terminal.sh "/path/to/论文.docx" "/path/to/report.html"
 ```
 
 ## 注意事项
