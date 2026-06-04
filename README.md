@@ -14,11 +14,14 @@ pinned: false
 ## 本地运行
 
 ```bash
-python3 -m venv .venv
+uv venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 python app.py
 ```
+
+项目根目录的 `uv.toml` 已配置清华 PyPI 镜像；如果不用 `uv`，也可以继续用
+`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt`。
 
 打开：
 

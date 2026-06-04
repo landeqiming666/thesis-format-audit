@@ -56,6 +56,7 @@ from config import (
     MAX_STORED_REPORTS_PER_USER,
     MAX_SUBMISSIONS,
     MAX_UPLOAD_MB,
+    RATE_LIMIT_MULTIPLIER,
     REGISTRATION_CODES_TABLE,
     REPORTS_BUCKET,
     REPORTS_TABLE,
@@ -136,13 +137,19 @@ COLLEGE_ALIASES = {
 COLLEGE_LABEL_PATTERN = re.compile(r"(?:所在)?(?:学院|院系|院（系）|院\(系\)|培养单位|教学单位|系别)\s*[:：]?\s*(.{0,40})")
 COLLEGE_NAME_PATTERN = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9（）()·]{2,30}(?:学院|教学部))")
 RATE_LIMITS = {
-    "login": (10, 5 * 60),
-    "register": (5, 60 * 60),
-    "email_code": (8, 60 * 60),
-    "audit": (8, 60 * 60),
-    "admin": (30, 5 * 60),
+    "login": (60, 5 * 60),
+    "login_email": (10, 5 * 60),
+    "register": (40, 60 * 60),
+    "register_email": (6, 60 * 60),
+    "email_code": (40, 60 * 60),
+    "email_code_email": (6, 60 * 60),
+    "audit": (80, 60 * 60),
+    "audit_user": (12, 60 * 60),
+    "admin": (60, 5 * 60),
 }
 RATE_BUCKETS: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
+RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = 5 * 60
+RATE_LIMIT_LAST_CLEANUP = 0.0
 USER_COLUMNS = (
     "id,email,password_hash,submissions_used,submission_quota,account_status,is_admin,"
     "invite_code,invited_by,register_ip,register_user_agent,last_login_at,last_login_ip,"
@@ -481,8 +488,8 @@ def user_id_from_token(token: str) -> str | None:
 def client_ip() -> str:
     forwarded_for = request.headers.get("X-Forwarded-For", "")
     if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return request.remote_addr or "unknown"
+        return forwarded_for.split(",", 1)[0].strip()[:80] or "unknown"
+    return (request.remote_addr or "unknown")[:80]
 
 
 def email_verification_enabled() -> bool:
@@ -575,16 +582,54 @@ def request_trace_payload(prefix: str = "") -> dict:
     }
 
 
-def rate_limit(scope: str) -> Response | None:
-    max_requests, window_seconds = RATE_LIMITS[scope]
+def rate_limit(scope: str, identifier: str | None = None) -> Response | None:
+    cleanup_rate_limit_buckets()
+    configured_max_requests, window_seconds = RATE_LIMITS[scope]
+    max_requests = scaled_rate_limit(configured_max_requests)
     now = time.time()
-    key = (scope, client_ip())
+    key = (scope, normalize_rate_limit_identifier(identifier) if identifier else client_ip())
     recent = [timestamp for timestamp in RATE_BUCKETS[key] if now - timestamp < window_seconds]
     RATE_BUCKETS[key] = recent
     if len(recent) >= max_requests:
-        return Response("请求太频繁，请稍后再试。", status=429, mimetype="text/plain; charset=utf-8")
+        retry_seconds = max(1, int(window_seconds - (now - min(recent))))
+        message = f"请求太频繁，请 {retry_seconds} 秒后再试。"
+        response = Response(message, status=429, mimetype="text/plain; charset=utf-8")
+        response.headers["Retry-After"] = str(retry_seconds)
+        response.headers["X-RateLimit-Scope"] = scope
+        return response
     recent.append(now)
     return None
+
+
+def scaled_rate_limit(max_requests: int) -> int:
+    try:
+        multiplier = float(RATE_LIMIT_MULTIPLIER)
+    except (TypeError, ValueError):
+        multiplier = 1.0
+    return max(1, int(round(max_requests * max(multiplier, 0.1))))
+
+
+def cleanup_rate_limit_buckets() -> None:
+    global RATE_LIMIT_LAST_CLEANUP
+    now = time.time()
+    if now - RATE_LIMIT_LAST_CLEANUP < RATE_LIMIT_CLEANUP_INTERVAL_SECONDS:
+        return
+    RATE_LIMIT_LAST_CLEANUP = now
+    for key, timestamps in list(RATE_BUCKETS.items()):
+        scope = key[0]
+        _max_requests, window_seconds = RATE_LIMITS.get(scope, (1, 60))
+        recent = [timestamp for timestamp in timestamps if now - timestamp < window_seconds]
+        if recent:
+            RATE_BUCKETS[key] = recent
+        else:
+            RATE_BUCKETS.pop(key, None)
+
+
+def normalize_rate_limit_identifier(identifier: str | None) -> str:
+    value = (identifier or "").strip().lower()
+    if is_valid_email(value):
+        return value
+    return re.sub(r"\s+", "", value)[:120] or client_ip()
 
 
 @app.after_request
@@ -3136,9 +3181,11 @@ PAGE = """
       let remainingSeconds = Number(seconds || 0);
       const paint = () => {
         if (remainingSeconds > 0) {
+          sendEmailCodeButton.dataset.countingDown = '1';
           sendEmailCodeButton.disabled = true;
           sendEmailCodeButton.textContent = `${remainingSeconds} 秒后重发`;
         } else {
+          delete sendEmailCodeButton.dataset.countingDown;
           sendEmailCodeButton.disabled = false;
           sendEmailCodeButton.textContent = '发送验证码';
           window.clearInterval(resendCountdownTimer);
@@ -3358,6 +3405,9 @@ PAGE = """
             };
           }
           if (!response.ok || data.ok === false) {
+            if (Number(data.resend_seconds || 0) > 0) {
+              startEmailCodeCountdown(Number(data.resend_seconds));
+            }
             throw new Error(data.message || '发送验证码失败，请稍后再试。');
           }
           if (emailCodeNote) {
@@ -3370,8 +3420,10 @@ PAGE = """
           });
           registerEmailCodeInput?.focus();
         } catch (error) {
-          sendEmailCodeButton.disabled = false;
-          sendEmailCodeButton.textContent = '发送验证码';
+          if (!sendEmailCodeButton.dataset.countingDown) {
+            sendEmailCodeButton.disabled = false;
+            sendEmailCodeButton.textContent = '发送验证码';
+          }
           showModal({
             title: '发送失败',
             body: error.message || '邮箱验证码发送失败，请稍后再试。'
@@ -6019,11 +6071,6 @@ def index() -> str:
 
 @app.post("/register")
 def register():
-    limited = rate_limit("register")
-    if limited:
-        return limited
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return render_home(auth_error="服务还没有配置 Supabase 数据库。", auth_mode="register"), 503
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     confirm_password = request.form.get("confirm_password", "")
@@ -6034,6 +6081,12 @@ def register():
     captcha_left = request.form.get("captcha_left", "")
     captcha_right = request.form.get("captcha_right", "")
     auth_values = registration_values(email, password, confirm_password, registration_code, invite_code, email_code)
+    limited = rate_limit("register") or rate_limit("register_email", email)
+    if limited:
+        refresh_captcha()
+        return render_home(auth_error=limited.get_data(as_text=True), auth_mode="register", auth_values=auth_values), limited.status_code
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return render_home(auth_error="服务还没有配置 Supabase 数据库。", auth_mode="register"), 503
     if not is_valid_registration_email(email):
         refresh_captcha()
         return render_home(auth_error="新注册仅支持 QQ 邮箱，请使用类似 123456@qq.com 的邮箱地址。", auth_mode="register", auth_values=auth_values), 400
@@ -6108,23 +6161,11 @@ def register():
 @app.post("/register/email-code")
 def send_register_email_code():
     wants_json = request.headers.get("X-Requested-With") == "fetch" or "application/json" in request.headers.get("Accept", "")
-    limited = rate_limit("email_code")
-    if limited:
-        message = limited.get_data(as_text=True)
-        if wants_json:
-            return jsonify({"ok": False, "message": message}), limited.status_code
-        return Response(message, status=limited.status_code, mimetype="text/plain; charset=utf-8")
     if not email_verification_enabled():
         message = "邮箱验证码服务尚未配置。"
         if wants_json:
             return jsonify({"ok": False, "message": message}), 503
         return Response(message, status=503, mimetype="text/plain; charset=utf-8")
-    resend_seconds = email_code_remaining_seconds()
-    if resend_seconds > 0:
-        message = f"请在 {resend_seconds} 秒后再重新发送。"
-        if wants_json:
-            return jsonify({"ok": False, "message": message}), 429
-        return Response(message, status=429, mimetype="text/plain; charset=utf-8")
 
     email = request.form.get("email", "").strip().lower()
     if not is_valid_registration_email(email):
@@ -6132,6 +6173,19 @@ def send_register_email_code():
         if wants_json:
             return jsonify({"ok": False, "message": message}), 400
         return Response(message, status=400, mimetype="text/plain; charset=utf-8")
+    resend_seconds = email_code_remaining_seconds()
+    if resend_seconds > 0:
+        message = f"请在 {resend_seconds} 秒后再重新发送。"
+        if wants_json:
+            return jsonify({"ok": False, "message": message, "resend_seconds": resend_seconds}), 429
+        return Response(message, status=429, mimetype="text/plain; charset=utf-8")
+    limited = rate_limit("email_code") or rate_limit("email_code_email", email)
+    if limited:
+        message = limited.get_data(as_text=True)
+        retry_seconds = int(limited.headers.get("Retry-After", "0") or 0)
+        if wants_json:
+            return jsonify({"ok": False, "message": message, "resend_seconds": retry_seconds}), limited.status_code
+        return Response(message, status=limited.status_code, mimetype="text/plain; charset=utf-8")
     if find_user_by_email(email) is not None:
         message = "这个邮箱已经注册，请直接登录。"
         if wants_json:
@@ -6157,14 +6211,14 @@ def send_register_email_code():
 
 @app.post("/login")
 def login():
-    limited = rate_limit("login")
-    if limited:
-        return limited
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return render_home(auth_error="服务还没有配置 Supabase 数据库。"), 503
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     auth_values = login_values(email, password)
+    limited = rate_limit("login") or rate_limit("login_email", email)
+    if limited:
+        return render_home(auth_error=limited.get_data(as_text=True), auth_mode="login", auth_values=auth_values), limited.status_code
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return render_home(auth_error="服务还没有配置 Supabase 数据库。"), 503
     user = find_user_by_email(email)
     if user is None or not check_password_hash(user["password_hash"], password):
         return render_home(auth_error="邮箱或密码不正确。请确认这个邮箱已经注册，并且密码没有输错。", auth_mode="login", auth_values=auth_values), 400
@@ -6605,12 +6659,12 @@ def download_original(report_id: str):
 
 @app.post("/audit")
 def audit():
-    limited = rate_limit("audit")
-    if limited:
-        return limited
     user = current_user()
     if user is None:
         return audit_reject("请先注册或登录后再生成报告。", 401)
+    limited = rate_limit("audit") or rate_limit("audit_user", user.get("id", ""))
+    if limited:
+        return limited
     if not is_account_active(user):
         return audit_reject(account_block_message(user), 403)
     if remaining_submissions(user) <= 0:
