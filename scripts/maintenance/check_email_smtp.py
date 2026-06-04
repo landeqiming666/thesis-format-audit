@@ -22,7 +22,7 @@ def main() -> int:
         print("缺少 GMAIL_SMTP_USER 或 GMAIL_SMTP_APP_PASSWORD，请先填写 .env。")
         return 1
     if not to_email:
-        print("缺少收件邮箱。用法：python scripts/check_email_smtp.py your-email@example.com")
+        print("缺少收件邮箱。用法：python scripts/maintenance/check_email_smtp.py your-email@example.com")
         return 1
 
     message = EmailMessage()

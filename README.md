@@ -49,6 +49,8 @@ Flask Web 服务 app.py
 
 ## 目录结构
 
+根目录只保留应用入口、核心检测脚本、依赖和 Dockerfile；部署模板、维护工具、数据库脚本和补充文档都收进子目录。
+
 ```text
 .
 ├── app.py                         # Flask Web、API、认证、后台、存储、邮件、页面模板
@@ -57,22 +59,16 @@ Flask Web 服务 app.py
 ├── requirements.txt                # Python 依赖
 ├── uv.toml                         # uv 国内 PyPI 镜像配置
 ├── Dockerfile                      # Docker / Hugging Face Spaces / Azure 容器镜像
-├── docker-compose.yml              # Mac mini 或本地 Docker 自托管
-├── render.yaml                     # Render Blueprint 部署配置
+├── deploy/
+│   ├── docker-compose.yml          # Mac mini 或本地 Docker 自托管
+│   └── render.yaml                 # Render Blueprint 部署配置
 ├── supabase/
 │   └── schema.sql                  # Supabase 表、索引、RPC、策略初始化脚本
 ├── scripts/
-│   ├── check_email_smtp.py         # 测试 Gmail SMTP 发信
-│   ├── grant_low_quota_users.py    # 给低次数用户补次数并发邮件
-│   ├── backfill_report_colleges.py # 从历史检测记录回填学院信息
-│   ├── dedupe_duplicate_reports.py # 清理重复检测记录
-│   ├── prune_report_archives.py    # 每个账号最多保留指定数量报告
-│   ├── prune_original_archives.py  # 每个账号原文归档仅保留最新记录
-│   ├── migrate_archives_to_drive.py # 把 Supabase 原文归档迁移到 Google Drive
-│   ├── maintain_supabase_original_storage.py # Supabase 容量到阈值后公平清理原文
-│   ├── run_mac.command             # macOS 双击运行入口
-│   └── run_mac_terminal.sh         # macOS 命令行检测入口
+│   ├── maintenance/                # 管理、迁移、清理、回填、邮件等维护脚本
+│   └── local/                      # macOS 离线版双击和命令行入口
 └── docs/
+    ├── env.example                 # 环境变量模板
     ├── MAC_MINI_DEPLOY.md          # Mac mini + Docker 自托管部署说明
     └── README_MAC.md               # 离线 macOS 版使用说明
 ```
@@ -107,7 +103,7 @@ python app.py
 
 ## 环境变量
 
-可以复制 `.env.example` 为 `.env`，再按自己的服务配置填写。
+可以复制 `docs/env.example` 为 `.env`，再按自己的服务配置填写。
 
 | 分类 | 变量 | 说明 |
 | --- | --- | --- |
@@ -152,14 +148,14 @@ python app.py
 
 | 命令 | 用途 |
 | --- | --- |
-| `python scripts/check_email_smtp.py 收件邮箱@example.com` | 测试 Gmail SMTP 是否能发验证码 |
-| `python scripts/grant_low_quota_users.py --help` | 给剩余次数低于阈值的用户补次数，并可邮件提醒 |
-| `python scripts/backfill_report_colleges.py --help` | 从历史成功检测记录里重新解析学院信息 |
-| `python scripts/dedupe_duplicate_reports.py --help` | 按账号和文件哈希清理重复检测记录 |
-| `python scripts/prune_report_archives.py --help` | 控制每个账号最多保留几份检测报告 |
-| `python scripts/prune_original_archives.py --help` | 控制每个账号原文归档只保留最新记录 |
-| `python scripts/migrate_archives_to_drive.py --help` | 将 Supabase 中的原文归档迁移到 Google Drive |
-| `python scripts/maintain_supabase_original_storage.py --help` | Supabase 存储到阈值后，公平清理已迁移的原文文件 |
+| `python scripts/maintenance/check_email_smtp.py 收件邮箱@example.com` | 测试 Gmail SMTP 是否能发验证码 |
+| `python scripts/maintenance/grant_low_quota_users.py --help` | 给剩余次数低于阈值的用户补次数，并可邮件提醒 |
+| `python scripts/maintenance/backfill_report_colleges.py --help` | 从历史成功检测记录里重新解析学院信息 |
+| `python scripts/maintenance/dedupe_duplicate_reports.py --help` | 按账号和文件哈希清理重复检测记录 |
+| `python scripts/maintenance/prune_report_archives.py --help` | 控制每个账号最多保留几份检测报告 |
+| `python scripts/maintenance/prune_original_archives.py --help` | 控制每个账号原文归档只保留最新记录 |
+| `python scripts/maintenance/migrate_archives_to_drive.py --help` | 将 Supabase 中的原文归档迁移到 Google Drive |
+| `python scripts/maintenance/maintain_supabase_original_storage.py --help` | Supabase 存储到阈值后，公平清理已迁移的原文文件 |
 
 ## 存储与归档策略
 
@@ -175,9 +171,9 @@ python app.py
 示例：
 
 ```bash
-python scripts/migrate_archives_to_drive.py --no-reports --execute --client-secret /path/to/client_secret.json
-python scripts/maintain_supabase_original_storage.py
-python scripts/maintain_supabase_original_storage.py --execute
+python scripts/maintenance/migrate_archives_to_drive.py --no-reports --execute --client-secret /path/to/client_secret.json
+python scripts/maintenance/maintain_supabase_original_storage.py
+python scripts/maintenance/maintain_supabase_original_storage.py --execute
 ```
 
 ## 部署
@@ -185,7 +181,7 @@ python scripts/maintain_supabase_original_storage.py --execute
 ### Docker / Mac mini 自托管
 
 ```bash
-docker compose up -d --build
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 默认监听：
@@ -198,15 +194,15 @@ Mac mini 长期自托管和内网穿透参考 [docs/MAC_MINI_DEPLOY.md](docs/MAC
 
 ### Azure Container Apps
 
-本项目可以直接构建 Docker 镜像并部署到 Azure Container Apps。部署时需要把 `.env.example` 中的生产环境变量配置到 Container App 的环境变量里，尤其是 Supabase、邮件和 `SECRET_KEY`。
+本项目可以直接构建 Docker 镜像并部署到 Azure Container Apps。部署时需要把 `docs/env.example` 中的生产环境变量配置到 Container App 的环境变量里，尤其是 Supabase、邮件和 `SECRET_KEY`。
 
 ### Render
 
-仓库保留了 `render.yaml`，可以在 Render 创建 Blueprint 后自动读取：
+仓库保留了 `deploy/render.yaml`，可以在 Render 创建 Blueprint 后使用：
 
 1. 把仓库推送到 GitHub、GitLab 或 Bitbucket。
 2. 在 Render 新建 Blueprint，选择本仓库。
-3. Render 会读取 `render.yaml` 并启动 Python Web Service。
+3. Blueprint 文件选择 `deploy/render.yaml`，Render 会启动 Python Web Service。
 
 ### Hugging Face Spaces
 

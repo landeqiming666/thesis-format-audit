@@ -1,6 +1,8 @@
 services:
   thesis-audit:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: upc-thesis-audit
     restart: unless-stopped
     env_file:

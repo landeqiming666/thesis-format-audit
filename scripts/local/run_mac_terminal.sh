@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 if [ "$#" -lt 1 ]; then
-  echo "用法：./scripts/run_mac_terminal.sh 论文.docx [报告.html]"
+  echo "用法：./scripts/local/run_mac_terminal.sh 论文.docx [报告.html]"
   exit 1
 fi
 

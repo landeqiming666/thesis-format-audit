@@ -7,7 +7,7 @@
 复制模板：
 
 ```bash
-cp .env.example .env
+cp docs/env.example .env
 ```
 
 编辑 `.env`，填入 Supabase 配置：
@@ -36,7 +36,7 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON=服务账号 JSON 内容
 ## 2. 启动服务
 
 ```bash
-docker compose up -d --build
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 本机访问：
@@ -54,20 +54,20 @@ http://你的Mac mini局域网IP:7860
 查看日志：
 
 ```bash
-docker compose logs -f
+docker compose -f deploy/docker-compose.yml logs -f
 ```
 
 停止服务：
 
 ```bash
-docker compose down
+docker compose -f deploy/docker-compose.yml down
 ```
 
 更新代码后重启：
 
 ```bash
 git pull
-docker compose up -d --build
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 ## 3. 让外网访问
