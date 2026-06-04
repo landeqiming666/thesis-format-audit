@@ -6055,7 +6055,7 @@ def register():
     access_code_record = find_registration_code(registration_code)
     if not registration_code_is_available(access_code_record):
         refresh_captcha()
-        return render_home(auth_error="QQ群注册码不存在、已停用或使用次数已满。请加入官方 QQ 群 537124215，从群公告获取最新注册码。", auth_mode="register", auth_values=auth_values), 400
+        return render_home(auth_error=registration_code_error_message(), auth_mode="register", auth_values=auth_values), 400
     if find_user_by_email(email) is not None:
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
@@ -6076,8 +6076,14 @@ def register():
     try:
         user = create_user(email, password, invited_by=inviter["id"] if inviter else None)
     except APIError:
+        refund_registration_code_use(consumed_code)
         refresh_captcha()
         return render_home(auth_error="这个邮箱已经注册，请直接登录。", auth_mode="register", auth_values=auth_values), 400
+    except Exception:
+        refund_registration_code_use(consumed_code)
+        app.logger.exception("Failed to create user %s after consuming registration code", email)
+        refresh_captcha()
+        return render_home(auth_error="注册失败，请稍后重试。注册码次数已自动恢复。", auth_mode="register", auth_values=auth_values), 500
     try:
         record_admin_log(
             None,
